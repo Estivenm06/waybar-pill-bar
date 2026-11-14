@@ -2,7 +2,8 @@ notch/target/
 __pycache__/
 *.py[cod]
 node_modules/
-/promo/
+/promo/hyperframes/
+/promo/showcase/
 .env
 .env.*
 google.json
