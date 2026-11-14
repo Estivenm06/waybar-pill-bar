@@ -1,4 +1,14 @@
 #!/bin/bash
 # Run by omarchy-hook after a theme or font change: restyle Waybar and the notch.
-"__HOME__/.local/bin/waybar-notch" --gen-waybar-theme && systemctl --user kill --kill-whom=main -s SIGUSR2 waybar.service
+HELPER="__HOME__/.config/waybar/scripts/waybar-pill-plugin"
+MODE=$(python3 "$HELPER" mode) || exit 1
+"__HOME__/.local/bin/waybar-notch" --gen-waybar-theme || exit 1
+if [ "$MODE" = plugin ]; then
+  python3 "$HELPER" record-generated "__HOME__/.config/waybar/pill-theme.css" || exit 1
+  # a disabled plugin only saves the theme; nothing is started
+  python3 "$HELPER" active || exit 0
+  python3 "$HELPER" reload
+else
+  systemctl --user kill --kill-whom=main -s SIGUSR2 waybar.service
+fi
 "__HOME__/.config/waybar/scripts/waybar-popupctl" reload-theme

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Restore the newest backup made by install.sh and remove everything the installer added.
+# Plugin installs (marker ~/.local/state/waybar-notch/plugin-install.json) take the plugin branch below.
 # Usage: ./uninstall.sh [--purge]   (--purge also deletes your Google OAuth client, token and sign-in browser profile)
 set -euo pipefail
 PURGE=0
@@ -12,6 +13,24 @@ done
 W="$HOME/.config/waybar"; H="$HOME/.config/hypr"
 STATE="$HOME/.local/state/waybar-notch"
 GCONF="$HOME/.config/waybar-notch"; GDATA="$HOME/.local/share/waybar-notch"
+STATE_PLUGIN="${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/plugin-install.json"
+if [ -e "$STATE_PLUGIN" ]; then
+  HELPER_DIR="$(dirname "$(readlink -f "$0")")/files"
+  if command -v omarchy >/dev/null 2>&1; then
+    # an enabled plugin owns the session; disabling closes its lease and restores the native desktop
+    omarchy plugin disable waybar.pill-bar >/dev/null 2>&1 || true
+    for _ in $(seq 50); do python3 "$HELPER_DIR/scripts/waybar-pill-plugin" active || break; sleep 0.2; done
+  fi
+  python3 "$HELPER_DIR/scripts/waybar-pill-plugin" recover || true
+  python3 "$HELPER_DIR/setup/plugin-state.py" uninstall || { echo "Plugin left disabled; nothing was removed."; exit 1; }
+  hyprctl reload || true
+  echo "Plugin files restored. Preferences and credentials are kept; remove the checkout with: omarchy plugin remove waybar.pill-bar"
+  if [ "$PURGE" = 1 ]; then
+    rm -rf "$GCONF/google.json" "$GCONF/project-id" "$GDATA/google-token.json" "$GDATA/browser-profile"
+    echo "Deleted the Google OAuth client, token and sign-in browser profile."
+  fi
+  exit 0
+fi
 BK=$(ls -d "$W"/backup-* 2>/dev/null | sort | tail -1 || true)
 [ -n "$BK" ] || { echo "No backup found in $W"; exit 1; }
 echo "Restoring from $BK"

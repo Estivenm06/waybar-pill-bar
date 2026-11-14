@@ -1,8 +1,16 @@
 #!/bin/bash
 # Tell the persistent popup daemon to toggle a popup: waybar-popupctl volume|bluetooth|wifi|battery
 F="${XDG_RUNTIME_DIR:-/tmp}/waybar-popupd.fifo"
+PLUGIN="$(dirname "$(readlink -f "$0")")/waybar-pill-plugin"
 msg="$1 $(date +%s%N)"
 send() { [ -p "$F" ] && timeout 0.3 sh -c 'printf "%s\n" "$0" > "$1"' "$msg" "$F"; }
+m=$(python3 "$PLUGIN" mode) || exit 1
+if [ "$m" = plugin ]; then
+  # plugin mode: never start anything; only talk to the daemon while the plugin session is active
+  python3 "$PLUGIN" active || exit 1
+  send && exit 0
+  exit 1
+fi
 send && exit 0
 systemctl --user start waybar-notch.service >/dev/null 2>&1
 for _ in $(seq 40); do sleep 0.1; send && exit 0; done

@@ -4,7 +4,7 @@
   waybar-setup.py defaults                          write the config file if it does not exist
   waybar-setup.py ask                               interactive choice, writes the config file
   waybar-setup.py render-config <config.jsonc>      generate custom/<app> modules + group/apps from the config
-  waybar-setup.py render-autostart <in.lua> <out>   add the hidden-workspace rules for background apps
+  waybar-setup.py render-autostart <in.lua> <out> [--plugin]   add the hidden-workspace rules for background apps
   waybar-setup.py apply                             re-render the installed Waybar config + autostart from the saved apps (Settings page)
 """
 import fcntl
@@ -358,7 +358,7 @@ def lua_esc(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def bg_lines(cfg):
+def bg_lines(cfg, plugin=False):
     lines = []
     for _, a, bg in app_modules(cfg):
         if not bg:
@@ -367,17 +367,20 @@ def bg_lines(cfg):
         script = "%s/scripts/waybar-bgapp.sh" % WAYBAR
         cmd = "%s ensure %s %s %s" % (shlex.quote(script), shlex.quote(a["id"]), shlex.quote(a["class"]), launch)
         lines.append('o.window("%s", { workspace = "special:%s silent" }) -- @bg' % (lua_esc(hypr_re(a["class"])), a["id"]))
-        lines.append('o.exec_on_start("%s") -- @bg' % lua_esc(cmd))
+        if not plugin:  # plugin mode: the active supervisor's Tracker maintains background apps, never autostart
+            lines.append('o.exec_on_start("%s") -- @bg' % lua_esc(cmd))
     return lines
 
 
-def cmd_render_autostart(src, dst):
+def cmd_render_autostart(src, dst, plugin=False):
     cfg = ensure_config()
-    lines = bg_lines(cfg)
+    lines = bg_lines(cfg, plugin)
     with open(src) as f:
         text = f.read().splitlines()
     out = []
     for ln in text:
+        if plugin and ln.strip() == 'o.exec_on_start("omarchy-toggle-bar on")':
+            continue
         if ln.startswith("-- Popup animation:"):
             out.extend(lines)
         out.append(ln)
@@ -422,6 +425,17 @@ def hypr_reload():
     subprocess.run(["hyprctl", "reload"], capture_output=True, text=True)
 
 
+def plugin_mode():
+    """'plugin' or 'standalone' from the install marker; a malformed marker is an error."""
+    helper = os.path.join(WAYBAR, "scripts", "waybar-pill-plugin")
+    if not os.path.exists(helper):
+        return "standalone"
+    r = subprocess.run([sys.executable, helper, "mode"], capture_output=True, text=True)
+    if r.returncode != 0 or r.stdout.strip() not in ("plugin", "standalone"):
+        raise ConfigError("cannot determine install mode: " + r.stderr.strip())
+    return r.stdout.strip()
+
+
 def cmd_apply():
     """Re-render the installed Waybar config and Hyprland autostart from the saved `apps`, validate, apply, and roll back
     both files if Hyprland reports new config errors."""
@@ -438,7 +452,8 @@ def cmd_apply():
     render_apps(conf, cfg)
     new_conf = json.dumps(conf, indent=2) + "\n"
     json.loads(new_conf)
-    new_auto = replace_bg_rules(auto_text, bg_lines(cfg))
+    plugin = plugin_mode() == "plugin"
+    new_auto = replace_bg_rules(auto_text, bg_lines(cfg, plugin))
     if new_conf == conf_text and new_auto == auto_text:
         print("Nothing to change")
     else:
@@ -456,6 +471,20 @@ def cmd_apply():
             write_atomic(auto, auto_text)
             hypr_reload()
             raise ConfigError("Hyprland rejected the new autostart rules, previous files restored: " + "; ".join(fresh))
+    if plugin:
+        helper = os.path.join(WAYBAR, "scripts", "waybar-pill-plugin")
+        if new_conf != conf_text or new_auto != auto_text:
+            r = subprocess.run([sys.executable, helper, "record-generated", wconf, auto], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise ConfigError("could not record the regenerated files: " + r.stderr.strip())
+        if subprocess.run([sys.executable, helper, "active"]).returncode != 0:
+            print("Saved (plugin disabled)")
+            return
+        r = subprocess.run([sys.executable, helper, "reload"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ConfigError("waybar-pill-plugin reload failed: " + (r.stderr.strip() or "exit %d" % r.returncode))
+        print("Applied")
+        return
     r = subprocess.run(["systemctl", "--user", "reload", "waybar.service"], capture_output=True, text=True)
     if r.returncode != 0:
         raise ConfigError("systemctl --user reload waybar.service failed: " + (r.stderr.strip() or "exit %d" % r.returncode))
@@ -473,8 +502,8 @@ def main(argv):
         cmd_ask()
     elif c == "render-config" and len(argv) == 2:
         cmd_render_config(argv[1])
-    elif c == "render-autostart" and len(argv) == 3:
-        cmd_render_autostart(argv[1], argv[2])
+    elif c == "render-autostart" and len(argv) in (3, 4) and (len(argv) == 3 or argv[3] == "--plugin"):
+        cmd_render_autostart(argv[1], argv[2], len(argv) == 4)
     elif c == "apply" and len(argv) == 1:
         cmd_apply()
     else:

@@ -13,9 +13,27 @@ Almost. It does everything from your side except installing packages:
 
 Needs Omarchy 4.x with the Lua Hyprland config; it will not work on other setups as-is.
 
-### As an Omarchy plugin?
+### As an Omarchy plugin
 
-This baseline is standalone (Waybar config + Rust/GTK4 binary run by systemd units). Omarchy plugin integration is added in the next commit as a service-plugin bridge; no UI rewrite is involved.
+The repo is also an Omarchy **service plugin** (`waybar.pill-bar`). It is a bridge, not a rewrite: the same Rust/GTK notch and Waybar run unchanged; the plugin's `Service.qml` holds a lease on a small backend (`files/scripts/waybar-pill-plugin`) that starts them while the plugin is enabled and, when it is disabled, removed, or the shell exits, stops them and restores the native bar, notifications and OSD. It is not a Quickshell-rendered bar.
+
+```
+omarchy plugin add https://github.com/Estivenm06/waybar-pill-bar.git
+cd ~/.config/omarchy/plugins/waybar.pill-bar
+./install.sh --plugin --no-google
+omarchy plugin enable waybar.pill-bar
+# later:
+omarchy plugin disable waybar.pill-bar
+```
+
+- Dependencies (see Requirements) and the initial build are explicit: `omarchy plugin add/update` never runs build or privileged hooks, and enabling without `./install.sh --plugin` fails with an actionable message.
+- `--plugin` installs files only (binary, Waybar config, scripts, hooks, managed Lua blocks). It installs no systemd units, hides nothing, disables nothing and starts no daemon. Originals are backed up and recorded in `~/.local/state/waybar-notch/plugin-install.json`.
+- While enabled, the session hides the native bar and disables `omarchy.notifications`/`omarchy.osd` (and their clones) via `disabledPlugins` in `shell.json`; it restores only what it changed. Popup, theme, Settings and brightness/volume/bar-toggle keys never start anything while the plugin is disabled (keys fall back to native Omarchy behavior).
+- Update: disable, `omarchy plugin update waybar.pill-bar`, rerun `./install.sh --plugin`, re-enable.
+- Full removal: disable, run `./uninstall.sh` (restores the recorded originals; refuses, changing nothing, if an installed file was edited since), then `omarchy plugin remove waybar.pill-bar`. Preferences and Google credentials are kept unless `--purge`.
+- A standalone install must be removed with `./uninstall.sh` before plugin setup.
+- Crash boundaries: a shell crash closes the lease and cleanup runs automatically. If the backend itself is killed (SIGKILL, power loss) cleanup cannot run: run `files/scripts/waybar-pill-plugin recover` (installed at `~/.config/waybar/scripts/`); the next start also recovers.
+- Tests: `python3 -m unittest tests/test_plugin_bridge.py files/setup/test_waybar_setup.py`. The plugin has not been exercised in a nested compositor yet; the Rust/GTK parts are unchanged.
 
 Local promo assets are excluded from the repository and not needed to install.
 
@@ -150,6 +168,8 @@ CLI: `waybar-notch --google-login [--print-url]` exits 0 (token saved), 2 (`goog
 ```
 waybar-pill-bar/
 ├── install.sh                 installer (backs up first, never deletes)
+├── manifest.json, Service.qml  Omarchy service plugin entry
+├── tests/                     plugin bridge tests
 ├── uninstall.sh               restores the newest backup, undoes the install (--purge)
 ├── notch/                     Rust crate -> ~/.local/bin/waybar-notch
 │   └── src/
