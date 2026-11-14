@@ -1,0 +1,6 @@
+[
+  {"id": "discord", "name": "Discord", "glyph": "\udb81\ude6f", "class": "^(discord|vesktop)$", "proc": "Discord", "exe": ["discord", "vesktop"], "default_bg": false},
+  {"id": "steam", "name": "Steam", "glyph": "\uf1b6", "class": "^steam$", "proc": "steam", "exe": ["steam"], "default_bg": false},
+  {"id": "spotify", "name": "Spotify", "glyph": "\uf1bc", "class": "^spotify$", "proc": "spotify", "exe": ["spotify"], "default_bg": false},
+  {"id": "whatsapp", "name": "WhatsApp", "glyph": "\uf232", "class": "web\\.whatsapp\\.com", "web": "https://web.whatsapp.com/", "default_bg": true}
+]

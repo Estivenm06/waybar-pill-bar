@@ -1,0 +1,9 @@
+#!/bin/bash
+# Tell the persistent popup daemon to toggle a popup: waybar-popupctl volume|bluetooth|wifi|battery
+F="${XDG_RUNTIME_DIR:-/tmp}/waybar-popupd.fifo"
+msg="$1 $(date +%s%N)"
+send() { [ -p "$F" ] && timeout 0.3 sh -c 'printf "%s\n" "$0" > "$1"' "$msg" "$F"; }
+send && exit 0
+systemctl --user start waybar-notch.service >/dev/null 2>&1
+for _ in $(seq 40); do sleep 0.1; send && exit 0; done
+exit 1

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Brightness keys: change brightness silently, then show the notch overlay. Usage: waybar-brightness-key +5%|5%-|100%|1%
+omarchy-brightness-display --no-osd "$1"
+exec "$(dirname "$0")/waybar-popupctl" osd-brightness

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Run by omarchy-hook after a theme or font change: restyle Waybar and the notch.
+"__HOME__/.local/bin/waybar-notch" --gen-waybar-theme && systemctl --user kill --kill-whom=main -s SIGUSR2 waybar.service
+"__HOME__/.config/waybar/scripts/waybar-popupctl" reload-theme

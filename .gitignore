@@ -1,0 +1,13 @@
+notch/target/
+__pycache__/
+*.py[cod]
+node_modules/
+/promo/
+.env
+.env.*
+google.json
+google-token.json
+project-id
+browser-profile/
+backup-*/
+*.new
