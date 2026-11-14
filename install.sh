@@ -61,14 +61,14 @@ if [ "$PLUGIN" = 1 ]; then
     "$HOME/.config/omarchy/hooks/theme-set.d/50-waybar-pill-bar" "$HOME/.config/omarchy/hooks/font-set.d/50-waybar-pill-bar"
     "$HOME/.local/share/waybar-notch/setup/waybar-setup.py" "$HOME/.local/share/waybar-notch/setup/apps-catalog.json"
     "$H/autostart.lua" "$H/bindings.lua")
-  for f in "$SRC"/scripts/*; do PFILES+=("$W/scripts/$(basename "$f")"); done
+  for f in "$SRC"/scripts/*; do [ -f "$f" ] || continue; PFILES+=("$W/scripts/$(basename "$f")"); done
   python3 "$STATEPY" begin "${PFILES[@]}"
   if [ -n "$(date +%p)" ]; then CLOCK_FMT='{:%I:%M %p}'; else CLOCK_FMT='{:%H:%M}'; fi
   mkdir -p "$W/scripts" "$H"
   echo "== Installing Waybar files"
   sed -e "s|__HOME__|$HOME|g" -e "s|__CLOCK_FMT__|$CLOCK_FMT|g" "$SRC/config.jsonc" > "$W/config.jsonc"
   sed "s|__HOME__|$HOME|g" "$SRC/style.css" > "$W/style.css"
-  for f in "$SRC"/scripts/*; do sed "s|__HOME__|$HOME|g" "$f" > "$W/scripts/$(basename "$f")"; chmod +x "$W/scripts/$(basename "$f")"; done
+  for f in "$SRC"/scripts/*; do [ -f "$f" ] || continue; sed "s|__HOME__|$HOME|g" "$f" > "$W/scripts/$(basename "$f")"; chmod +x "$W/scripts/$(basename "$f")"; done
   CFG="${XDG_CONFIG_HOME:-$HOME/.config}/waybar-notch/config.json"
   if [ -t 0 ] && { [ ! -f "$CFG" ] || [ "$RECONFIGURE" = 1 ]; }; then python3 "$SRC/setup/waybar-setup.py" ask; else python3 "$SRC/setup/waybar-setup.py" defaults; fi
   python3 "$SRC/setup/waybar-setup.py" render-config "$W/config.jsonc"
@@ -128,13 +128,13 @@ if [ -n "$(date +%p)" ]; then CLOCK_FMT='{:%I:%M %p}'; else CLOCK_FMT='{:%H:%M}'
 echo "== Backing up to $BK"
 mkdir -p "$BK/scripts" "$BK/hypr" "$W/scripts" "$H" "$HOME/.config/systemd/user"
 for f in config.jsonc style.css; do [ -e "$W/$f" ] && cp -a "$W/$f" "$BK/$f"; done
-for f in "$SRC"/scripts/*; do b=$(basename "$f"); [ -e "$W/scripts/$b" ] && cp -a "$W/scripts/$b" "$BK/scripts/$b"; done
+for f in "$SRC"/scripts/*; do [ -f "$f" ] || continue; b=$(basename "$f"); [ -e "$W/scripts/$b" ] && cp -a "$W/scripts/$b" "$BK/scripts/$b"; done
 for f in autostart.lua bindings.lua; do [ -e "$H/$f" ] && cp -a "$H/$f" "$BK/hypr/$f"; done
 
 echo "== Installing Waybar files"
 sed -e "s|__HOME__|$HOME|g" -e "s|__CLOCK_FMT__|$CLOCK_FMT|g" "$SRC/config.jsonc" > "$W/config.jsonc"
 sed "s|__HOME__|$HOME|g" "$SRC/style.css" > "$W/style.css"
-for f in "$SRC"/scripts/*; do sed "s|__HOME__|$HOME|g" "$f" > "$W/scripts/$(basename "$f")"; chmod +x "$W/scripts/$(basename "$f")"; done
+for f in "$SRC"/scripts/*; do [ -f "$f" ] || continue; sed "s|__HOME__|$HOME|g" "$f" > "$W/scripts/$(basename "$f")"; chmod +x "$W/scripts/$(basename "$f")"; done
 rm -f "$W/scripts/waybar-whatsapp.sh"   # replaced by waybar-bgapp.sh (the backup loop above already saved it)
 [ -e "$W/scripts/wifi-status.sh" ] && cp -a "$W/scripts/wifi-status.sh" "$BK/scripts/wifi-status.sh"
 rm -f "$W/scripts/wifi-status.sh"   # replaced by the native Waybar network module
