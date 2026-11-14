@@ -3,6 +3,8 @@
   "id": "waybar.pill-bar",
   "name": "Waybar Pill Bar",
   "version": "0.1.0",
+  "author": "Estivenm06",
+  "license": "MIT",
   "description": "Bridge service for the external Rust/GTK pill bar and notch: while enabled it runs Waybar and the notch in place of the native bar, notifications and OSD; disabling restores them. Run ./install.sh once before enabling.",
   "kinds": ["service"],
   "entryPoints": { "service": "Service.qml" },
