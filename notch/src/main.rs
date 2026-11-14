@@ -94,7 +94,7 @@ impl CaptureAction {
 enum Msg {
     Media { status: String, artist: String, title: String, art_url: String, len: f64, player: String },
     NoMedia,
-    Weather(String),
+    Weather(WeatherInfo),
     Art(String, String),
     Pos(f64),
     Bars(u64, [f64; BARS]),
@@ -160,6 +160,9 @@ struct Ui {
     c_title: gtk::Label,
     c_weather: gtk::Label,
     i_weather: gtk::Label,
+    h_weather_temp: gtk::Label,
+    h_weather_location: gtk::Label,
+    h_weather_wind: gtk::Label,
     eq: gtk::DrawingArea,
     m_art: gtk::Picture,
     m_backdrop: gtk::Picture,
@@ -1652,22 +1655,40 @@ fn usage_thread(tx: async_channel::Sender<Msg>, rx: std::sync::mpsc::Receiver<bo
     });
 }
 
+#[derive(Clone)]
+struct WeatherInfo { compact: String, location: String, wind: String }
+
+/// Parse `City  ·  Temp +25°C  ·  Wind ↑5km/h`; malformed output yields None rather than partial fields.
+fn parse_weather_status(icon: &str, status: &str) -> Option<WeatherInfo> {
+    let parts: Vec<&str> = status.split('·').map(str::trim).collect();
+    let [city, temp, wind] = parts[..] else { return None };
+    let temp = temp.strip_prefix("Temp ")?.trim();
+    let wind = wind.strip_prefix("Wind ")?.trim();
+    if city.is_empty() || temp.is_empty() || wind.is_empty() { return None; }
+    let temp = temp.strip_prefix('+').unwrap_or(temp);
+    Some(WeatherInfo { compact: format!("{icon} {temp}"), location: city.to_string(), wind: format!("Wind {wind}") })
+}
+
+fn weather_snapshot(icon: &str, status: Option<&str>, previous: Option<WeatherInfo>) -> WeatherInfo {
+    status.and_then(|s| parse_weather_status(icon, s)).or(previous)
+        .unwrap_or_else(|| WeatherInfo { compact: icon.to_string(), location: "Weather unavailable".into(), wind: String::new() })
+}
+
 fn weather_thread(tx: async_channel::Sender<Msg>) {
     std::thread::spawn(move || {
-        let mut last = String::new();
+        const CLOUD: &str = "\u{f0c2}";
+        if tx.send_blocking(Msg::Weather(weather_snapshot(CLOUD, None, None))).is_err() { return; }
+        let mut last: Option<WeatherInfo> = None;
         loop {
             let run = |c: &str| std::process::Command::new(c).output().ok()
                 .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            let icon = run("omarchy-weather-icon").filter(|s| !s.is_empty()).unwrap_or_else(|| "\u{f0c2}".to_string());
-            let temp = run("omarchy-weather-status").and_then(|s| {
-                let i = s.find("Temp ")? + 5;
-                let t: String = s[i..].chars().take_while(|c| !c.is_whitespace()).collect();
-                Some(t.trim_start_matches('+').to_string())
-            });
-            if let Some(t) = temp { last = format!("{icon} {t}"); }
-            else if last.is_empty() { last = icon; }
-            let _ = tx.try_send(Msg::Weather(last.clone()));
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            let icon = run("omarchy-weather-icon").unwrap_or_else(|| CLOUD.to_string());
+            let status = run("omarchy-weather-status");
+            let snap = weather_snapshot(&icon, status.as_deref(), last.take());
+            last = Some(snap.clone());
+            if tx.send_blocking(Msg::Weather(snap)).is_err() { return; }
             std::thread::sleep(Duration::from_secs(600));
         }
     });
@@ -2494,9 +2515,15 @@ impl Ui {
                 self.viz_on.set(false);
                 self.stop_visualizer();
             }
-            Msg::Weather(t) => {
-                self.c_weather.set_text(&t);
-                self.i_weather.set_text(&t);
+            Msg::Weather(w) => {
+                self.c_weather.set_text(&w.compact);
+                self.i_weather.set_text(&w.compact);
+                self.h_weather_temp.set_text(&w.compact);
+                self.h_weather_location.set_text(&w.location);
+                self.h_weather_wind.set_text(&w.wind);
+                self.h_weather_wind.set_visible(!w.wind.is_empty());
+                for l in [&self.h_weather_temp, &self.h_weather_location, &self.h_weather_wind] { l.set_tooltip_text(Some(&l.text())); }
+                let _ = self.tx.try_send(Msg::Relayout);
             }
             Msg::Stats(b, v, w, bt, bt_on) => {
                 for (l, t) in [(&self.s_batt, &b), (&self.s_vol, &v), (&self.s_wifi, &w), (&self.s_bt, &bt)] {
@@ -2884,6 +2911,27 @@ fn build(app: &gtk::Application) {
     stats.attach(&c_bt, 1, 1, 1, 1);
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     top.append(&left);
+    let weather_col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    weather_col.add_css_class("home-weather");
+    weather_col.set_valign(gtk::Align::Center);
+    weather_col.set_halign(gtk::Align::Fill);
+    weather_col.set_hexpand(true);
+    let mk_weather = |cls: &str, text: &str| {
+        let l = gtk::Label::new(Some(text));
+        l.add_css_class(cls);
+        l.set_xalign(0.0);
+        l.set_halign(gtk::Align::Start);
+        l.set_width_chars(1);
+        l.set_max_width_chars(20);
+        l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        l
+    };
+    let h_weather_temp = mk_weather("home-weather-temp", "\u{f0c2}");
+    let h_weather_location = mk_weather("home-weather-location", "Weather unavailable");
+    let h_weather_wind = mk_weather("home-weather-wind", "");
+    h_weather_wind.set_visible(false);
+    for w in [&h_weather_temp, &h_weather_location, &h_weather_wind] { weather_col.append(w); }
+    top.append(&weather_col);
     let HomePlayer { root: h_player, strip, art: h_art, backdrop: h_backdrop, title: h_title, artist: h_artist, play: h_play } = home_player_card();
     let h_play_ref = h_play.clone();
     let h_clip = gtk::Label::new(Some("\u{f0ea}  Nothing copied yet"));
@@ -3749,7 +3797,7 @@ fn build(app: &gtk::Application) {
         settings: RefCell::new(settings), desk: RefCell::new(None), dest: RefCell::new(None), dest_info: RefCell::new(None),
         geom: Cell::new(geom0), host: Cell::new(host0), hidden: Cell::new(false), bar_tx: bar_controller::start_sync_sender(),
         tabs: tabs.clone(),
-        win: win.clone(), notch: notch.clone(), c_art, c_note, c_title, c_weather, i_weather, eq: eq.clone(), m_art, m_backdrop, m_title, m_artist, m_prog, m_t1, m_t2,
+        win: win.clone(), notch: notch.clone(), c_art, c_note, c_title, c_weather, i_weather, h_weather_temp, h_weather_location, h_weather_wind, eq: eq.clone(), m_art, m_backdrop, m_title, m_artist, m_prog, m_t1, m_t2,
         m_cover_spacer, media_background: media_background.clone(), m_open_app: m_open_app.clone(),
         player_instance: RefCell::new(String::new()), player_generation: Cell::new(0), player_raise_busy: Cell::new(false),
         coll_stack: coll_stack.clone(),
@@ -4246,6 +4294,31 @@ fn main() -> glib::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weather_parsing() {
+        let w = parse_weather_status("", "Valledupar  ·  Temp +25°C  ·  Wind ↑5km/h").unwrap();
+        assert_eq!((w.compact.as_str(), w.location.as_str(), w.wind.as_str()), (" 25°C", "Valledupar", "Wind ↑5km/h"));
+        let w = parse_weather_status("i", "Bogotá São  ·  Temp -3°C  ·  Wind ↓12km/h").unwrap();
+        assert_eq!((w.compact.as_str(), w.location.as_str(), w.wind.as_str()), ("i -3°C", "Bogotá São", "Wind ↓12km/h"));
+        for bad in ["Weather unavailable", "A · Temp 1°C", "A · Temp  · Wind 1", " · Temp 1 · Wind 2", "A · T 1 · Wind 2", "A · Temp 1 · W 2", "A · Temp 1 · Wind 2 · x"] {
+            assert!(parse_weather_status("i", bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn weather_snapshot_retains_previous() {
+        let ok = "Valledupar  ·  Temp +25°C  ·  Wind ↑5km/h";
+        let s = weather_snapshot("a", Some(ok), None);
+        let r = weather_snapshot("b", None, Some(s.clone()));
+        assert_eq!((r.compact.as_str(), r.location.as_str(), r.wind.as_str()), ("a 25°C", "Valledupar", "Wind ↑5km/h"));
+        let r = weather_snapshot("b", Some("garbage"), Some(s));
+        assert_eq!(r.location, "Valledupar");
+        let f = weather_snapshot("c", None, None);
+        assert_eq!((f.compact.as_str(), f.location.as_str(), f.wind.as_str()), ("c", "Weather unavailable", ""));
+        let n = weather_snapshot("d", Some(ok), Some(f));
+        assert_eq!(n.compact, "d 25°C");
+    }
 
     #[test]
     fn fit_extent_bounds() {

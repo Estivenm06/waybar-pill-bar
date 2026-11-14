@@ -368,6 +368,14 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_body_sits_below_the_top_gap() {
+        let l = LayoutSettings { collapsed_width: 210, collapsed_height: 24, expanded_width: 520, top_margin: 2 };
+        let g = Geometry::compute(&l, Some((1200.0, 750.0)));
+        assert_eq!((g.top_margin, g.coll_h), (2, 24.0));
+        assert_eq!(g.top_margin as f64 + g.coll_h, 26.0);
+    }
+
+    #[test]
     fn geometry_never_exceeds_the_output() {
         let l = LayoutSettings { collapsed_width: 420, collapsed_height: 48, expanded_width: 960, top_margin: 24 };
         let g = Geometry::compute(&l, Some((600.0, 400.0)));

@@ -113,7 +113,7 @@ impl Default for NotchSettings {
                 font_size: 12,
                 corner_radius: 22,
             },
-            layout: LayoutSettings { collapsed_width: 210, collapsed_height: 26, expanded_width: 520, top_margin: 0 },
+            layout: LayoutSettings { collapsed_width: 210, collapsed_height: 24, expanded_width: 520, top_margin: 2 },
             behavior: BehaviorSettings {
                 open_on_hover: true,
                 collapse_delay_ms: 350,
