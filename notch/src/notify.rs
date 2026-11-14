@@ -1,20 +1,14 @@
-//! Notification daemon (org.freedesktop.Notifications) with notch-style black pill cards.
-//! D-Bus side runs on zbus' own executor and forwards `Msg`s to the GTK thread; cards hang below the right-hand
-//! Waybar pill. Do-Not-Disturb is shared with the Omarchy state file so the Controls tile and Waybar keep working.
-use crate::Msg;
+//! Notification cards (notch-style black pills) for notifications forwarded by the Omarchy shell's relay.
+//! Cards hang below the right-hand Waybar pill. Do-Not-Disturb is shared with the Omarchy state file so the Controls
+//! tile and Waybar keep working.
 use gtk::{gdk, glib, prelude::*};
+use crate::notification_relay::Command;
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
-use zbus::OwnedVariant as OwnedValue;
 
-const PATH: &str = "/org/freedesktop/Notifications";
-const IFACE: &str = "org.freedesktop.Notifications";
 const MAX_CARDS: usize = 5;
 const DEFAULT_MS: u64 = 6000;
 const SLIDE_MS: u32 = 240;
@@ -51,54 +45,6 @@ pub fn set_dnd(on: bool) {
     let _ = std::fs::write(&p, format!("{{\n  \"version\": 3,\n  \"dnd\": {on}\n}}\n"));
 }
 
-// ------------------------------------------------------------------ D-Bus server
-struct Daemon {
-    tx: async_channel::Sender<Msg>,
-    next: AtomicU32,
-}
-
-#[zbus::interface(name = "org.freedesktop.Notifications")]
-impl Daemon {
-    fn get_capabilities(&self) -> Vec<String> {
-        ["body", "actions", "icon-static", "persistence"].iter().map(|s| s.to_string()).collect()
-    }
-
-    fn get_server_information(&self) -> (String, String, String, String) {
-        ("waybar-notch".into(), "waybar-pill-bar".into(), env!("CARGO_PKG_VERSION").into(), "1.2".into())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn notify(&self, app_name: String, replaces_id: u32, app_icon: String, summary: String, body: String,
-              actions: Vec<String>, hints: HashMap<String, OwnedValue>, expire_timeout: i32) -> u32 {
-        let id = if replaces_id != 0 { replaces_id } else { self.next.fetch_add(1, Ordering::Relaxed) };
-        let urgency = hints.get("urgency").and_then(|v| u8::try_from(v).ok()).unwrap_or(1).min(2);
-        let icon = if !app_icon.is_empty() { app_icon } else {
-            hints.get("image-path").and_then(|v| String::try_from(v.clone()).ok()).unwrap_or_default()
-        };
-        // DND silences everything except critical notifications
-        if dnd_on() && urgency < 2 {
-            return id;
-        }
-        let actions = actions.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect();
-        let _ = self.tx.try_send(Msg::Notify(Note { id, app: app_name, icon, summary, body, actions, urgency, timeout_ms: expire_timeout }));
-        id
-    }
-
-    fn close_notification(&self, id: u32) {
-        let _ = self.tx.try_send(Msg::NotifyClose(id));
-    }
-}
-
-/// Claim the bus name and serve. Err when another daemon owns it (stop that one first).
-pub fn start(tx: async_channel::Sender<Msg>) -> zbus::Result<zbus::Connection> {
-    futures_lite::future::block_on(
-        zbus::connection::Builder::session()
-            .name(IFACE)
-            .serve_at(PATH, Daemon { tx, next: AtomicU32::new(1) })
-            .build(),
-    )
-}
-
 // ------------------------------------------------------------------ UI
 struct Card {
     id: u32,
@@ -113,7 +59,7 @@ pub struct NotifyUi {
     hidden: Cell<bool>,
     animations: Cell<bool>,
     mon: RefCell<String>,
-    conn: Option<Arc<zbus::Connection>>,
+    relay: std::sync::mpsc::Sender<Command>,
 }
 
 fn strip_markup(s: &str) -> String {
@@ -131,7 +77,7 @@ fn strip_markup(s: &str) -> String {
 }
 
 impl NotifyUi {
-    pub fn new(app: &gtk::Application, conn: Option<zbus::Connection>) -> Rc<Self> {
+    pub fn new(app: &gtk::Application, relay: std::sync::mpsc::Sender<Command>) -> Rc<Self> {
         let win = gtk::ApplicationWindow::new(app);
         win.init_layer_shell();
         win.set_layer(Layer::Overlay);
@@ -147,15 +93,16 @@ impl NotifyUi {
         col.set_halign(gtk::Align::End);
         col.set_valign(gtk::Align::Start);
         win.set_child(Some(&col));
-        Rc::new(NotifyUi { win, col, cards: RefCell::new(Vec::new()), hidden: Cell::new(false), animations: Cell::new(true), mon: RefCell::new(String::new()), conn: conn.map(Arc::new) })
+        Rc::new(NotifyUi { win, col, cards: RefCell::new(Vec::new()), hidden: Cell::new(false), animations: Cell::new(true), mon: RefCell::new(String::new()), relay })
     }
 
     fn emit_closed(&self, id: u32, reason: u32) {
-        if let Some(c) = &self.conn { let _ = futures_lite::future::block_on(c.emit_signal(None::<&str>, PATH, IFACE, "NotificationClosed", &(id, reason))); }
+        // closure reason 3 means the sender already removed it (replacement/external close): nothing to echo
+        if reason != REASON_CLOSED { let _ = self.relay.send(Command::Close { id, reason }); }
     }
 
     fn emit_action(&self, id: u32, key: &str) {
-        if let Some(c) = &self.conn { let _ = futures_lite::future::block_on(c.emit_signal(None::<&str>, PATH, IFACE, "ActionInvoked", &(id, key))); }
+        let _ = self.relay.send(Command::Action { id, key: key.to_owned() });
     }
 
     fn sync_visibility(&self) {

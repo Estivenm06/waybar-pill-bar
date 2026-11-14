@@ -8,6 +8,8 @@ mod config;
 mod desktop;
 mod gcal;
 mod lyrics;
+mod notch_content;
+mod notification_relay;
 mod notify;
 mod osd;
 mod popups;
@@ -28,6 +30,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 const BARS: usize = 6;
+const WA_CONTENT_H: f64 = 420.0;   // preferred height of the hosted WhatsApp content, bounded by the output ceiling
 const HOST_RESERVE_H: f64 = 560.0;   // layer-host height reserved up front so page changes never resize the window
 const EQ_MIN: f64 = 0.4;   // shortest bar as a fraction of the drawing height, so a quiet band is still a bar, not a dot
 const PLAYERS: &str = "spotify,%any";
@@ -114,6 +117,10 @@ enum Msg {
     Net(&'static str, u8, String),
     Notify(notify::Note),
     NotifyClose(u32),
+    NotificationRelayFailed(String),
+    NotchContent(notch_content::Event),
+    NotchContentFailed(String),
+    TabSelected(&'static str),
     Gcal(gcal::Update),
     Usage(Box<usage::Usage>),
     PopupReq(String),
@@ -130,7 +137,29 @@ static SEEKING: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy)]
 struct Size { w: f64, h: f64, vw: f64, vh: f64, tw: f64, th: f64 }
 
+/// Where an ordinary close of the WhatsApp page leads once its content has hidden.
+#[derive(Clone, Copy, PartialEq)]
+enum CloseTo { Collapse, Home, Tab(&'static str) }
+
+/// The one live WhatsApp content session (GTK owns it; QML only reports into it).
+struct Ext {
+    s: notch_content::Session,
+    /// Follow mode keeps the notch on the output that was clicked while the page is up.
+    pin: Option<String>,
+    after: CloseTo,
+    /// Output and slot rectangle of the newest layout sent; cleared while the content is suspended.
+    last: Option<(String, [i32; 4])>,
+}
+
 struct Ui {
+    content: notch_content::Bridge,
+    ext: RefCell<Option<Ext>>,
+    ext_timer: RefCell<Option<glib::SourceId>>,
+    ext_pub_busy: Cell<bool>,
+    notch_hover: Cell<bool>,
+    started: std::time::Instant,
+    wa_page: gtk::Box,
+    wa_status: gtk::Label,
     popups: Rc<popups::Popups>,
     populate_bt: Rc<dyn Fn()>,
     populate_wifi: Rc<dyn Fn()>,
@@ -1790,6 +1819,7 @@ impl Ui {
 
     fn set_expanded(self: &Rc<Self>, expand: bool) {
         if expand && (self.capture_pending.get() || self.capture_active.get()) { return; }
+        if !expand { self.ext_drop("collapsed", Some("home")); }
         // Hovering again keeps the tab you left on; staying away for a while sends it back to Home.
         if let Some(id) = self.reset_id.borrow_mut().take() { id.remove(); }
         let reset_secs = self.settings.borrow().behavior.home_reset_secs;
@@ -1828,6 +1858,9 @@ impl Ui {
             if page.as_deref() == Some("settings") { return; } // editing: stays open until Back
             // a slider drag that left the notch must not close the page under the pointer
             if page.as_deref() == Some("utility") && u.popups.is_interacting() { u.schedule_collapse(ms); return; }
+            // a live editor or pointer in the WhatsApp content keeps the page; otherwise hide it before collapsing
+            if u.ext.borrow().as_ref().is_some_and(|e| e.s.holds_open()) { u.schedule_collapse(ms); return; }
+            if u.ext_close(CloseTo::Collapse) { return; }
             u.set_expanded(false);
         });
         *self.collapse_id.borrow_mut() = Some(id);
@@ -1849,6 +1882,8 @@ impl Ui {
         self.stack.set_size_request(-1, -1);
         let sel = self.stack.visible_child_name();
         let is_media = sel.as_deref() == Some("media");
+        let is_wa = sel.as_deref() == Some("whatsapp");
+        let prev_size = (self.size.get().tw, self.size.get().th);
         let apply_compact = |compact: bool| {
             if compact { self.notch.add_css_class("compact-layout") } else { self.notch.remove_css_class("compact-layout") }
             let (em, pm) = if compact { (12, 8) } else { (16, 12) };
@@ -1874,10 +1909,14 @@ impl Ui {
             apply_compact(tw <= 520.0);
             tw = content_w(self);
         }
+        // the WhatsApp page is as wide as the configured card; its content is hosted, not measured
+        if is_wa { tw = g.exp_w; }
         let pw = ((tw as i32) - self.exp.margin_start() - self.exp.margin_end()).max(1);
         let chrome = self.tabs.measure(gtk::Orientation::Vertical, pw).1 as f64 + vpad;
         let ceiling = if is_media { MEDIA_MAX_H.min(g.exp_h_max) } else { g.exp_h_max };
-        let ph = if is_media {
+        let ph = if is_wa {
+            WA_CONTENT_H
+        } else if is_media {
             // compact player: the cover takes whatever the fixed controls leave of the output-bounded budget
             let budget = (ceiling.floor() - chrome) as i32;
             self.m_cover_spacer.set_size_request(0, 0);
@@ -1901,6 +1940,10 @@ impl Ui {
             self.win.set_default_size(host.0, host.1);
             self.win.set_size_request(host.0, host.1);
         }
+        if self.ext.borrow().is_some() {
+            if prev_size != (tw, th) { self.ext_invalidate(); }
+            self.ext_schedule_publish();
+        }
         self.kick();
     }
 
@@ -1909,6 +1952,7 @@ impl Ui {
         let logical = self.dest_info.borrow().as_ref().map(|m| (m.logical_width, m.logical_height));
         let g = desktop::Geometry::compute(&self.settings.borrow().layout, logical);
         self.geom.set(g);
+        self.ext_invalidate();
         self.win.set_margin(Edge::Top, g.top_margin);
         self.coll.set_size_request(-1, g.coll_h as i32);
         self.osd.set_collapsed(g.coll_w, g.coll_h);
@@ -1927,6 +1971,7 @@ impl Ui {
 
     /// The open/close motion ended: pick up any destination change that waited for the interaction.
     fn settled(self: &Rc<Self>) {
+        self.ext_schedule_publish();
         if !self.interaction_active() { self.reconcile(); }
     }
 
@@ -1974,6 +2019,7 @@ impl Ui {
 
     /// Collapse everything at once and give back input focus (the output is going away, or the bar is being hidden).
     fn force_idle(self: &Rc<Self>) {
+        self.ext_drop("idle", Some("home"));
         self.cancel_collapse();
         self.popups.close();
         self.win.set_keyboard_mode(KeyboardMode::None);
@@ -2076,7 +2122,9 @@ impl Ui {
         };
         let (prefs_mode_hide, sel) = {
             let prefs = self.settings.borrow();
-            let pin = if cur.as_deref().is_some_and(|c| snap.monitor(c).is_some()) && self.interaction_active() { cur.as_deref() } else { None };
+            let ext_pin = self.ext.borrow().as_ref().and_then(|e| e.pin.clone());
+            let pin = if ext_pin.is_some() { ext_pin.as_deref() }
+                else if cur.as_deref().is_some_and(|c| snap.monitor(c).is_some()) && self.interaction_active() { cur.as_deref() } else { None };
             (prefs.behavior.hide_on_fullscreen, desktop::select_output(&snap, &prefs, pin, cur.as_deref()))
         };
         let hidden = prefs_mode_hide && sel.as_deref().is_some_and(|n| snap.fullscreen_outputs.contains(n));
@@ -2200,6 +2248,235 @@ impl Ui {
             l.set_wrap_mode(gtk::pango::WrapMode::WordChar);
             self.agenda.append(&l);
         }
+    }
+
+    // ---------------------------------------------------------------- hosted WhatsApp content
+
+    fn now_ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
+
+    fn ext_send(&self, conn: u64, frame: serde_json::Value) {
+        self.content.send(conn, frame);
+    }
+
+    /// Run `f` on the live session when `conn` is still its connection; events of any other connection are stale.
+    fn ext_with<R>(&self, conn: u64, f: impl FnOnce(&mut Ext) -> R) -> Option<R> {
+        self.ext.borrow_mut().as_mut().filter(|e| e.s.conn == conn).map(f)
+    }
+
+    fn ext_event(self: &Rc<Self>, ev: notch_content::Event) {
+        use notch_content::{Event, Phase};
+        match ev {
+            Event::Open { conn, output } => self.ext_open(conn, output),
+            Event::Mapped { conn, serial } => {
+                if self.ext_with(conn, |e| e.s.on_mapped(serial)) == Some(true) { self.wa_status.set_visible(false); }
+            }
+            Event::Interaction { conn, hovered, busy } => {
+                let Some(was_held) = self.ext_with(conn, |e| { let held = e.s.holds_open(); e.s.on_interaction(hovered, busy); held }) else { return };
+                if hovered || busy {
+                    self.cancel_collapse();
+                } else if was_held && !self.notch_hover.get() {
+                    // only leaving the content arms the collapse; the first report must not cut the travel grace short
+                    let ms = self.settings.borrow().behavior.collapse_delay_ms;
+                    self.schedule_collapse(ms as u64);
+                }
+            }
+            Event::Close { conn, home } => {
+                if self.ext_with(conn, |_| ()).is_some() { self.ext_close(if home { CloseTo::Home } else { CloseTo::Collapse }); }
+            }
+            Event::Hidden { conn } => {
+                if self.ext_with(conn, |e| e.s.phase == Phase::Closing) == Some(true) { self.ext_finish(); }
+            }
+            Event::Gone { conn } => match self.ext_with(conn, |e| e.s.phase) {
+                Some(Phase::Closing) => self.ext_finish(),
+                Some(Phase::Open) => {
+                    self.ext_drop("connection lost", Some("home"));
+                    self.set_expanded(false);
+                }
+                None => {}
+            },
+        }
+    }
+
+    fn ext_open(self: &Rc<Self>, conn: u64, output: String) {
+        let bridge = &self.content;
+        // a replacement session supersedes the old one without bouncing through Home
+        self.ext_drop("replaced", None);
+        let reject = |why: &str| {
+            bridge.send(conn, serde_json::json!({"op": "error", "message": why}));
+            bridge.disconnect(conn);
+        };
+        let Some(snap) = self.desk.borrow().clone() else { return reject("the compositor state is not known yet") };
+        if snap.monitor(&output).is_none() { return reject(&format!("output {output} is not connected")); }
+        if self.capture_pending.get() || self.capture_active.get() { return reject("a screenshot or recording is in progress"); }
+        let (follow, hide_fs) = {
+            let p = self.settings.borrow();
+            (p.monitor.mode == config::MonitorMode::Follow, p.behavior.hide_on_fullscreen)
+        };
+        if hide_fs && snap.fullscreen_outputs.contains(&output) { return reject("the notch is hidden by a fullscreen window"); }
+        if self.hidden.get() { return reject("the notch is hidden"); }
+        *self.ext.borrow_mut() = Some(Ext {
+            s: notch_content::Session::new(conn, self.now_ms()),
+            pin: follow.then(|| output.clone()),
+            after: CloseTo::Collapse,
+            last: None,
+        });
+        self.wa_status.set_visible(true);
+        self.cancel_collapse();
+        self.detail_origin.set("home");
+        self.stack.set_visible_child_name("whatsapp");
+        self.reconcile();
+        if self.suppressed() {
+            self.ext_fail(conn, "the notch has no output to show on");
+            return;
+        }
+        self.set_expanded(true);
+        self.schedule_collapse(3000); // grace for the pointer to travel from the bar; entering either window cancels it
+        self.ext_start_timer();
+        self.ext_schedule_publish();
+    }
+
+    /// Tell the content why it is going away, close its connection, and leave the WhatsApp page.
+    fn ext_drop(self: &Rc<Self>, reason: &str, leave: Option<&'static str>) {
+        let Some(e) = self.ext.borrow_mut().take() else { return };
+        let conn = e.s.conn;
+        if std::env::var_os("NOTCH_DEBUG").is_some() { eprintln!("content session {conn} dropped: {reason}"); }
+        self.ext_send(conn, serde_json::json!({"op": "hide", "session": conn, "reason": reason}));
+        self.content.disconnect(conn);
+        if let Some(id) = self.ext_timer.borrow_mut().take() { id.remove(); }
+        if let Some(page) = leave {
+            if self.stack.visible_child_name().as_deref() == Some("whatsapp") { self.show_tab(page); }
+        }
+        if e.pin.is_some() {
+            let u = self.clone();
+            glib::idle_add_local_once(move || u.reconcile()); // the interaction pin is gone
+        }
+    }
+
+    /// Start the bounded close (hide, then wait for `hidden`). False when no content session is live.
+    fn ext_close(self: &Rc<Self>, to: CloseTo) -> bool {
+        let now = self.now_ms();
+        let conn = {
+            let mut g = self.ext.borrow_mut();
+            let Some(e) = g.as_mut() else { return false };
+            e.after = to;
+            if !e.s.begin_close(now) { return true; }
+            if std::env::var_os("NOTCH_DEBUG").is_some() { eprintln!("content session {} closing", e.s.conn); }
+            e.s.conn
+        };
+        self.ext_send(conn, serde_json::json!({"op": "hide", "session": conn, "reason": "close"}));
+        true
+    }
+
+    /// The content hid (or the bound ran out): disconnect and carry on to where the close was heading.
+    fn ext_finish(self: &Rc<Self>) {
+        let Some(after) = self.ext.borrow().as_ref().map(|e| e.after) else { return };
+        match after {
+            CloseTo::Tab(t) => { self.ext_drop("closed", Some(t)); }
+            _ => { self.ext_drop("closed", Some("home")); }
+        }
+        if after == CloseTo::Collapse { self.set_expanded(false); }
+    }
+
+    /// A failed open or lost content: tell QML (it notifies the user), return Home and collapse.
+    fn ext_fail(self: &Rc<Self>, conn: u64, why: &str) {
+        if self.ext_with(conn, |_| ()).is_none() { return; }
+        self.ext_send(conn, serde_json::json!({"op": "error", "message": why}));
+        self.ext_drop("error", Some("home"));
+        self.set_expanded(false);
+    }
+
+    fn ext_start_timer(self: &Rc<Self>) {
+        if let Some(id) = self.ext_timer.borrow_mut().take() { id.remove(); }
+        let u = self.clone();
+        let id = glib::timeout_add_local(Duration::from_millis(50), move || {
+            use notch_content::Tick;
+            let t = u.ext.borrow().as_ref().map(|e| (e.s.conn, e.s.tick(u.now_ms())));
+            match t {
+                Some((_, Tick::Idle)) => glib::ControlFlow::Continue,
+                None => { u.ext_timer.borrow_mut().take(); glib::ControlFlow::Break }
+                Some((conn, tick)) => {
+                    u.ext_timer.borrow_mut().take(); // this source ends by returning Break
+                    if tick == Tick::MapTimeout { u.ext_fail(conn, "WhatsApp did not appear in the notch in time"); } else { u.ext_finish(); }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+        *self.ext_timer.borrow_mut() = Some(id);
+    }
+
+    /// Slot rectangle in output-local logical pixels, from the real allocation and the real layer host position.
+    fn ext_slot_rect(&self) -> Option<[i32; 4]> {
+        let b = self.wa_page.compute_bounds(&self.win)?;
+        let (w, h) = (b.width().round() as i32, b.height().round() as i32);
+        let win_w = self.win.width();
+        if w <= 0 || h <= 0 || win_w <= 0 || !self.win.is_visible() { return None; }
+        let out_w = self.dest_info.borrow().as_ref()?.logical_width.round() as i32;
+        let x = (out_w - win_w) / 2 + b.x().round() as i32;
+        let y = self.geom.get().top_margin + b.y().round() as i32;
+        Some([x, y, w, h])
+    }
+
+    /// Hide the content while the slot moves; the next settled layout brings it back.
+    fn ext_invalidate(&self) {
+        let sent = {
+            let mut g = self.ext.borrow_mut();
+            let Some(e) = g.as_mut() else { return };
+            if e.last.take().is_none() { return; }
+            e.s.suspended();
+            e.s.conn
+        };
+        self.ext_send(sent, serde_json::json!({"op": "suspend", "session": sent}));
+    }
+
+    /// Wait for the slot to settle (animation over, the same allocation on consecutive frames), then publish it once.
+    fn ext_schedule_publish(self: &Rc<Self>) {
+        if self.ext.borrow().is_none() || self.ext_pub_busy.replace(true) { return; }
+        let u = self.clone();
+        let (prev, stable, frames) = (Cell::new(None::<[i32; 4]>), Cell::new(0u32), Cell::new(0u32));
+        self.win.add_tick_callback(move |_, _| {
+            frames.set(frames.get() + 1);
+            if u.ext.borrow().is_none() || frames.get() > 600 {
+                u.ext_pub_busy.set(false);
+                return glib::ControlFlow::Break;
+            }
+            let settled = !u.animating.get() && u.expanded.load(Ordering::Relaxed) && u.prog.get() > 0.99;
+            let rect = if settled { u.ext_slot_rect() } else { None };
+            let Some(r) = rect else { stable.set(0); prev.set(None); return glib::ControlFlow::Continue };
+            if prev.get() == Some(r) { stable.set(stable.get() + 1) } else { stable.set(0); prev.set(Some(r)); }
+            if stable.get() < 2 { return glib::ControlFlow::Continue; }
+            u.ext_pub_busy.set(false);
+            u.ext_publish(r);
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn ext_publish(self: &Rc<Self>, r: [i32; 4]) {
+        let Some((out, ow, oh)) = self.dest_info.borrow().as_ref().map(|m| (m.name.clone(), m.logical_width.round() as i32, m.logical_height.round() as i32)) else { return };
+        let Some(conn) = self.ext.borrow().as_ref().map(|e| e.s.conn) else { return };
+        if r[0] < 0 || r[1] < 0 || r[0] + r[2] > ow || r[1] + r[3] > oh {
+            return self.ext_fail(conn, "the notch content falls outside its output");
+        }
+        let serial = {
+            let mut g = self.ext.borrow_mut();
+            let Some(e) = g.as_mut() else { return };
+            if e.last.as_ref() == Some(&(out.clone(), r)) { return; }
+            e.last = Some((out.clone(), r));
+            e.s.layout_sent()
+        };
+        let t = theme::current();
+        let (size, radius, anim) = {
+            let s = self.settings.borrow();
+            (s.appearance.font_size, s.appearance.corner_radius, s.behavior.animations)
+        };
+        self.ext_send(conn, serde_json::json!({
+            "op": "layout", "version": notch_content::VERSION, "session": conn, "serial": serial, "output": out,
+            "rect": {"x": r[0], "y": r[1], "width": r[2], "height": r[3]},
+            "theme": {
+                "background": theme::hex(t.bg), "foreground": theme::hex(t.fg), "foreground_hi": theme::hex(t.fg_hi()),
+                "accent": theme::hex(t.accent), "alert": theme::hex(t.red), "font_family": t.font,
+                "font_size": size, "radius": radius, "animations": anim,
+            },
+        }));
     }
 
     fn cancel_collapse(&self) {
@@ -2339,6 +2616,16 @@ impl Ui {
         match m {
             Msg::Notify(n) => self.notes.show(n),
             Msg::NotifyClose(id) => self.notes.close(id, notify::REASON_CLOSED, true),
+            Msg::NotificationRelayFailed(why) => {
+                eprintln!("notification relay failed: {why}");
+                if let Some(a) = gtk::gio::Application::default() { a.quit(); }
+            }
+            Msg::NotchContentFailed(why) => {
+                eprintln!("notch content transport failed: {why}");
+                if let Some(a) = gtk::gio::Application::default() { a.quit(); }
+            }
+            Msg::NotchContent(ev) => self.ext_event(ev),
+            Msg::TabSelected(name) => { if !self.ext_close(CloseTo::Tab(name)) { self.show_tab(name); } }
             Msg::Gcal(u) => {
                 match u {
                     gcal::Update::Events(ev) => { *self.events.borrow_mut() = ev; self.gstate.borrow_mut().clear(); }
@@ -2350,6 +2637,7 @@ impl Ui {
             }
             Msg::CaptureActive(on) => {
                 self.capture_active.set(on);
+                if on { self.ext_drop("capture", Some("home")); }
                 self.win.set_layer(if on { Layer::Top } else { Layer::Overlay });
             }
             Msg::CaptureFinished(action, res) => self.finish_capture(action, res),
@@ -2362,9 +2650,11 @@ impl Ui {
             Msg::UtilityPageChanged => {
                 let name = self.stack.visible_child_name();
                 let name = name.as_deref();
+                // any other page replaces the WhatsApp content at once
+                if name != Some("whatsapp") { self.ext_drop("page changed", Some("home")); }
                 let is_tab = |n: &str| self.tab_btns.borrow().iter().any(|(_, t)| *t == n);
                 // Wi-Fi, Bluetooth and the utility pages keep their origin tab (Home or Controls) selected
-                let sel = if matches!(name, Some("utility") | Some("wifi") | Some("bluetooth")) { Some(self.detail_origin.get()) } else { name.filter(|n| is_tab(n)) };
+                let sel = if matches!(name, Some("utility") | Some("wifi") | Some("bluetooth") | Some("whatsapp")) { Some(self.detail_origin.get()) } else { name.filter(|n| is_tab(n)) };
                 if name != Some("controls") { self.clear_control_status(); }
                 if name == Some("settings") { self.ensure_settings_page().on_show(); }
                 if let Some(sel) = sel {
@@ -2756,7 +3046,7 @@ fn draw_bars(ui: &Ui, cr: &cairo::Context, w: i32, h: i32) {
     let _ = cr.fill();
 }
 
-fn build(app: &gtk::Application) {
+fn build(app: &gtk::Application, shell_pid: i32) {
     let expanded = Arc::new(AtomicBool::new(false));
     let (tx, rx) = async_channel::unbounded::<Msg>();
     let (settings, _) = config::load_settings();
@@ -3738,13 +4028,9 @@ fn build(app: &gtk::Application) {
         if name == "home" { b.add_css_class("active"); }
         tabs.append(&b);
         tab_btns.borrow_mut().push((b.clone(), name));
-        let (stack, tab_btns) = (stack.clone(), tab_btns.clone());
-        b.connect_clicked(move |_| {
-            stack.set_visible_child_name(name);
-            for (btn, n) in tab_btns.borrow().iter() {
-                if *n == name { btn.add_css_class("active") } else { btn.remove_css_class("active") }
-            }
-        });
+        // the handler releases hosted WhatsApp content first, then switches page and highlight
+        let tx = tx.clone();
+        b.connect_clicked(move |_| { let _ = tx.try_send(Msg::TabSelected(name)); });
     }
     // clicking the home page's mini player / mini calendar jumps to that tab
     {
@@ -3769,6 +4055,18 @@ fn build(app: &gtk::Application) {
         });
         mini.add_controller(g);
     }
+    // WhatsApp detail page: an empty slot. The plugin's QML window is placed exactly over it and draws no backplate.
+    let wa_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    wa_page.add_css_class("wa-page");
+    wa_page.set_vexpand(true);
+    wa_page.set_hexpand(true);
+    let wa_status = gtk::Label::new(Some("Opening WhatsApp\u{2026}"));
+    wa_status.add_css_class("sub");
+    wa_status.set_vexpand(true);
+    wa_status.set_valign(gtk::Align::Center);
+    wa_status.set_halign(gtk::Align::Center);
+    wa_page.append(&wa_status);
+    stack.add_named(&wa_page, Some("whatsapp"));
     exp.append(&stack);
     exp.append(&tabs);
 
@@ -3786,13 +4084,19 @@ fn build(app: &gtk::Application) {
 
     let popups = popups::Popups::new(tx.clone());
     let osd = osd::Osd::new(app);
-    // Rust notification daemon: owns org.freedesktop.Notifications; falls back to no popups if another daemon holds it
-    let conn = match notify::start(tx.clone()) {
-        Ok(c) => Some(c),
-        Err(e) => { eprintln!("notify: cannot own org.freedesktop.Notifications: {e}"); None }
+    // Quickshell owns org.freedesktop.Notifications and relays over private sockets; both must bind or there is no UI.
+    let cmds = match notification_relay::start(shell_pid, tx.clone()) {
+        Ok(cmds) => cmds,
+        Err(e) => { eprintln!("notification relay: cannot listen: {e}"); app.quit(); return; }
     };
-    let notes = notify::NotifyUi::new(app, conn);
+    let content = match notch_content::start(shell_pid, tx.clone()) {
+        Ok(b) => b,
+        Err(e) => { eprintln!("notch content: cannot listen: {e}"); app.quit(); return; }
+    };
+    let notes = notify::NotifyUi::new(app, cmds);
     let ui = Rc::new(Ui {
+        content, ext: RefCell::new(None), ext_timer: RefCell::new(None), ext_pub_busy: Cell::new(false), notch_hover: Cell::new(false),
+        started: std::time::Instant::now(), wa_page: wa_page.clone(), wa_status: wa_status.clone(),
         popups, populate_bt: populate_bt.clone(), populate_wifi: populate_wifi.clone(), osd, notes, ai, cal, agenda, events: RefCell::new(Vec::new()), gstate: RefCell::new(String::new()), stack: stack.clone(), tab_btns: tab_btns.clone(),
         settings: RefCell::new(settings), desk: RefCell::new(None), dest: RefCell::new(None), dest_info: RefCell::new(None),
         geom: Cell::new(geom0), host: Cell::new(host0), hidden: Cell::new(false), bar_tx: bar_controller::start_sync_sender(),
@@ -3835,7 +4139,10 @@ fn build(app: &gtk::Application) {
         stack.connect_visible_child_name_notify(move |_| { let _ = txu.try_send(Msg::UtilityPageChanged); });
         let (u, key) = (ui.clone(), gtk::EventControllerKey::new());
         key.connect_key_pressed(move |_, k, _, _| {
-            if k == gdk::Key::Escape && matches!(u.stack.visible_child_name().as_deref(), Some("utility") | Some("wifi") | Some("bluetooth")) {
+            if k == gdk::Key::Escape && u.stack.visible_child_name().as_deref() == Some("whatsapp") {
+                if !u.ext_close(CloseTo::Home) { u.show_tab("home"); }
+                glib::Propagation::Stop
+            } else if k == gdk::Key::Escape && matches!(u.stack.visible_child_name().as_deref(), Some("utility") | Some("wifi") | Some("bluetooth")) {
                 u.win.set_keyboard_mode(KeyboardMode::None);
                 u.stack.set_visible_child_name(u.detail_origin.get());
                 glib::Propagation::Stop
@@ -3905,11 +4212,12 @@ fn build(app: &gtk::Application) {
     {
         let u = ui.clone();
         motion.connect_enter(move |_, _, _| {
+            u.notch_hover.set(true);
             u.cancel_collapse();
             if u.settings.borrow().behavior.open_on_hover && !u.capture_hover_blocked.get() { u.set_expanded(true); }
         });
         let u = ui.clone();
-        motion.connect_leave(move |_| { u.capture_hover_blocked.set(false); let ms = u.settings.borrow().behavior.collapse_delay_ms; u.schedule_collapse(ms as u64) });
+        motion.connect_leave(move |_| { u.notch_hover.set(false); u.capture_hover_blocked.set(false); let ms = u.settings.borrow().behavior.collapse_delay_ms; u.schedule_collapse(ms as u64) });
     }
     notch.add_controller(motion);
 
@@ -4243,6 +4551,7 @@ fn reload_main_css() {
 
 fn main() -> glib::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut relay_pid = None;
     match args.first().map(String::as_str) {
         Some("--gen-waybar-theme") => {
             let family = config::read_document().map(|d| config::NotchSettings::from_json(&d).appearance.font_family);
@@ -4251,7 +4560,15 @@ fn main() -> glib::ExitCode {
                 Err(e) => { eprintln!("{e}"); glib::ExitCode::FAILURE }
             };
         }
-        Some("--waybar-supervisor") => return bar_controller::run_supervisor(),
+        Some("--waybar-supervisor") if args.len() == 1 => return bar_controller::run_supervisor(),
+        Some("--notification-relay") => {
+            let pid = args.get(1).filter(|_| args.len() == 2).and_then(|p| p.parse::<i32>().ok()).filter(|p| *p > 0);
+            let Some(pid) = pid else {
+                eprintln!("usage: waybar-notch --notification-relay <shell-pid>");
+                return glib::ExitCode::FAILURE;
+            };
+            relay_pid = Some(pid);
+        }
         Some("--waybar-app-status") => {
             return match args.get(1).filter(|_| args.len() == 2).map(|id| app_status::read_status(id)) {
                 Some(Ok(line)) => { print!("{line}"); glib::ExitCode::SUCCESS }
@@ -4277,6 +4594,10 @@ fn main() -> glib::ExitCode {
         }
         _ => {}
     }
+    let Some(shell_pid) = relay_pid else {
+        eprintln!("usage: waybar-notch --notification-relay <shell-pid>");
+        return glib::ExitCode::FAILURE;
+    };
     theme::configure(&config::load_settings().0.appearance);
     let app = gtk::Application::builder().application_id("dev.waybar.notch").build();
     app.connect_startup(|_| {
@@ -4287,8 +4608,9 @@ fn main() -> glib::ExitCode {
         }
         MAIN_PROV.with(|p| *p.borrow_mut() = Some(prov));
     });
-    app.connect_activate(build);
-    app.run()
+    app.connect_activate(move |a| build(a, shell_pid));
+    // the private relay flag must not reach GTK's own argument parser
+    app.run_with_args(&[std::env::args().next().unwrap_or_default()])
 }
 
 #[cfg(test)]
@@ -4297,10 +4619,10 @@ mod tests {
 
     #[test]
     fn weather_parsing() {
-        let w = parse_weather_status("", "Valledupar  ·  Temp +25°C  ·  Wind ↑5km/h").unwrap();
-        assert_eq!((w.compact.as_str(), w.location.as_str(), w.wind.as_str()), (" 25°C", "Valledupar", "Wind ↑5km/h"));
-        let w = parse_weather_status("i", "Bogotá São  ·  Temp -3°C  ·  Wind ↓12km/h").unwrap();
-        assert_eq!((w.compact.as_str(), w.location.as_str(), w.wind.as_str()), ("i -3°C", "Bogotá São", "Wind ↓12km/h"));
+        let w = parse_weather_status("", "Example City  ·  Temp +25°C  ·  Wind ↑5km/h").unwrap();
+        assert_eq!((w.compact.as_str(), w.location.as_str(), w.wind.as_str()), (" 25°C", "Example City", "Wind ↑5km/h"));
+        let w = parse_weather_status("i", "Éxample São  ·  Temp -3°C  ·  Wind ↓12km/h").unwrap();
+        assert_eq!((w.compact.as_str(), w.location.as_str(), w.wind.as_str()), ("i -3°C", "Éxample São", "Wind ↓12km/h"));
         for bad in ["Weather unavailable", "A · Temp 1°C", "A · Temp  · Wind 1", " · Temp 1 · Wind 2", "A · T 1 · Wind 2", "A · Temp 1 · W 2", "A · Temp 1 · Wind 2 · x"] {
             assert!(parse_weather_status("i", bad).is_none(), "{bad}");
         }
@@ -4308,12 +4630,12 @@ mod tests {
 
     #[test]
     fn weather_snapshot_retains_previous() {
-        let ok = "Valledupar  ·  Temp +25°C  ·  Wind ↑5km/h";
+        let ok = "Example City  ·  Temp +25°C  ·  Wind ↑5km/h";
         let s = weather_snapshot("a", Some(ok), None);
         let r = weather_snapshot("b", None, Some(s.clone()));
-        assert_eq!((r.compact.as_str(), r.location.as_str(), r.wind.as_str()), ("a 25°C", "Valledupar", "Wind ↑5km/h"));
+        assert_eq!((r.compact.as_str(), r.location.as_str(), r.wind.as_str()), ("a 25°C", "Example City", "Wind ↑5km/h"));
         let r = weather_snapshot("b", Some("garbage"), Some(s));
-        assert_eq!(r.location, "Valledupar");
+        assert_eq!(r.location, "Example City");
         let f = weather_snapshot("c", None, None);
         assert_eq!((f.compact.as_str(), f.location.as_str(), f.wind.as_str()), ("c", "Weather unavailable", ""));
         let n = weather_snapshot("d", Some(ok), Some(f));

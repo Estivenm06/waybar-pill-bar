@@ -2,8 +2,7 @@ notch/target/
 __pycache__/
 *.py[cod]
 node_modules/
-/promo/hyperframes/
-/promo/showcase/
+/promo/
 .env
 .env.*
 google.json
@@ -12,3 +11,11 @@ project-id
 browser-profile/
 backup-*/
 *.new
+/json
+/importlib.util
+/importlib.machinery
+*.ps
+*.core
+core
+core.*
+*.log

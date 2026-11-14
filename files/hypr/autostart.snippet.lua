@@ -1,7 +1,5 @@
 -- >>> waybar-pill-bar BEGIN (managed block, do not edit) >>>
--- Waybar and its popup daemon run as systemd user services (waybar.service, waybar-notch.service).
--- Keep Omarchy's built-in bar hidden (bar-off flag); Waybar is the visible bar.
-o.exec_on_start("omarchy-toggle-bar on")
+-- Waybar and the notch are owned by the Omarchy plugin backend (waybar.pill-bar), not by systemd units.
 -- Frosted glass: real compositor blur behind the bar, notch, popups, OSD and notifications (never the click-catcher)
 hl.config({ decoration = { blur = { enabled = true } } })
 hl.layer_rule({ match = { namespace = "^(waybar|waybar-notch|waybar-popup|waybar-osd|waybar-notifications)$" }, blur = true, ignore_alpha = 0.03 })

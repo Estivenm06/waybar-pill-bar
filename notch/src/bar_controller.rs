@@ -1,5 +1,5 @@
 //! Side-pill control. The GTK notch owns the destination output and tells the Waybar supervisor
-//! (`waybar-notch --waybar-supervisor`, run by `waybar.service`) over a private datagram socket which output's
+//! (`waybar-notch --waybar-supervisor`, launched by the Omarchy plugin backend, waybar-pill-plugin) over a private datagram socket which output's
 //! pills to show. The supervisor keeps one persistent Waybar worker per enabled output (all started hidden) and only
 //! ever sends show/hide signals to those workers, so a focus change never reloads or restarts Waybar.
 use crate::config::{self, NotchSettings};

@@ -23,6 +23,7 @@ CONFLICTS = ("omarchy.notifications", "omarchy.osd")
 NOTIFY_NAME = "org.freedesktop.Notifications"
 LEASE_WAIT = 5.0
 READY_WAIT = 15.0
+SESSION_SOCKETS = ("notifications.sock", "notch-content.sock")
 STOP_WAIT = 5.0
 
 
@@ -81,7 +82,10 @@ def read_marker():
 
 
 def mode():
-    return "plugin" if read_marker() is not None else "standalone"
+    """Installation diagnostic: 'plugin' for a valid install record, an error otherwise."""
+    if read_marker() is None:
+        raise PluginError("plugin setup has not been run: run ./install.sh in the plugin checkout, then re-enable")
+    return "plugin"
 
 
 def sha256_of(path):
@@ -164,6 +168,7 @@ class Session:
         self.children = []  # [(name, Popen)] in start order
         self.active = False
         self.cleaned = False
+        self.sockets = []  # absolute paths of the session-owned sockets (notch listeners)
 
     # ---- external queries
     def sh(self, *cmd):
@@ -234,15 +239,15 @@ class Session:
     # ---- transaction
     def preflight(self):
         if read_marker() is None:
-            raise PluginError("plugin setup has not been run: run ./install.sh --plugin in the plugin checkout, then re-enable")
+            raise PluginError("plugin setup has not been run: run ./install.sh in the plugin checkout, then re-enable")
         b = os.path.join(home(), ".local", "bin", "waybar-notch")
         helper = os.path.join(home(), ".config", "waybar", "scripts", "waybar-popupctl")
         for p in (b, helper, os.path.join(home(), ".config", "waybar", "config.jsonc")):
             if not os.path.exists(p):
-                raise PluginError("%s is missing: run ./install.sh --plugin" % p)
+                raise PluginError("%s is missing: run ./install.sh" % p)
         drop = os.path.join(home(), ".config", "systemd", "user", "waybar.service.d", "50-waybar-notch.conf")
         if os.path.exists(drop) or self.sh("systemctl", "--user", "is-enabled", "waybar-notch.service").returncode == 0:
-            raise PluginError("a standalone install is still present: run ./uninstall.sh (standalone) before using the plugin")
+            raise PluginError("Legacy standalone files detected; remove the old standalone installation with its original uninstaller before running ./install.sh.")
         self.load_shell()
         if self.sh("omarchy", "plugin", "list", "--json").returncode != 0:
             raise PluginError("Omarchy plugin IPC is not working")
@@ -255,8 +260,31 @@ class Session:
             raise PluginError("waybar.service is not a plain Waybar; refusing to stop it")
         return True
 
-    def activate(self):
+    def native_targets_gone(self):
+        """The native QML handlers answer `ping` until unloaded; the process-wide bus name is not released with them."""
+        return all(self.sh("omarchy-shell", t, "ping").returncode != 0 for t in ("notifications", "osd"))
+
+    def prepare_session_socket(self, name):
+        """Path of one of this session's own sockets, after clearing a stale one left by a dead session."""
+        if name not in SESSION_SOCKETS:
+            raise PluginError("%s is not a session socket" % name)
+        path = os.path.join(runtime_dir(), name)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return path
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            raise PluginError("%s is not a socket of yours; remove it and retry" % path)
+        os.unlink(path)  # the runtime flock proves no live session owns it
+        return path
+
+    def activate(self, shell_pid, connect_relay):
+        """`shell_pid` is the lease peer (the Quickshell process). `connect_relay` runs the QML handshake and raises
+        PluginError unless the shell attached its notification server to the notch."""
         self.preflight()
+        owner = self.notify_owner_pid()
+        if owner is not None and owner != shell_pid:
+            raise PluginError("another process (pid %d) owns %s; it was not touched" % (owner, NOTIFY_NAME))
         waybar_was_active = self.waybar_unit_was_active()
         conflicts = self.conflicting_enabled()
         journal = {"version": 1, "phase": "preparing", "bar_hidden_before": os.path.exists(self.bar_flag()),
@@ -264,10 +292,9 @@ class Session:
         self.save_journal(journal)
         try:
             self.edit_disabled(add=conflicts)
-            self.wait_until(lambda: not self.conflicting_enabled(), 5.0, "native notifications/OSD did not unload")
-            owner = self.notify_owner_pid()
-            if owner is not None:
-                raise PluginError("another process (pid %d) owns %s; it was not touched" % (owner, NOTIFY_NAME))
+            self.wait_until(lambda: not self.conflicting_enabled() and self.native_targets_gone(), 5.0,
+                            "native notifications/OSD did not unload")
+            self.sockets = [self.prepare_session_socket(n) for n in SESSION_SOCKETS]
             if not journal["bar_hidden_before"]:
                 self.sh("omarchy", "toggle", "bar", "on")
             if waybar_was_active:
@@ -275,10 +302,16 @@ class Session:
             baseline = set(self.hypr_errors())
             exe = os.path.join(home(), ".local", "bin", "waybar-notch")
             env = {k: v for k, v in os.environ.items() if k not in ("GDK_SCALE", "GDK_DPI_SCALE")}
-            for name, args in (("supervisor", [exe, "--waybar-supervisor"]), ("notch", [exe])):
+            for name, args in (("supervisor", [exe, "--waybar-supervisor"]),
+                               ("notch", [exe, "--notification-relay", str(shell_pid)])):
                 self.children.append((name, self.popen(args, env=env, start_new_session=True,
                                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
             self.wait_until(lambda: self.ready(baseline), READY_WAIT, "the notch and Waybar did not become ready")
+            connect_relay()
+            self.check_children()
+            owner = self.notify_owner_pid()
+            if owner != shell_pid:
+                raise PluginError("the shell does not own %s after attaching the relay" % NOTIFY_NAME)
             journal["phase"] = "active"
             self.save_journal(journal)
             self.active = True
@@ -314,9 +347,12 @@ class Session:
             return False
         if not os.path.exists(os.path.join(rt, "waybar-notch", "bar-control.sock")):
             return False
-        notch = dict(self.children)["notch"]
-        if self.notify_owner_pid() != notch.pid:
-            return False
+        for path in self.sockets:
+            try:
+                if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                    return False
+            except OSError:
+                return False
         r = self.sh("hyprctl", "layers", "-j")
         if '"waybar"' not in r.stdout.replace(" ", ""):
             return False
@@ -359,6 +395,13 @@ class Session:
                     pass
                 self.reap(p, 1.0)
         self.children = []
+        for path in self.sockets:
+            try:
+                if stat.S_ISSOCK(os.lstat(path).st_mode):
+                    os.unlink(path)
+            except OSError:
+                pass
+        self.sockets = []
         restore(self)
 
     def reap(self, p, limit):
@@ -418,10 +461,40 @@ def lock_runtime():
     return fd
 
 
-def peer_ok(conn):
+def peer_credentials(conn):
+    """(pid, uid, gid) of the process on the other end of a Unix socket, from the kernel."""
     import struct
     cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-    return struct.unpack("3i", cred)[1] == os.getuid()
+    return struct.unpack("3i", cred)
+
+
+def relay_handshake(conn, session, limit=READY_WAIT):
+    """Ask the shell's plugin to attach its notification server to the notch, then wait for its acknowledgement."""
+    try:
+        conn.sendall((json.dumps({"ok": True, "active": False, "stage": "connect-relay"}) + "\n").encode())
+    except OSError:
+        raise PluginError("the lease closed before the notification relay was ready")
+    end = time.monotonic() + limit
+    buf = b""
+    while b"\n" not in buf:
+        session.check_children()
+        left = end - time.monotonic()
+        if left <= 0:
+            raise PluginError("the shell did not attach the notification relay in time")
+        if not select.select([conn], [], [], min(0.2, left))[0]:
+            continue
+        chunk = conn.recv(4096)
+        if not chunk:
+            raise PluginError("the lease closed before the notification relay was ready")
+        buf += chunk
+        if len(buf) > 4096:
+            raise PluginError("the shell sent an oversized relay acknowledgement")
+    try:
+        ack = json.loads(buf.split(b"\n")[0].decode())
+    except ValueError:
+        ack = None
+    if ack != {"op": "relay-ready", "version": 1}:
+        raise PluginError("the shell sent an invalid relay acknowledgement")
 
 
 def read_line(conn, limit=5.0):
@@ -491,7 +564,8 @@ def serve(runner=run, popen=subprocess.Popen):
             if srv in r:
                 conn, _ = srv.accept()
                 try:
-                    if not peer_ok(conn):
+                    pid, uid, _ = peer_credentials(conn)
+                    if uid != os.getuid():
                         conn.close()
                         continue
                     op = read_line(conn).get("op")
@@ -501,7 +575,7 @@ def serve(runner=run, popen=subprocess.Popen):
                             conn.close()
                             continue
                         try:
-                            session.activate()
+                            session.activate(pid, lambda: relay_handshake(conn, session))
                         except PluginError as e:
                             print("waybar-pill-plugin: " + str(e), file=sys.stderr)
                             reply(conn, False, False, str(e))
@@ -546,7 +620,7 @@ def start():
     """Launcher for the QML service: verify setup, then ensure one detached backend is running."""
     read = read_marker()
     if read is None:
-        print("waybar-pill-plugin: plugin setup has not been run: run ./install.sh --plugin in the plugin checkout, then re-enable", file=sys.stderr)
+        print("waybar-pill-plugin: plugin setup has not been run: run ./install.sh in the plugin checkout, then re-enable", file=sys.stderr)
         return 1
     runtime_dir()
     if request("active", 1.0) is not None:
@@ -608,13 +682,13 @@ def main(argv):
         print(mode())
         return 0
     if c == "active" and len(argv) == 1:
-        if mode() != "plugin":
+        if read_marker() is None:
             return 1
         r = request("active", 1.0)
         return 0 if r and r.get("active") else 1
     if c == "toggle" and len(argv) == 1:
         # active session: toggle the owned supervisor; otherwise the native Omarchy bar
-        if mode() == "plugin":
+        if read_marker() is not None:
             r = request("active", 1.0)
             if r and r.get("active"):
                 return control("toggle")

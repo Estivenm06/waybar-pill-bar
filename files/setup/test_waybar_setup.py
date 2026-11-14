@@ -15,7 +15,6 @@ BASE_CONFIG = {
 }
 
 BLOCK = """-- >>> waybar-pill-bar BEGIN (managed block, do not edit) >>>
-o.exec_on_start("omarchy-toggle-bar on")
 -- Popup animation: pop in
 hl.layer_rule({ match = { namespace = "waybar-popup" }, animation = "popin 88%" })
 -- <<< waybar-pill-bar END <<<
@@ -112,22 +111,21 @@ class SetupTests(unittest.TestCase):
                 self.m.replace_bg_rules(bad, ["x -- @bg"])
             self.assertIn("install.sh", str(cm.exception))
 
-    def test_plugin_render_drops_startup_launches_but_keeps_window_rules(self):
+    def test_render_has_window_rules_but_no_launch_or_bar_hide(self):
         cfg = self.cfg([("steam", True)])
-        std = self.m.bg_lines(cfg)
-        plug = self.m.bg_lines(cfg, plugin=True)
-        self.assertEqual(len(std), 2)
-        self.assertEqual(len(plug), 1)
-        self.assertIn("o.window(", plug[0])
-        self.assertFalse([ln for ln in plug if "exec_on_start" in ln])
+        lines = self.m.bg_lines(cfg)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("o.window(", lines[0])
         src = os.path.join(self.tmp, "in.lua")
         with open(src, "w") as f:
             f.write(BLOCK)
-        for plugin, expect_hide in ((False, True), (True, False)):
-            out = os.path.join(self.tmp, "out%d.lua" % plugin)
-            self.m.cmd_render_autostart(src, out, plugin)
-            with open(out) as f:
-                self.assertEqual('o.exec_on_start("omarchy-toggle-bar on")' in f.read(), expect_hide)
+        out = os.path.join(self.tmp, "out.lua")
+        self.m.cmd_render_autostart(src, out)
+        with open(out) as f:
+            text = f.read()
+        self.assertIn("o.window(", text)
+        self.assertNotIn("exec_on_start", text)
+        self.assertNotEqual(self.m.main(["render-autostart", src, out, "--plugin"]), 0)
 
     def test_apply_in_plugin_mode_rolls_back_both_files_and_never_starts_services(self):
         wb = self.m.WAYBAR
@@ -176,6 +174,57 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn("systemctl", calls)
         self.assertIn("helper record-generated", calls)
         self.assertNotIn("helper reload", calls)  # plugin disabled: saved only
+
+    def _prep_apply(self, helper_body):
+        wb = self.m.WAYBAR
+        auto = os.path.join(self.home, ".config", "hypr", "autostart.lua")
+        os.makedirs(os.path.join(wb, "scripts"))
+        os.makedirs(os.path.dirname(auto))
+        os.makedirs(os.path.dirname(self.m.CONFIG), exist_ok=True)
+        with open(self.m.CONFIG, "w") as f:
+            json.dump(self.cfg([("steam", True)]), f)
+        conf = os.path.join(wb, "config.jsonc")
+        conf_text = json.dumps(BASE_CONFIG, indent=2) + "\n"
+        with open(conf, "w") as f:
+            f.write(conf_text)
+        with open(auto, "w") as f:
+            f.write(BLOCK)
+        log = os.path.join(self.tmp, "calls.log")
+        for n, body in {"systemctl": 'echo "systemctl $*" >> "%s"' % log, "hyprctl": 'echo "hyprctl $*" >> "%s"' % log}.items():
+            with open(os.path.join(self.bin, n), "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(os.path.join(self.bin, n), 0o755)
+        if helper_body is not None:
+            helper = os.path.join(wb, "scripts", "waybar-pill-plugin")
+            with open(helper, "w") as f:
+                f.write("#!/bin/sh\n" + helper_body.replace("LOG", log) + "\n")
+            os.chmod(helper, 0o755)
+        self.m.sys.executable = "/bin/sh"
+        return conf, conf_text, auto, log
+
+    def test_apply_refuses_without_a_valid_installation_before_writing(self):
+        for body in (None, "echo 'plugin setup has not been run' >&2; exit 1", "echo standalone", "echo"):
+            with self.subTest(helper=body):
+                for d in (self.m.WAYBAR, os.path.join(self.home, ".config", "hypr")):
+                    shutil.rmtree(d, ignore_errors=True)
+                script = None if body is None else 'case "$1" in mode) %s;; esac' % body
+                conf, conf_text, auto, log = self._prep_apply(script)
+                with self.assertRaises(self.m.ConfigError):
+                    self.m.cmd_apply()
+                with open(conf) as f:
+                    self.assertEqual(f.read(), conf_text)
+                with open(auto) as f:
+                    self.assertEqual(f.read(), BLOCK)
+                self.assertFalse(os.path.exists(log))
+
+    def test_apply_reloads_only_the_owned_backend_when_active(self):
+        conf, conf_text, auto, log = self._prep_apply('case "$1" in mode) echo plugin;; *) echo "helper $*" >> "LOG";; esac')
+        self.m.cmd_apply()
+        with open(log) as f:
+            calls = f.read()
+        self.assertIn("helper record-generated", calls)
+        self.assertIn("helper reload", calls)
+        self.assertNotIn("systemctl", calls)
 
 
 if __name__ == "__main__":

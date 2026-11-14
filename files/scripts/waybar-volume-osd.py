@@ -1,6 +1,6 @@
 #!/usr/bin/env /usr/bin/python3
 """Volume keys: change the volume, then ask the notch daemon to show its overlay.
-Plugin installed but inactive: native Omarchy volume handling instead."""
+Plugin session inactive or not set up: native Omarchy volume handling instead."""
 import os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -11,8 +11,7 @@ ACTIONS = {
 }
 action = sys.argv[1] if len(sys.argv) > 1 else 'raise'
 helper = os.path.join(HERE, 'waybar-pill-plugin')
-if subprocess.run([sys.executable, helper, 'mode'], capture_output=True, text=True).stdout.strip() == 'plugin' \
-        and subprocess.run([sys.executable, helper, 'active']).returncode != 0:
+if subprocess.run([sys.executable, helper, 'active']).returncode != 0:
     sys.exit(subprocess.run(['omarchy-audio-output-volume', action]).returncode)
 cmd = ACTIONS.get(action)
 if cmd:

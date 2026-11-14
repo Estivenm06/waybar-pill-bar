@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install record for plugin mode (install.sh --plugin / uninstall.sh).
+"""Install record for plugin mode (install.sh / uninstall.sh).
 
   plugin-state.py begin FILE...   preflight, back up originals once, write the record (hashes pending)
   plugin-state.py finish          record the sha256 of every installed file
@@ -56,7 +56,7 @@ def begin(files):
     if active_session():
         return fail("the plugin is active: run `omarchy plugin disable waybar.pill-bar` first")
     if m is None and legacy_present():
-        return fail("a standalone install is present: run ./uninstall.sh (standalone) before plugin setup")
+        return fail("Legacy standalone files detected; remove the old standalone installation with its original uninstaller before running ./install.sh.")
     paths = [os.path.abspath(p) for p in files]
     if m is None:
         base = os.path.join(helper.home(), ".config", "waybar", "backup-" + time.strftime("%Y%m%d-%H%M%S"))

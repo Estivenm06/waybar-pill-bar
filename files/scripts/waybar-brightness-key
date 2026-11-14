@@ -1,9 +1,9 @@
 #!/bin/bash
 # Brightness keys. Usage: waybar-brightness-key +5%|5%-|100%|1%
-# Standalone or plugin active: change brightness silently, then show the notch overlay.
-# Plugin installed but inactive: native Omarchy behavior, including its own OSD.
+# Plugin session active: change brightness silently, then show the notch overlay.
+# Otherwise (inactive or not set up): native Omarchy behavior, including its own OSD.
 D="$(dirname "$0")"
-if [ "$(python3 "$D/waybar-pill-plugin" mode)" = plugin ] && ! python3 "$D/waybar-pill-plugin" active; then
+if ! python3 "$D/waybar-pill-plugin" active; then
   exec omarchy-brightness-display "$1"
 fi
 omarchy-brightness-display --no-osd "$1"

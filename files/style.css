@@ -142,6 +142,17 @@ window#waybar {
   color: @brand-whatsapp;
 }
 
+/* plugin status stream: unread count beside the icon; bridge down or login needed reads dim */
+#custom-whatsapp.unread {
+  color: @brand-whatsapp;
+  font-weight: 600;
+}
+
+#custom-whatsapp.offline,
+#custom-whatsapp.unlinked {
+  color: alpha(@text-dim, 0.55);
+}
+
 #custom-spotify.running {
   color: @brand-spotify;
 }
@@ -415,6 +426,9 @@ tooltip {
 #apps #custom-steam.running    { color: @brand-steam; }
 #apps #custom-spotify.running  { color: @brand-spotify; }
 #apps #custom-whatsapp.running { color: @brand-whatsapp; }
+#apps #custom-whatsapp.unread { color: @brand-whatsapp; font-weight: 600; }
+#apps #custom-whatsapp.offline,
+#apps #custom-whatsapp.unlinked { color: alpha(@text-dim, 0.55); }
 
 /* connected Bluetooth devices and an active Bluetooth output read as active, not idle */
 #right #status #bluetooth.connected { color: @accent; }

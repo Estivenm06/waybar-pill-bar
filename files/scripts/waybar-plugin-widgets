@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Bridge between Waybar and the Omarchy desktop plugins hosted by the (parked) native bar.
+
+Usage: waybar-plugin-widgets open power | open whatsapp | whatsapp-status
+
+`open` summons the plugin's existing panel through the running shell; it never enables, installs or restarts anything.
+`open whatsapp` instead asks the clicked output's WhatsApp content to toggle inside the central notch (the adapter Pill
+Bar installs next to the WhatsApp panel). Both require an active Pill Bar session.
+`whatsapp-status` is a long-running Waybar `return-type: json` stream: the WhatsApp daemon's unread badge and link state.
+Chat and message contents are never read out of the frames, printed or logged."""
+import json
+import math
+import os
+import select
+import socket
+import subprocess
+import sys
+import time
+
+WIDGETS = {"power": "patcastle.power", "whatsapp": "io.github.ricky.whatsapp"}
+WHATSAPP = WIDGETS["whatsapp"]
+GLYPH = "\uf232"
+MAX_LINE = 512 * 1024
+RECONNECT = 2.0
+HYPR_TIMEOUT = 2
+
+
+def fail(msg):
+    print("waybar-plugin-widgets: " + msg, file=sys.stderr)
+    try:
+        subprocess.run(["notify-send", "--app-name=Waybar", "-u", "normal", "Plugin widget unavailable", msg],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 1
+
+
+def pill_bar_guard():
+    """Error text, or None. The widgets only make sense while Pill Bar is the active bar."""
+    guard = os.path.join(os.path.dirname(os.path.abspath(__file__)), "waybar-pill-plugin")
+    if not os.path.exists(guard):
+        return "the Pill Bar helper is missing: run ./install.sh in the plugin checkout"
+    try:
+        active = subprocess.run([sys.executable, guard, "active"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        return "cannot check whether Pill Bar is active: %s" % e
+    return None if active else "Pill Bar is not active"
+
+
+class AnchorError(Exception):
+    pass
+
+
+def hypr_json(sig, what):
+    try:
+        r = subprocess.run(["hyprctl", "-i", sig, "-j", what], capture_output=True, text=True, timeout=HYPR_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise AnchorError("hyprctl %s failed: %s" % (what, e))
+    if r.returncode != 0:
+        raise AnchorError("hyprctl %s failed: %s" % (what, r.stderr.strip() or "exit %d" % r.returncode))
+    try:
+        return json.loads(r.stdout)
+    except ValueError as e:
+        raise AnchorError("hyprctl %s returned bad JSON: %s" % (what, e))
+
+
+def hypr_signature():
+    """$HYPRLAND_INSTANCE_SIGNATURE, else the newest instance directory whose compositor answers."""
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if sig:
+        return sig
+    base = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr")
+    try:
+        ents = sorted(os.scandir(base), key=lambda e: e.stat().st_mtime, reverse=True)
+    except OSError as e:
+        raise AnchorError("no Hyprland instance found: %s" % e)
+    for e in ents:
+        try:
+            hypr_json(e.name, "cursorpos")
+            return e.name
+        except AnchorError:
+            continue
+    raise AnchorError("no live Hyprland instance answers")
+
+
+def query_compositor():
+    sig = hypr_signature()
+    return hypr_json(sig, "cursorpos"), hypr_json(sig, "monitors"), hypr_json(sig, "layers")
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+def logical_size(mon):
+    w, h, scale = _num(mon.get("width")), _num(mon.get("height")), _num(mon.get("scale"))
+    if w is None or h is None or w <= 0 or h <= 0:
+        return None
+    if scale is None or scale <= 0:
+        scale = 1.0
+    lw, lh = w / scale, h / scale
+    if (_num(mon.get("transform")) or 0) % 2 != 0:
+        lw, lh = lh, lw
+    return lw, lh
+
+
+def layer_rects(layers, output):
+    levels = ((layers or {}).get(output) or {}).get("levels") or {}
+    groups = levels.values() if isinstance(levels, dict) else levels
+    for group in groups:
+        for layer in group or []:
+            if isinstance(layer, dict) and layer.get("namespace") == "waybar":
+                yield layer
+
+
+def whatsapp_output(cursor, monitors, layers):
+    """Name of the output whose top Waybar was clicked.
+    Hyprland reports the cursor and layer rectangles in global logical coordinates; monitor sizes are physical."""
+    try:
+        cx, cy = _num(cursor["x"]), _num(cursor["y"])
+    except (KeyError, TypeError):
+        cx = cy = None
+    if cx is None or cy is None:
+        raise AnchorError("the cursor position is unavailable")
+    if not isinstance(monitors, list):
+        raise AnchorError("the monitor list is unavailable")
+    for mon in monitors:
+        if not isinstance(mon, dict) or mon.get("disabled") is True or not isinstance(mon.get("name"), str):
+            continue
+        size, mx, my = logical_size(mon), _num(mon.get("x")), _num(mon.get("y"))
+        if size is None or mx is None or my is None:
+            continue
+        lx, ly = cx - mx, cy - my
+        if not (0 <= lx < size[0] and 0 <= ly < size[1]):
+            continue
+        name = mon["name"]
+        hits = []
+        for layer in layer_rects(layers, name):
+            x, y, w, h = (_num(layer.get(k)) for k in ("x", "y", "w", "h"))
+            if None in (x, y, w, h) or w <= 0 or h <= 0:
+                continue
+            x, y = x - mx, y - my
+            if w > h and y >= 0 and y + h <= size[1] / 2 and x <= lx < x + w and y <= ly < y + h:
+                hits.append(layer)
+        if len(hits) != 1:
+            raise AnchorError("the click on %s is not on a single top Waybar bar (%d matches)" % (name, len(hits)))
+        return name
+    raise AnchorError("the cursor is not on an enabled output")
+
+
+def open_whatsapp_notch():
+    try:
+        name = whatsapp_output(*query_compositor())
+    except AnchorError as e:
+        return fail("cannot open WhatsApp in the notch: %s" % e)
+    try:
+        r = subprocess.run(["omarchy-shell", "waybar-pill-whatsapp-" + name, "toggleNotch"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return fail("cannot run omarchy-shell: %s" % e)
+    if r.returncode != 0 or r.stdout.strip() != "ok":
+        detail = r.stderr.strip() or r.stdout.strip() or "exit %d" % r.returncode
+        return fail("WhatsApp did not open in the notch on %s (the Pill Bar WhatsApp adapter may not be loaded: reinstall "
+                    "Pill Bar and run 'omarchy restart shell'): %s" % (name, detail))
+    return 0
+
+
+def cmd_open(which):
+    plugin = WIDGETS.get(which)
+    if plugin is None:
+        print(__doc__, file=sys.stderr)
+        return 2
+    why = pill_bar_guard()
+    if why:
+        return fail(why)
+    if which == "whatsapp":
+        return open_whatsapp_notch()
+    try:
+        r = subprocess.run(["omarchy-shell", "shell", "summon", plugin, "{}"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return fail("cannot run omarchy-shell: %s" % e)
+    if r.returncode != 0 or r.stdout.strip() != "ok":
+        detail = (r.stderr.strip() or r.stdout.strip() or "exit %d" % r.returncode)
+        return fail("the %s widget did not open (is %s enabled in the bar layout?): %s" % (which, plugin, detail))
+    return 0
+
+
+def shell_config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "omarchy", "shell.json")
+
+
+def widget_settings():
+    """Settings of the WhatsApp entry in the native bar layout; the installed widget's own defaults otherwise."""
+    out = {"socketPath": "", "showUnreadCount": True}
+    try:
+        with open(shell_config_path()) as f:
+            cfg = json.load(f)
+        layout = cfg["bar"]["layout"]
+        for entries in layout.values():
+            for e in entries:
+                if isinstance(e, dict) and e.get("id") == WHATSAPP:
+                    if isinstance(e.get("socketPath"), str):
+                        out["socketPath"] = e["socketPath"]
+                    if isinstance(e.get("showUnreadCount"), bool):
+                        out["showUnreadCount"] = e["showUnreadCount"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return out
+
+
+def socket_path(configured):
+    if configured:
+        return configured
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-whatsapp.sock")
+
+
+class Status:
+    """Connection/link/unread facts from the daemon, and the Waybar JSON they render to."""
+
+    def __init__(self, show_count):
+        self.show_count = show_count
+        self.reset()
+
+    def reset(self):
+        self.online = False
+        self.linked = False
+        self.needs_login = False
+        self.connection = ""
+        self.unread = 0
+
+    def apply(self, frame):
+        t = frame.get("t")
+        if t == "state":
+            self.online = True
+            self.connection = str(frame.get("connection") or "")
+            self.needs_login = frame.get("needsLogin") is True
+            self.linked = frame.get("linked") is True
+            self.unread = _count(frame.get("unread"))
+        elif t in ("chats", "message") and "unread" in frame:
+            self.unread = _count(frame.get("unread"))  # unread-only update: keep connection/link flags
+
+    def render(self):
+        if not self.online:
+            return {"text": GLYPH, "tooltip": "WhatsApp bridge unavailable", "class": ["offline"]}
+        if self.needs_login or not self.linked:
+            return {"text": GLYPH, "tooltip": "WhatsApp: login required", "class": ["unlinked"]}
+        if self.connection != "open":
+            return {"text": GLYPH, "tooltip": "WhatsApp: reconnecting", "class": ["offline"]}
+        n = self.unread
+        text = GLYPH
+        if n > 0 and self.show_count:
+            text += " " + ("99+" if n > 99 else str(n))
+        if n > 0:
+            return {"text": text, "tooltip": "WhatsApp: %d unread" % n, "class": ["running", "unread"]}
+        return {"text": text, "tooltip": "WhatsApp: connected", "class": ["running"]}
+
+
+def _count(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+class OutputClosed(Exception):
+    """Whoever reads our stdout (Waybar) is gone."""
+
+
+class Emitter:
+    def __init__(self, out):
+        self.out = out
+        self.last = None
+
+    def fileno(self):
+        try:
+            return self.out.fileno()
+        except (AttributeError, OSError, ValueError):
+            return None  # not a real file (tests)
+
+    def emit(self, view):
+        if view == self.last:
+            return
+        self.last = view
+        try:
+            self.out.write(json.dumps(view, ensure_ascii=False) + "\n")
+            self.out.flush()
+        except BrokenPipeError:
+            raise OutputClosed
+
+
+def read_session(sock, status, emitter):
+    """Stream frames until the connection ends or misbehaves. Returns normally on EOF/oversize/malformed input.
+    Raises BrokenPipeError as soon as the reader of our stdout is gone, even while the daemon is silent."""
+    buf = b""
+    watch = select.poll()
+    watch.register(sock.fileno(), select.POLLIN)
+    out_fd = emitter.fileno()
+    if out_fd is not None:
+        watch.register(out_fd, 0)  # POLLERR/POLLHUP are always reported
+    while True:
+        ready = False
+        for fd, ev in watch.poll():
+            if fd == out_fd and ev & (select.POLLERR | select.POLLHUP):
+                raise OutputClosed
+            if fd == sock.fileno():
+                ready = True
+        if not ready:
+            continue
+        chunk = sock.recv(65536)
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if len(line) > MAX_LINE:
+                return
+            try:
+                frame = json.loads(line)
+            except ValueError:
+                return
+            if isinstance(frame, dict):
+                status.apply(frame)
+                emitter.emit(status.render())
+        if len(buf) > MAX_LINE:
+            return
+
+
+def cmd_status(out=None, once=False):
+    settings = widget_settings()
+    status = Status(settings["showUnreadCount"])
+    emitter = Emitter(out or sys.stdout)
+    path = socket_path(settings["socketPath"])
+    try:
+        emitter.emit(status.render())
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.connect(path)
+                    s.sendall(b'{"t":"hello"}\n')
+                    read_session(s, status, emitter)
+            except OutputClosed:
+                raise
+            except OSError:
+                pass
+            status.reset()  # a stale badge must not outlive its connection
+            emitter.emit(status.render())
+            if once:
+                return 0
+            time.sleep(RECONNECT)
+    except (OutputClosed, KeyboardInterrupt):
+        # Waybar went away: leave without a traceback from the interpreter's final stdout flush
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 0
+
+
+def main(argv):
+    if len(argv) == 2 and argv[0] == "open":
+        return cmd_open(argv[1])
+    if argv == ["whatsapp-status"]:
+        return cmd_status()
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

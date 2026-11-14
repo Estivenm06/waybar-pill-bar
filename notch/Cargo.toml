@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 async-channel = "2"
 chrono = "0.4.45"
-futures-lite = "2.6.1"
 gtk4 = { version = "0.11.5", features = ["v4_12"] }
 gtk4-layer-shell = "0.8.1"
 libc = "0.2"
