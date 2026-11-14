@@ -31,7 +31,7 @@ if [ -e "$STATE_PLUGIN" ]; then
   fi
   exit 0
 fi
-BK=$(ls -d "$W"/backup-* 2>/dev/null | sort | tail -1 || true)
+BK=$(ls -td "$W"/backup-[0-9]* 2>/dev/null | head -1 || true)
 [ -n "$BK" ] || { echo "No backup found in $W"; exit 1; }
 echo "Restoring from $BK"
 for f in config.jsonc style.css; do [ -e "$BK/$f" ] && cp -a "$BK/$f" "$W/$f"; done

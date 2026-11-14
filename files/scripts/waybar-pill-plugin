@@ -217,6 +217,16 @@ class Session:
         write_atomic(self.shell_json(), json.dumps(cfg, indent=2) + "\n", 0o644)
         self.sh("omarchy-shell", "shell", "reloadConfig")
 
+    def ensure_notifications(self):
+        """Never leave the desktop without a notification daemon/OSD after restore."""
+        cfg = self.load_shell()
+        dis = list(cfg.get("disabledPlugins", []))
+        plugins = cfg.get("plugins", {})
+        names = [n.get("id", "") if isinstance(n, dict) else str(n) for n in (plugins if isinstance(plugins, list) else [])]
+        active = [n for n in names if "notifications" in str(n) and n not in dis]
+        if "omarchy.notifications" in dis and not active:
+            self.edit_disabled(remove=["omarchy.notifications", "omarchy.osd"])
+
     # ---- journal
     def save_journal(self, j):
         write_atomic(journal_path(), json.dumps(j, indent=2) + "\n")
@@ -375,6 +385,7 @@ def restore(session=None):
     failed = []
     try:
         s.edit_disabled(remove=j.get("disabled_plugins_added", []))
+        s.ensure_notifications()
     except Exception as e:
         failed.append("plugins: %s" % e)
     try:

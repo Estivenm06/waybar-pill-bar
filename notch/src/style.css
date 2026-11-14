@@ -294,3 +294,4 @@ window.no-anim .ncard, window.no-anim .ncard * { transition: none; animation: no
 .settings-page switch:checked { background: alpha({{accent}}, 0.55); }
 .settings-page button:focus-visible, .settings-page entry:focus-within, .settings-page spinbutton:focus-within, .settings-page switch:focus-visible { outline: 2px solid alpha({{accent}}, 0.7); outline-offset: 1px; }
 .settings-page .settings-footer { padding-top: 2px; }
+.c-weather { font-family: "Symbols Nerd Font", {{font}}; font-size: 11.5px; font-weight: 600; color: alpha({{fg-hi}}, 0.85); }

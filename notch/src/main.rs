@@ -94,6 +94,7 @@ impl CaptureAction {
 enum Msg {
     Media { status: String, artist: String, title: String, art_url: String, len: f64, player: String },
     NoMedia,
+    Weather(String),
     Art(String, String),
     Pos(f64),
     Bars(u64, [f64; BARS]),
@@ -157,6 +158,8 @@ struct Ui {
     coll_stack: gtk::Stack,
     c_note: gtk::Label,
     c_title: gtk::Label,
+    c_weather: gtk::Label,
+    i_weather: gtk::Label,
     eq: gtk::DrawingArea,
     m_art: gtk::Picture,
     m_backdrop: gtk::Picture,
@@ -1649,6 +1652,27 @@ fn usage_thread(tx: async_channel::Sender<Msg>, rx: std::sync::mpsc::Receiver<bo
     });
 }
 
+fn weather_thread(tx: async_channel::Sender<Msg>) {
+    std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            let run = |c: &str| std::process::Command::new(c).output().ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            let icon = run("omarchy-weather-icon").filter(|s| !s.is_empty()).unwrap_or_else(|| "\u{f0c2}".to_string());
+            let temp = run("omarchy-weather-status").and_then(|s| {
+                let i = s.find("Temp ")? + 5;
+                let t: String = s[i..].chars().take_while(|c| !c.is_whitespace()).collect();
+                Some(t.trim_start_matches('+').to_string())
+            });
+            if let Some(t) = temp { last = format!("{icon} {t}"); }
+            else if last.is_empty() { last = icon; }
+            let _ = tx.try_send(Msg::Weather(last.clone()));
+            std::thread::sleep(Duration::from_secs(600));
+        }
+    });
+}
+
 fn stats_thread(tx: async_channel::Sender<Msg>) {
     std::thread::spawn(move || {
         let p = power::snapshot();
@@ -2470,6 +2494,10 @@ impl Ui {
                 self.viz_on.set(false);
                 self.stop_visualizer();
             }
+            Msg::Weather(t) => {
+                self.c_weather.set_text(&t);
+                self.i_weather.set_text(&t);
+            }
             Msg::Stats(b, v, w, bt, bt_on) => {
                 for (l, t) in [(&self.s_batt, &b), (&self.s_vol, &v), (&self.s_wifi, &w), (&self.s_bt, &bt)] {
                     l.set_text(t);
@@ -2755,15 +2783,22 @@ fn build(app: &gtk::Application) {
     eq.set_content_height(16);
     eq.set_valign(gtk::Align::Center);
     eq.set_halign(gtk::Align::End);
-    eq.set_hexpand(true);
+    eq.set_hexpand(false);
+    let c_weather = gtk::Label::new(None);
+    c_weather.add_css_class("c-weather");
+    c_weather.set_halign(gtk::Align::Center);
+    c_weather.set_valign(gtk::Align::Center);
+    c_weather.set_hexpand(true);
+    let i_weather = gtk::Label::new(None);
+    i_weather.add_css_class("c-weather");
     let media_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    media_row.append(&c_art); media_row.append(&c_note); media_row.append(&c_title); media_row.append(&eq);
+    media_row.append(&c_art); media_row.append(&c_note); media_row.append(&c_title); media_row.append(&c_weather); media_row.append(&eq);
     let i_day = gtk::Label::new(None);  i_day.add_css_class("idle-day");
     let i_time = gtk::Label::new(None); i_time.add_css_class("idle-time");
     let idle_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     idle_row.set_halign(gtk::Align::Center);
     idle_row.set_valign(gtk::Align::Center);
-    idle_row.append(&i_day); idle_row.append(&i_time);
+    idle_row.append(&i_day); idle_row.append(&i_time); idle_row.append(&i_weather);
     let coll_stack = gtk::Stack::new();
     coll_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     coll_stack.set_transition_duration(220);
@@ -3714,7 +3749,7 @@ fn build(app: &gtk::Application) {
         settings: RefCell::new(settings), desk: RefCell::new(None), dest: RefCell::new(None), dest_info: RefCell::new(None),
         geom: Cell::new(geom0), host: Cell::new(host0), hidden: Cell::new(false), bar_tx: bar_controller::start_sync_sender(),
         tabs: tabs.clone(),
-        win: win.clone(), notch: notch.clone(), c_art, c_note, c_title, eq: eq.clone(), m_art, m_backdrop, m_title, m_artist, m_prog, m_t1, m_t2,
+        win: win.clone(), notch: notch.clone(), c_art, c_note, c_title, c_weather, i_weather, eq: eq.clone(), m_art, m_backdrop, m_title, m_artist, m_prog, m_t1, m_t2,
         m_cover_spacer, media_background: media_background.clone(), m_open_app: m_open_app.clone(),
         player_instance: RefCell::new(String::new()), player_generation: Cell::new(0), player_raise_busy: Cell::new(false),
         coll_stack: coll_stack.clone(),
@@ -3881,6 +3916,7 @@ fn build(app: &gtk::Application) {
     }
 
     media_thread(tx.clone());
+    weather_thread(tx.clone());
     desktop::start_watcher(tx.clone());
     settings::watch_config(tx.clone());
     let (usage_act, usage_rx) = std::sync::mpsc::channel::<bool>();

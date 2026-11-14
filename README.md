@@ -2,26 +2,12 @@
 
 ## Videos & Demos
 
-### Notch in action (36s)
-https://github.com/user-attachments/assets/8efcb406-3c2d-401e-8343-9f12e48457c2
-
-[![Notch in action](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/previews/notch-action.gif)](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/promo.mp4)
-
-### Theme switching (44s)
-https://github.com/user-attachments/assets/78642d36-5590-46e6-b06e-24f47a261923
-
-[![Theme switching](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/previews/theme-switching.gif)](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/themes.mp4)
-
-### Cinematic cut (45s)
-https://github.com/user-attachments/assets/5a33a80a-6cb2-4950-b8db-06f5cb455656
-
-[![Cinematic cut](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/previews/hyperframes-summary.gif)](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/waybar-hyperframes-lofi.mp4)
-
-### Full feature showcase (90s)
-https://github.com/user-attachments/assets/f4e1c606-bbcb-449e-8030-97b4af303258
-
-[![Full showcase](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/previews/pill-bar-overview.gif)](https://github.com/Estivenm06/waybar-pill-bar/raw/main/promo/waybar-new-look-lofi.mp4)
-
+| Showcase | Video Player |
+| :--- | :--- |
+| **Notch in action (36s)**<br>Compact pill expansion, media playback, tabs & controls | https://github.com/user-attachments/assets/8efcb406-3c2d-401e-8343-9f12e48457c2 |
+| **Theme switching (44s)**<br>Live Omarchy theme restyling with dynamic colors and fonts | https://github.com/user-attachments/assets/78642d36-5590-46e6-b06e-24f47a261923 |
+| **Cinematic cut (45s)**<br>Full widget overview, popups, and quick utilities | https://github.com/user-attachments/assets/5a33a80a-6cb2-4950-b8db-06f5cb455656 |
+| **Full feature showcase (90s)**<br>End-to-end walkthrough of the complete Waybar Pill Bar suite | https://github.com/user-attachments/assets/f4e1c606-bbcb-449e-8030-97b4af303258 |
 
 A pill-style Waybar plus a Rust "notch" for **Arch Linux + Omarchy 4.x (Hyprland, Wayland)**. One `./install.sh` gives you translucent rounded pills, an expanding notch (media, calendar, clipboard, AI usage, quick controls), click popups, a notification daemon and a volume/brightness overlay. Colors and font follow your active Omarchy theme and restyle live when you change the theme or font. No personal data is included: the installer substitutes your own `$HOME`.
 
