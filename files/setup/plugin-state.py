@@ -10,7 +10,9 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import tempfile
 import shutil
+import stat
 import sys
 import time
 
@@ -51,6 +53,40 @@ def legacy_present():
     return False
 
 
+def private_root(path):
+    """Validate a recorded backup root (real directory, ours) and tighten it to 0700 before it is reused."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise PluginError("backup directory %s is missing; the install record was left intact" % path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PluginError("backup path %s is not a plain directory" % path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise PluginError("cannot open backup directory %s: %s" % (path, e.strerror))
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISDIR(fst.st_mode) or fst.st_uid != os.geteuid():
+            raise PluginError("backup directory %s is not owned by you" % path)
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+def new_private_root(base):
+    """Create the backup root itself as 0700 (exclusive mkdir, so nothing existing or dangling is reused)."""
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    bk, n = base, 1
+    while True:
+        try:
+            os.mkdir(bk, 0o700)
+            return bk
+        except FileExistsError:
+            n += 1
+            bk = "%s-%d" % (base, n)
+
+
 def begin(files):
     m = helper.read_marker()
     if active_session():
@@ -58,18 +94,18 @@ def begin(files):
     if m is None and legacy_present():
         return fail("Legacy standalone files detected; remove the old standalone installation with its original uninstaller before running ./install.sh.")
     paths = [os.path.abspath(p) for p in files]
-    if m is None:
-        base = os.path.join(helper.home(), ".config", "waybar", "backup-" + time.strftime("%Y%m%d-%H%M%S"))
-        bk, n = base, 1
-        while os.path.exists(bk):
-            n += 1
-            bk = "%s-%d" % (base, n)
-        m = {"version": 1, "mode": "plugin", "backup_dir": bk, "files": []}
-    else:
-        mod = [e["path"] for e in m["files"] if e.get("installed_sha256") and os.path.exists(e["path"])
-               and helper.sha256_of(e["path"]) != e["installed_sha256"]]
-        if mod:
-            return fail("modified since the last setup, not overwriting: " + ", ".join(mod))
+    try:
+        if m is None:
+            base = os.path.join(helper.home(), ".config", "waybar", "backup-" + time.strftime("%Y%m%d-%H%M%S"))
+            m = {"version": 1, "mode": "plugin", "backup_dir": new_private_root(base), "files": []}
+        else:
+            private_root(m["backup_dir"])
+            mod = [e["path"] for e in m["files"] if e.get("installed_sha256") and os.path.exists(e["path"])
+                   and helper.sha256_of(e["path"]) != e["installed_sha256"]]
+            if mod:
+                return fail("modified since the last setup, not overwriting: " + ", ".join(mod))
+    except PluginError as e:
+        return fail(str(e))
     known = {e["path"] for e in m["files"]}
     for p in paths:
         if p in known:
@@ -95,12 +131,36 @@ def finish():
     return 0
 
 
+def restore_atomic(src, dst):
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".restore.", dir=os.path.dirname(dst))
+        with open(src, "rb") as r, os.fdopen(fd, "wb") as w:
+            shutil.copyfileobj(r, w)
+            w.flush()
+            os.fsync(w.fileno())
+        shutil.copystat(src, tmp)
+        os.replace(tmp, dst)
+    except OSError as exc:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise PluginError("cannot restore %s: %s" % (dst, exc.strerror or type(exc).__name__)) from exc
+
+
 def uninstall():
     m = helper.read_marker()
     if m is None:
         return fail("no plugin install record; nothing to restore")
     if active_session():
         return fail("the plugin is active: disable it first")
+    if any(e["existed"] for e in m["files"]):
+        try:
+            private_root(m["backup_dir"])
+        except PluginError as e:
+            return fail(str(e))
     conflicts = []
     for e in m["files"]:
         p = e["path"]
@@ -113,9 +173,7 @@ def uninstall():
     for e in m["files"]:
         p = e["path"]
         if e["existed"]:
-            tmp = p + ".restore.%d" % os.getpid()
-            shutil.copy2(m["backup_dir"] + p, tmp)
-            os.replace(tmp, p)
+            restore_atomic(m["backup_dir"] + p, p)
         elif os.path.lexists(p):
             os.unlink(p)
     os.unlink(helper.marker_path())

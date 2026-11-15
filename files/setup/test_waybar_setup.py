@@ -226,6 +226,81 @@ class SetupTests(unittest.TestCase):
         self.assertIn("helper reload", calls)
         self.assertNotIn("systemctl", calls)
 
+    PLUGIN_HELPER = 'case "$1" in mode) echo plugin;; active) exit 1;; esac'
+
+    def _set_hyprctl_rejecting(self, auto):
+        body = '[ "$1" = configerrors ] && /usr/bin/grep -q o.window "%s" && echo "bad rule"; exit 0' % auto
+        with open(os.path.join(self.bin, "hyprctl"), "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+
+    def test_apply_keeps_private_modes_and_makes_private_backups(self):
+        from stat import S_IMODE
+        conf, conf_text, auto, log = self._prep_apply(self.PLUGIN_HELPER)
+        hypr = os.path.dirname(auto)
+        os.chmod(hypr, 0o700)
+        os.chmod(conf, 0o600)
+        os.chmod(auto, 0o644)
+        old = os.umask(0o022)
+        try:
+            self.m.cmd_apply()
+        finally:
+            os.umask(old)
+        self.assertEqual(S_IMODE(os.stat(conf).st_mode), 0o600)
+        self.assertEqual(S_IMODE(os.stat(auto).st_mode), 0o644)
+        with open(conf) as f:
+            self.assertNotEqual(f.read(), conf_text)  # it really was rewritten
+        roots = [os.path.join(self.m.WAYBAR, n) for n in os.listdir(self.m.WAYBAR) if n.startswith("backup-")]
+        self.assertEqual(len(roots), 1)
+        for d in (roots[0], os.path.join(roots[0], "hypr")):
+            self.assertEqual(S_IMODE(os.stat(d).st_mode), 0o700)
+        with open(os.path.join(roots[0], "hypr", "autostart.lua")) as f:
+            self.assertEqual(f.read(), BLOCK)
+        self.assertEqual(S_IMODE(os.stat(os.path.join(roots[0], "hypr", "autostart.lua")).st_mode), 0o644)
+        self.assertEqual(S_IMODE(os.stat(os.path.join(roots[0], "config.jsonc")).st_mode), 0o600)
+
+    def test_rejected_apply_restores_bytes_and_modes(self):
+        from stat import S_IMODE
+        conf, conf_text, auto, log = self._prep_apply(self.PLUGIN_HELPER)
+        os.chmod(conf, 0o600)
+        os.chmod(auto, 0o600)
+        self._set_hyprctl_rejecting(auto)
+        os.chmod(os.path.join(self.bin, "hyprctl"), 0o755)
+        with self.assertRaises(self.m.ConfigError):
+            self.m.cmd_apply()
+        for p, text in ((conf, conf_text), (auto, BLOCK)):
+            with open(p) as f:
+                self.assertEqual(f.read(), text)
+            self.assertEqual(S_IMODE(os.stat(p).st_mode), 0o600)
+
+    def test_same_second_applies_never_reuse_a_backup_root(self):
+        conf, conf_text, auto, log = self._prep_apply(self.PLUGIN_HELPER)
+        from unittest import mock
+        with mock.patch.object(self.m.time, "strftime", lambda fmt: "20260101-000000"):
+            self.m.cmd_apply()
+            with open(self.m.CONFIG, "w") as f:
+                json.dump(self.cfg([]), f)
+            self.m.cmd_apply()
+        roots = [n for n in os.listdir(self.m.WAYBAR) if n.startswith("backup-")]
+        self.assertEqual(len(roots), 2, roots)
+
+    def test_atomic_write_failure_keeps_old_file_and_leaves_no_temp(self):
+        from unittest import mock
+        os.makedirs(self.home)
+        p = os.path.join(self.home, "f")
+        with open(p, "w") as f:
+            f.write("old")
+        os.chmod(p, 0o640)
+        with mock.patch.object(self.m.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.m.write_atomic(p, "new")
+        with open(p) as f:
+            self.assertEqual(f.read(), "old")
+        self.assertEqual(os.listdir(self.home), ["f"])
+        self.m.write_atomic(os.path.join(self.home, "fresh"), "x")
+        self.assertEqual(oct(os.stat(os.path.join(self.home, "fresh")).st_mode & 0o777), "0o600")
+        self.m.write_atomic(p, "new")
+        self.assertEqual(oct(os.stat(p).st_mode & 0o777), "0o640")
+
 
 if __name__ == "__main__":
     unittest.main()

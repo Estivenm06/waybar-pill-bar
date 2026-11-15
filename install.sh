@@ -41,11 +41,6 @@ fi
 if [ ! -e "$H/autostart.lua" ] && [ ! -e "$H/bindings.lua" ]; then
   echo "This installer targets Omarchy 4.x (Lua Hyprland config)."; exit 1
 fi
-NO_PW=
-if ! python3 -c "import playwright" 2>/dev/null; then
-  NO_PW=1
-  echo "Note: python-playwright not found, the Google Calendar login step will be skipped. Install with: sudo pacman -S --needed python-playwright"
-fi
 
 # Plugin setup: build, back up, install files and managed Lua blocks. No systemd units, no bar hiding,
 # no plugin enabling, no daemons: the Omarchy plugin's service starts the product when it is enabled.
@@ -117,6 +112,6 @@ if [ "$RESTART" = 1 ]; then
 fi
 python3 "$STATEPY" finish
 if [ "$GOOGLE" = yes ]; then
-  if [ -n "$NO_PW" ]; then echo "Skipping Google Calendar (install python-playwright first)"; else python3 "$W/scripts/google-setup.py" || echo "Google Calendar not connected"; fi
+  python3 "$W/scripts/google-setup.py" || echo "Google Calendar not connected"
 fi
 echo "Plugin setup done. Enable with: omarchy plugin enable waybar.pill-bar   (disable: omarchy plugin disable waybar.pill-bar)"

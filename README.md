@@ -70,7 +70,7 @@ Local promo assets are excluded from the repository and not needed to install.
 | Clipboard | `wl-clipboard` (`wl-paste --watch`, `wl-copy`) |
 | Equalizer on the bar | `cava` (optional, Waybar eq module) |
 | Calendar | Google Calendar API, OAuth2 loopback flow |
-| Google setup | Python 3 + Playwright (setup only; attaches to your own browser) |
+| Google setup | Python 3 (setup only; manual guide in your own browser) |
 | Services | Omarchy service plugin (`Service.qml` + `waybar-pill-plugin` backend); no Pill Bar systemd units |
 | Fonts | Nerd Fonts; font taken from fontconfig (`fc-match monospace`) |
 | Misc | `jq`, Omarchy hooks (`theme-set.d`, `font-set.d`), `omarchy-*` commands (brightness, monitor scaling, text size, night light, screenshot, screenrecord, plugins) |
@@ -81,7 +81,7 @@ Local promo assets are excluded from the repository and not needed to install.
    ```bash
    sudo pacman -S --needed waybar playerctl jq libpulse pamixer gtk4 gtk4-layer-shell pkgconf bluez-utils networkmanager upower power-profiles-daemon rust fontconfig wl-clipboard cava
    ```
-   For the guided Google login also: `sudo pacman -S --needed python-playwright` and a Chromium-based browser (`chromium`, `brave` or `google-chrome-stable`; or set `WAYBAR_NOTCH_BROWSER`).
+   The guided Google login needs only an interactive terminal and your normal browser.
 2. **Set up the plugin** (from the plugin checkout, see above):
    ```bash
    cd ~/.config/omarchy/plugins/waybar.pill-bar
@@ -123,7 +123,7 @@ In order: checks dependencies; requires `manifest.json` and a working `omarchy p
 ./uninstall.sh --purge   # also delete the Google OAuth client, token and sign-in browser profile
 ```
 
-Only a recorded plugin install is reversed; with no record it changes nothing, not even with `--purge`. Without `--purge` the Google files are kept: `~/.config/waybar-notch/google.json`, `~/.local/share/waybar-notch/google-token.json`, `~/.local/share/waybar-notch/browser-profile`. Scripts added to `~/.config/waybar/scripts` stay; delete them by hand.
+Only a recorded plugin install is reversed; with no record it changes nothing, not even with `--purge`. Without `--purge` the Google files are kept: `~/.config/waybar-notch/google.json`, `~/.local/share/waybar-notch/google-token.json`; a `browser-profile` left by older versions is kept too (`--purge` deletes it). Scripts added to `~/.config/waybar/scripts` stay; delete them by hand.
 
 ## Customising
 
@@ -149,13 +149,12 @@ Only a recorded plugin install is reversed; with no record it changes nothing, n
 
 ## Google Calendar
 
-The setup script `~/.config/waybar/scripts/google-setup.py` (run by the installer, re-run it any time):
+The setup script `~/.config/waybar/scripts/google-setup.py` (run by the installer with `--google`, re-run it any time) is a manual guide in your normal browser; no browser is automated and no debugging port is opened:
 
-1. Starts your Chromium-based browser normally with a dedicated profile (`~/.local/share/waybar-notch/browser-profile`) and a local remote-debugging port. You sign in to Google there; Google blocks sign-in inside automation-flagged browsers, so Playwright attaches only afterwards.
-2. Creates the Cloud project `waybar-notch` (id kept in `~/.config/waybar-notch/project-id`), enables the Calendar API, configures the consent screen (External, you as test user), tries to publish the app and creates a Desktop OAuth client.
-3. Writes `~/.config/waybar-notch/google.json` (mode 0600) and runs `waybar-notch --google-login --print-url`; the consent page opens in the same browser and you click through it.
+1. Opens the Cloud Console pages in order (create project `waybar-notch`, enable the Calendar API, consent screen External, add yourself as test user, create a Desktop OAuth client) and prints the exact instructions and URLs; it asks for the Project ID, Client ID and Client secret (the secret is read without echo).
+2. Writes `~/.config/waybar-notch/google.json` (mode 0600 from creation) and runs `waybar-notch --google-login`; the consent page opens in your browser and you click through it. Success is reported only when that login exits 0.
 
-Every step verifies its result; when a step cannot be automated the script prints `[manual] ...` naming the exact console page and value and waits for Enter.
+The setup needs an interactive terminal.
 
 **7-day sign-ins:** for personal Desktop apps without a homepage/privacy URL, *Publish app* is currently disabled, and apps left in Testing get refresh tokens that expire after 7 days. When the notch shows "Connect Google Calendar" again, press it (one click) or run `~/.local/bin/waybar-notch --google-login`.
 
@@ -192,7 +191,7 @@ waybar-pill-bar/
     ├── setup/                 read by install.sh only: apps-catalog.json, waybar-setup.py (choices, config + autostart rendering)
     ├── scripts/               -> ~/.config/waybar/scripts/
     │   ├── waybar-popupctl         FIFO client; only talks to an active plugin session
-    │   ├── google-setup.py         guided Google Calendar login (Playwright)
+    │   ├── google-setup.py         guided Google Calendar login (manual)
     │   ├── waybar-app.sh           class-based launcher click
     │   ├── waybar-bgapp.sh         background app ensure/toggle (WhatsApp by default)
     │   ├── waybar-volume-osd.py    volume keys with OSD
@@ -213,7 +212,7 @@ Run for the plugin-only cutover (each Python file in its own process):
 - `python3 -m unittest tests/test_plugin_bridge.py`, `tests/test_omarchy_matrix.py` (temporary-HOME install and uninstall, no-record uninstall, legacy refusal, removed-flag usage error), `tests/test_notification_relay.py`, `tests/test_plugin_widgets.py`, `tests/test_widget_adapters.py` (real patched WhatsApp Panel in Quickshell on a private bus) and `files/setup/test_waybar_setup.py`
 - Headless subprocess runs of `notch/target/release/waybar-notch` with no arguments, an unknown command, a missing/zero/non-numeric/negative/extra relay PID and extra supervisor arguments: all print the usage line and exit 1 before GTK or D-Bus; `--gen-waybar-theme` still succeeds.
 
-Not verified: Omarchy 3.x; `google-setup.py` against the live Cloud Console (its locators change often; the `[manual]` fallbacks are the safety net); WhatsApp with a browser other than Brave; a machine without a battery; a non-Nerd Omarchy font; a full logout/login cycle. This change did not redeploy or restart any live desktop.
+Not verified: Omarchy 3.x; `google-setup.py` against the live Cloud Console and a live Google consent/token exchange; WhatsApp with a browser other than Brave; a machine without a battery; a non-Nerd Omarchy font; a full logout/login cycle. This change did not redeploy or restart any live desktop.
 
 ## Multiple monitors and Settings
 

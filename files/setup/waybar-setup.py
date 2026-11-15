@@ -13,8 +13,10 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -446,12 +448,25 @@ def replace_bg_rules(text, lines):
 
 
 def write_atomic(path, text):
-    tmp = path + ".tmp.%d" % os.getpid()
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Replace `path` atomically, keeping the existing file's permission bits (0600 for a new file)."""
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".tmp.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def hypr_errors():
@@ -495,8 +510,8 @@ def cmd_apply():
     if new_conf == conf_text and new_auto == auto_text:
         print("Nothing to change")
     else:
-        bk = os.path.join(WAYBAR, "backup-%s" % time.strftime("%Y%m%d-%H%M%S"))
-        os.makedirs(os.path.join(bk, "hypr"), exist_ok=True)
+        bk = tempfile.mkdtemp(prefix="backup-%s-" % time.strftime("%Y%m%d-%H%M%S"), dir=WAYBAR)  # 0700 from creation
+        os.mkdir(os.path.join(bk, "hypr"), 0o700)
         shutil.copy2(wconf, os.path.join(bk, "config.jsonc"))
         shutil.copy2(auto, os.path.join(bk, "hypr", "autostart.lua"))
         baseline = set(hypr_errors())

@@ -528,6 +528,91 @@ class InstallRecordTests(Base):
         self.assertFalse(os.path.exists(new))
         self.assertFalse(os.path.exists(self.h.marker_path()))
 
+    def _managed(self, content=b"mine\x00\xff", mode=0o600):
+        old = os.path.join(self.tmp, "old.bin")
+        with open(old, "wb") as f:
+            f.write(content)
+        os.chmod(old, mode)
+        os.utime(old, (1_000_000_000, 1_000_000_000))
+        self.assertEqual(self.run_state("begin", old).returncode, 0)
+        with open(old, "wb") as f:
+            f.write(b"managed")
+        os.chmod(old, 0o644)
+        self.assertEqual(self.run_state("finish").returncode, 0)
+        mod = load(STATEPY, "plugin_state_under_test")
+        mod.active_session = lambda: False
+        return old, mod
+
+    def test_restore_is_private_while_copying_and_keeps_bytes_mode_and_time(self):
+        import unittest.mock as um
+        real = shutil.copyfileobj
+        for mode in (0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                if os.path.exists(self.h.marker_path()):
+                    os.unlink(self.h.marker_path())
+                old, mod = self._managed(mode=mode)
+                seen = []
+
+                def spy(src, dst, *a):
+                    seen.append(stat.S_IMODE(os.fstat(dst.fileno()).st_mode))
+                    dst.write(src.read(2))
+                    dst.flush()
+                    seen.append(stat.S_IMODE(os.fstat(dst.fileno()).st_mode))
+                    real(src, dst, *a)
+                with um.patch.object(mod.shutil, "copyfileobj", spy):
+                    self.assertEqual(mod.uninstall(), 0)
+                self.assertEqual(seen, [0o600, 0o600])
+                with open(old, "rb") as f:
+                    self.assertEqual(f.read(), b"mine\x00\xff")
+                st = os.stat(old)
+                self.assertEqual((stat.S_IMODE(st.st_mode), int(st.st_mtime)), (mode, 1_000_000_000))
+                self.assertFalse(os.path.exists(self.h.marker_path()))
+
+    def test_restore_failures_leave_destination_record_and_no_temp_file(self):
+        import errno
+        import unittest.mock as um
+        real = shutil.copyfileobj
+
+        def partial_eio(src, dst, *a):
+            dst.write(src.read(2))
+            dst.flush()
+            raise OSError(errno.EIO, "synthetic failure")
+        cases = (("copyfileobj", partial_eio),
+                 ("copystat", um.Mock(side_effect=OSError(errno.EIO, "synthetic failure"))),
+                 ("replace", um.Mock(side_effect=PermissionError(errno.EACCES, "synthetic failure"))))
+        for name, fake in cases:
+            with self.subTest(name=name):
+                if os.path.exists(self.h.marker_path()):
+                    os.unlink(self.h.marker_path())
+                old, mod = self._managed()
+                with open(self.h.marker_path()) as f:
+                    record = f.read()
+                target = mod.os if name == "replace" else mod.shutil
+                with um.patch.object(target, name, fake):
+                    with self.assertRaises(mod.PluginError) as cm:
+                        mod.uninstall()
+                self.assertNotIn("mine", str(cm.exception))
+                with open(old, "rb") as f:
+                    self.assertEqual(f.read(), b"managed")
+                self.assertEqual(stat.S_IMODE(os.stat(old).st_mode), 0o644)
+                with open(self.h.marker_path()) as f:
+                    self.assertEqual(f.read(), record)
+                self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".restore.")], [])
+
+    def test_restore_ignores_predictable_symlink_temp_name(self):
+        old, mod = self._managed()
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "wb") as f:
+            f.write(b"victim")
+        link = old + ".restore.%d" % os.getpid()
+        os.symlink(victim, link)
+        self.assertEqual(mod.uninstall(), 0)
+        with open(old, "rb") as f:
+            self.assertEqual(f.read(), b"mine\x00\xff")
+        self.assertTrue(os.path.islink(link))
+        with open(victim, "rb") as f:
+            self.assertEqual(f.read(), b"victim")
+
     def test_modified_owned_file_blocks_uninstall_and_keeps_everything(self):
         f1 = os.path.join(self.tmp, "owned")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
@@ -562,6 +647,116 @@ class InstallRecordTests(Base):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("Legacy standalone files detected", r.stderr)
         self.assertFalse(os.path.exists(self.h.marker_path()))
+
+
+class InstallBackupPrivacyTests(Base):
+    """Backups never widen access to a source file that lived in a private directory."""
+
+    def run_state(self, *args):
+        return subprocess.run([sys.executable, STATEPY, *args], capture_output=True, text=True,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+
+    def backup_dir(self):
+        return self.h.read_marker()["backup_dir"]
+
+    def test_backup_root_is_private_and_restore_keeps_bytes_and_mode(self):
+        priv = os.path.join(self.tmp, "priv")
+        os.mkdir(priv, 0o700)
+        src = os.path.join(priv, "secret.conf")
+        with open(src, "w") as f:
+            f.write("synthetic secret")
+        os.chmod(src, 0o644)
+        env_umask = os.umask(0o022)
+        try:
+            self.assertEqual(self.run_state("begin", src).returncode, 0)
+        finally:
+            os.umask(env_umask)
+        root = self.backup_dir()
+        self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
+        with open(src, "w") as f:
+            f.write("managed")
+        self.run_state("finish")
+        r = self.run_state("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(src) as f:
+            self.assertEqual(f.read(), "synthetic secret")
+        self.assertEqual(stat.S_IMODE(os.stat(src).st_mode), 0o644)
+
+    def test_recorded_loose_root_is_tightened_before_reuse(self):
+        f1 = os.path.join(self.tmp, "a")
+        with open(f1, "w") as f:
+            f.write("x")
+        self.assertEqual(self.run_state("begin", f1).returncode, 0)
+        root = self.backup_dir()
+        os.chmod(root, 0o755)
+        f2 = os.path.join(self.tmp, "b")
+        with open(f2, "w") as f:
+            f.write("y")
+        self.assertEqual(self.run_state("begin", f2).returncode, 0)
+        self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
+
+    def test_symlinked_or_missing_recorded_root_is_rejected_untouched(self):
+        f1 = os.path.join(self.tmp, "a")
+        self.assertEqual(self.run_state("begin", f1).returncode, 0)
+        root = self.backup_dir()
+        with open(self.h.marker_path()) as f:
+            marker = f.read()
+        victim = os.path.join(self.tmp, "victim")
+        os.mkdir(victim, 0o755)
+        shutil.rmtree(root)
+        os.symlink(victim, root)
+        r = self.run_state("begin", os.path.join(self.tmp, "b"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
+        os.unlink(root)
+        r = self.run_state("begin", os.path.join(self.tmp, "b"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("missing", r.stderr)
+        with open(self.h.marker_path()) as f:
+            self.assertEqual(f.read(), marker)
+
+    def test_foreign_owned_root_is_rejected(self):
+        from unittest import mock
+        ps = load(STATEPY, "plugin_state_under_test")
+        root = os.path.join(self.tmp, "root")
+        os.mkdir(root, 0o755)
+        with mock.patch.object(ps.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(ps.PluginError):
+                ps.private_root(root)
+        self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o755)
+
+    def test_same_second_installs_pick_distinct_roots(self):
+        ps = load(STATEPY, "plugin_state_under_test2")
+        base = os.path.join(self.tmp, "w", "backup-1")
+        os.makedirs(os.path.dirname(base))
+        os.symlink(os.path.join(self.tmp, "nowhere"), base)  # dangling: must not be followed or reused
+        a = ps.new_private_root(base)
+        b = ps.new_private_root(base)
+        self.assertEqual(len({base, a, b}), 3)
+        self.assertEqual(stat.S_IMODE(os.stat(a).st_mode), 0o700)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "nowhere")))
+
+
+class ShellConfigModeTests(Fixture):
+    def test_activate_and_cleanup_keep_private_mode_and_unrelated_fields(self):
+        self.set_shell({"disabledPlugins": [], "bar": {"keep": "me"}, "token": "synthetic"})
+        os.chmod(self.shell, 0o600)
+        s = self.session()
+        self.activate(s)
+        self.assertEqual(stat.S_IMODE(os.stat(self.shell).st_mode), 0o600)
+        cfg = self.get_shell()
+        self.assertEqual((cfg["bar"], cfg["token"]), ({"keep": "me"}, "synthetic"))
+        s.cleanup()
+        self.assertEqual(stat.S_IMODE(os.stat(self.shell).st_mode), 0o600)
+        cfg = self.get_shell()
+        self.assertEqual((cfg["disabledPlugins"], cfg["bar"], cfg["token"]), ([], {"keep": "me"}, "synthetic"))
+
+    def test_explicitly_shared_mode_is_preserved_too(self):
+        os.chmod(self.shell, 0o640)
+        s = self.session()
+        self.activate(s)
+        s.cleanup()
+        self.assertEqual(stat.S_IMODE(os.stat(self.shell).st_mode), 0o640)
 
 
 if __name__ == "__main__":

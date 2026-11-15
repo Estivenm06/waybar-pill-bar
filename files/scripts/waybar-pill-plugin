@@ -219,7 +219,11 @@ class Session:
         if new == cur:
             return
         cfg["disabledPlugins"] = new
-        write_atomic(self.shell_json(), json.dumps(cfg, indent=2) + "\n", 0o644)
+        try:
+            mode = stat.S_IMODE(os.stat(self.shell_json()).st_mode)
+        except OSError as e:
+            raise PluginError("cannot inspect %s: %s" % (self.shell_json(), e))
+        write_atomic(self.shell_json(), json.dumps(cfg, indent=2) + "\n", mode)
         self.sh("omarchy-shell", "shell", "reloadConfig")
 
     def ensure_notifications(self):
