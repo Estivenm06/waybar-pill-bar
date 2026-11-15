@@ -156,7 +156,7 @@ The setup script `~/.config/waybar/scripts/google-setup.py` (run by the installe
 
 The setup needs an interactive terminal.
 
-**7-day sign-ins:** for personal Desktop apps without a homepage/privacy URL, *Publish app* is currently disabled, and apps left in Testing get refresh tokens that expire after 7 days. When the notch shows "Connect Google Calendar" again, press it (one click) or run `~/.local/bin/waybar-notch --google-login`.
+**7-day sign-ins:** apps left in Testing get refresh tokens that expire after 7 days. To avoid it, publish the app: in Google Auth Platform > *Branding* set the application home page (this repository) and privacy policy link (`PRIVACY.md` in this repository) and add `github.com` as an authorized domain, then *Audience* > *Publish app* > *Confirm*. Google then shows "hasn't verified this app" at sign-in (click *Advanced* > *Go to ... (unsafe)*); that is expected for a personal, unverified app. When the notch shows "Connect Google Calendar" again, press it (one click) or run `~/.local/bin/waybar-notch --google-login`.
 
 **Manual route:** create a "Desktop app" OAuth client in Google Cloud Console (Calendar API enabled), save `{"client_id": "...", "client_secret": "..."}` to `~/.config/waybar-notch/google.json`, then press "Connect Google Calendar" in the notch's Calendar tab. The refresh token is stored in `~/.local/share/waybar-notch/google-token.json`.
 

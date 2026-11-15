@@ -153,8 +153,11 @@ def main():
 
     print("== 4. Add yourself as a test user")
     print("   Audience > Test users > Add users: the Google account whose calendar you will use.")
-    print("   The app stays in Testing: its refresh tokens expire after 7 days. When the notch shows")
-    print("   'Connect Google Calendar' again, press it or run ~/.local/bin/waybar-notch --google-login")
+    print("   While the app stays in Testing, Google shows the testing screen and refresh tokens expire")
+    print("   after 7 days. To avoid that: Branding > set the home page and a public privacy policy URL")
+    print("   (this repository's PRIVACY.md works) and authorized domain github.com, then Audience >")
+    print("   Publish app > Confirm. Google then shows 'hasn't verified this app': Advanced > Go to the app.")
+    print("   When the notch shows 'Connect Google Calendar' again, press it or run ~/.local/bin/waybar-notch --google-login")
     open_page(f"{CONSOLE}/auth/audience?project={pid}")
     prompt("Press Enter when done... ")
 
