@@ -3,10 +3,12 @@
 //! Home / Media / Calendar / Clipboard tabs.
 mod app_status;
 mod art_cache;
+mod art_http;
 mod bar_controller;
 mod config;
 mod desktop;
 mod gcal;
+mod image_loader;
 mod lyrics;
 mod notch_content;
 mod notification_relay;
@@ -14,6 +16,7 @@ mod notify;
 mod osd;
 mod popups;
 mod power;
+mod private_files;
 mod settings;
 mod theme;
 mod usage;
@@ -99,7 +102,7 @@ enum Msg {
     Media { status: String, artist: String, title: String, art_url: String, len: f64, player: String },
     NoMedia,
     Weather(WeatherInfo),
-    Art(String, String),
+    Art { url: String, path: std::path::PathBuf, image: image_loader::DecodedImage },
     Pos(f64),
     Bars(u64, [f64; BARS]),
     VisualizerEnded(u64),
@@ -116,8 +119,6 @@ enum Msg {
     UtilResult(String),
     ClipCleared { message: String, success: bool },
     Net(&'static str, u8, String),
-    Notify(notify::Note),
-    NotifyClose(u32),
     NotificationRelayFailed(String),
     NotchContent(notch_content::Event),
     NotchContentFailed(String),
@@ -1250,80 +1251,23 @@ fn hist_path() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("waybar-notch").join("clipboard.json")
 }
 
-/// Makes sure the dedicated data directory exists, is ours, is not a symlink and is 0700. Shared ancestors
-/// (XDG_DATA_HOME, HOME) are never touched.
-fn secure_private_dir(dir: &std::path::Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(format!("{} is not a plain directory", dir.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = dir.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-            }
-            if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists { return Err(format!("cannot create {}: {e}", dir.display())); }
-            }
-        }
-        Err(e) => return Err(format!("cannot inspect {}: {e}", dir.display())),
-    }
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)
-        .map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
-    let m = f.metadata().map_err(|e| format!("cannot inspect {}: {e}", dir.display()))?;
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
-        return Err(format!("{} is not a directory owned by you", dir.display()));
-    }
-    f.set_permissions(std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("cannot restrict {}: {e}", dir.display()))
-}
+/// Largest clipboard history file we are willing to read back.
+const MAX_HISTORY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Reads the clipboard history. A missing file is an empty history; the content is never echoed in errors.
 fn load_history_at(path: &std::path::Path) -> Result<Vec<String>, String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    secure_private_dir(path.parent().ok_or_else(|| format!("invalid history path {}", path.display()))?)?;
-    let mut f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("cannot open {}: {e}", path.display())),
-    };
-    let m = f.metadata().map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
-    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } {
-        return Err(format!("{} is not a regular file owned by you", path.display()));
+    match private_files::read_private_bytes(path, MAX_HISTORY_BYTES)? {
+        None => Ok(Vec::new()),
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| format!("{} is not valid clipboard history", path.display())),
     }
-    f.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("cannot restrict {}: {e}", path.display()))?;
-    let mut text = String::new();
-    f.read_to_string(&mut text).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|_| format!("{} is not valid clipboard history", path.display()))
 }
 
 static HIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Atomically replaces the history file; the content only ever exists in 0600 files.
 fn save_history_at(path: &std::path::Path, history: &[String]) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let dir = path.parent().ok_or_else(|| format!("invalid history path {}", path.display()))?;
-    secure_private_dir(dir)?;
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() && m.uid() == unsafe { libc::geteuid() } => {}
-        Ok(_) => return Err(format!("{} is not a regular file owned by you", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot inspect {}: {e}", path.display())),
-    }
     let text = serde_json::to_string(history).map_err(|e| e.to_string())?;
-    for _ in 0..16 {
-        let tmp = dir.join(format!(".clipboard.json.tmp.{}.{}", std::process::id(), HIST_SEQ.fetch_add(1, Ordering::Relaxed)));
-        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("cannot write {}: {e}", path.display())),
-        };
-        let res = f.write_all(text.as_bytes()).and_then(|_| f.flush()).and_then(|_| f.sync_all()).and_then(|_| std::fs::rename(&tmp, path));
-        if let Err(e) = res {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("cannot write {}: {e}", path.display()));
-        }
-        return Ok(());
-    }
-    Err(format!("cannot write {}: no unused temporary name", path.display()))
+    private_files::write_private_file(path, text.as_bytes(), ".clipboard.json.tmp", &HIST_SEQ)
 }
 
 /// Outcome shown after a clear: it is only a full success when the history file was cleared as well.
@@ -1739,12 +1683,9 @@ static ART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 enum ArtFail { Final, Retry }
 
 /// Streams one http(s) cover into the new, private file `tmp`, never writing more than `art_cache::MAX_ART_BYTES`.
-fn art_download(url: &str, tmp: &std::path::Path, timeout: Duration) -> Result<(), ArtFail> {
+fn art_download(agent: &ureq::Agent, url: &str, tmp: &std::path::Path, timeout: Duration) -> Result<(), ArtFail> {
     use std::os::unix::fs::OpenOptionsExt;
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) { return Err(ArtFail::Final); }
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(timeout)).build().into();
-    let body = agent.get(url).call().map_err(|_| ArtFail::Retry)?.into_body();
+    let body = art_http::get(agent, url, timeout).map_err(|e| match e { art_http::GetError::Final => ArtFail::Final, art_http::GetError::Retry => ArtFail::Retry })?;
     if body.content_length().is_some_and(|n| n > art_cache::MAX_ART_BYTES) { return Err(ArtFail::Final); }
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(tmp).map_err(|_| ArtFail::Retry)?;
     match art_cache::copy_limited(&mut body.into_reader(), &mut f) {
@@ -1757,7 +1698,7 @@ fn art_download(url: &str, tmp: &std::path::Path, timeout: Duration) -> Result<(
 
 /// Returns the cached path of `url`'s cover, downloading it when needed. `None` when the cover is unusable, too
 /// large, or superseded by a newer request waiting in `pending`.
-fn fetch_art_in(dir: &std::path::Path, url: &str, pending: &async_channel::Receiver<String>, timeout: Duration) -> Option<String> {
+fn fetch_art_in(agent: &ureq::Agent, dir: &std::path::Path, url: &str, pending: &async_channel::Receiver<String>, timeout: Duration) -> Option<String> {
     let path = art_cache::path_for(dir, url);
     if art_cache::is_usable(&path) { return Some(path.to_string_lossy().into_owned()); }
     let deadline = std::time::Instant::now() + timeout;
@@ -1766,7 +1707,7 @@ fn fetch_art_in(dir: &std::path::Path, url: &str, pending: &async_channel::Recei
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() { return None; }
         let tmp = std::path::PathBuf::from(format!("{}.part.{}.{}", path.display(), std::process::id(), ART_SEQ.fetch_add(1, Ordering::Relaxed)));
-        match art_download(url, &tmp, remaining) {
+        match art_download(agent, url, &tmp, remaining) {
             Ok(()) if pending.is_empty() && std::time::Instant::now() < deadline && std::fs::rename(&tmp, &path).is_ok() => return Some(path.to_string_lossy().into_owned()),
             Ok(()) if !pending.is_empty() => { let _ = std::fs::remove_file(&tmp); return None; }
             Ok(()) | Err(ArtFail::Retry) => { let _ = std::fs::remove_file(&tmp); }
@@ -1782,6 +1723,13 @@ fn fetch_art_in(dir: &std::path::Path, url: &str, pending: &async_channel::Recei
     None
 }
 
+const ART_MAX_EDGE: i32 = 384;
+
+fn art_is_remote(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 /// One background thread downloads covers: one transfer at a time, and only the newest requested URL waits.
 struct ArtWorker {
     tx: async_channel::Sender<String>,
@@ -1792,10 +1740,10 @@ struct ArtWorker {
 
 impl ArtWorker {
     fn new(tx: async_channel::Sender<Msg>) -> Self {
-        Self::with(tx, std::path::PathBuf::from(runtime_dir()), ART_TIMEOUT)
+        Self::with(tx, std::path::PathBuf::from(runtime_dir()), ART_TIMEOUT, art_http::agent(ART_TIMEOUT))
     }
 
-    fn with(tx: async_channel::Sender<Msg>, dir: std::path::PathBuf, timeout: Duration) -> Self {
+    fn with(tx: async_channel::Sender<Msg>, dir: std::path::PathBuf, timeout: Duration, agent: ureq::Agent) -> Self {
         let (ptx, prx) = async_channel::bounded::<String>(1);
         let pins = Arc::new(std::sync::Mutex::new(ArtPins::default()));
         let (wrx, wdir, wpins) = (prx.clone(), dir.clone(), pins.clone());
@@ -1803,16 +1751,24 @@ impl ArtWorker {
         std::thread::spawn(move || {
             while let Ok(url) = wrx.recv_blocking() {
                 if url.is_empty() { continue; }
-                if let Some(p) = url.strip_prefix("file://") {
-                    let _ = tx.try_send(Msg::Art(url.clone(), p.to_string()));
+                if !art_is_remote(&url) {
+                    // Local artwork: validated and decoded here, never on the GTK thread.
+                    let Some(path) = image_loader::local_path(&url) else { continue };
+                    let Ok(image) = image_loader::load_file(&path, ART_MAX_EDGE) else { continue };
+                    if wrx.is_empty() { let _ = tx.try_send(Msg::Art { url, path, image }); }
                     continue;
                 }
                 art_cache::prune(&wdir, art_cache::KEEP, &snapshot());
-                let Some(path) = fetch_art_in(&wdir, &url, &wrx, timeout) else { continue };
+                let Some(path) = fetch_art_in(&agent, &wdir, &url, &wrx, timeout) else { continue };
+                let path = std::path::PathBuf::from(path);
+                let image = match image_loader::load_file(&path, ART_MAX_EDGE) {
+                    Ok(image) => image,
+                    Err(_) => { let _ = std::fs::remove_file(&path); continue; }   // undecodable cover: never cache or show it
+                };
                 let mut pins = snapshot();
-                pins.push(std::path::PathBuf::from(&path));
+                pins.push(path.clone());
                 art_cache::prune(&wdir, art_cache::KEEP, &pins);
-                let _ = tx.try_send(Msg::Art(url, path));
+                if wrx.is_empty() { let _ = tx.try_send(Msg::Art { url, path, image }); }
             }
         });
         ArtWorker { tx: ptx, rx: prx, dir, pins }
@@ -1820,7 +1776,7 @@ impl ArtWorker {
 
     /// Replaces any waiting request with `url` (empty = no cover wanted); never starts a second transfer.
     fn submit(&self, url: String) {
-        let current = (!url.is_empty() && !url.starts_with("file://")).then(|| art_cache::path_for(&self.dir, &url));
+        let current = art_is_remote(&url).then(|| art_cache::path_for(&self.dir, &url));
         self.pins.lock().unwrap_or_else(|e| e.into_inner()).current = current;
         while self.rx.try_recv().is_ok() {}
         let _ = self.tx.try_send(url);
@@ -2776,8 +2732,6 @@ impl Ui {
             let _ = self.tx.try_send(Msg::Relayout);
         }
         match m {
-            Msg::Notify(n) => self.notes.show(n),
-            Msg::NotifyClose(id) => self.notes.close(id, notify::REASON_CLOSED, true),
             Msg::NotificationRelayFailed(why) => {
                 eprintln!("notification relay failed: {why}");
                 if let Some(a) = gtk::gio::Application::default() { a.quit(); }
@@ -2907,13 +2861,12 @@ impl Ui {
                     self.art_worker.submit(art_url);
                 }
             }
-            Msg::Art(url, path) => {
+            Msg::Art { url, path, image } => {
                 self.schedule_art_prune();
                 if *self.art_url.borrow() != url { return; }   // stale cover from a previous track
-                let Ok(pb) = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 384, 384, true) else { return };
-                *self.art_accepted.borrow_mut() = Some(std::path::PathBuf::from(&path));
-                self.art_worker.accept(std::path::Path::new(&path));
-                let tex = gtk::gdk::Texture::for_pixbuf(&pb);
+                *self.art_accepted.borrow_mut() = Some(path.clone());
+                self.art_worker.accept(&path);
+                let tex: gtk::gdk::Texture = image_loader::texture(image).upcast();
                 self.c_art.set_paintable(Some(&tex));
                 self.c_art.set_visible(true);
                 self.c_note.set_visible(false);
@@ -4243,7 +4196,9 @@ fn build(app: &gtk::Application, shell_pid: i32) {
     let popups = popups::Popups::new(tx.clone());
     let osd = osd::Osd::new(app);
     // Quickshell owns org.freedesktop.Notifications and relays over private sockets; both must bind or there is no UI.
-    let cmds = match notification_relay::start(shell_pid, tx.clone()) {
+    // Bounded ingress (the shell never has more than 32 unacknowledged events); the GTK consumer acknowledges each one.
+    let (events_tx, events_rx) = async_channel::bounded::<notification_relay::Event>(32);
+    let cmds = match notification_relay::start(shell_pid, tx.clone(), events_tx) {
         Ok(cmds) => cmds,
         Err(e) => { eprintln!("notification relay: cannot listen: {e}"); app.quit(); return; }
     };
@@ -4252,6 +4207,7 @@ fn build(app: &gtk::Application, shell_pid: i32) {
         Err(e) => { eprintln!("notch content: cannot listen: {e}"); app.quit(); return; }
     };
     let notes = notify::NotifyUi::new(app, cmds);
+    notes.run_events(events_rx);
     let ui = Rc::new(Ui {
         content, ext: RefCell::new(None), ext_timer: RefCell::new(None), ext_pub_busy: Cell::new(false), notch_hover: Cell::new(false),
         started: std::time::Instant::now(), wa_page: wa_page.clone(), wa_status: wa_status.clone(),
@@ -4413,18 +4369,23 @@ fn build(app: &gtk::Application, shell_pid: i32) {
         });
     }
 
-    // message pump: wakes only when a message is queued; one sizing pass per drained batch
+    // message pump: wakes only when a message is queued; one sizing pass per drained batch of at most 64 messages,
+    // after which the main loop gets a turn (one-millisecond timeout) before the next batch
     {
+        const PUMP_BATCH: usize = 64;
         let u = ui.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(first) = rx.recv().await {
                 let mut relayout = false;
+                let mut taken = 0;
                 let mut m = Some(first);
                 while let Some(msg) = m.take() {
+                    taken += 1;
                     if matches!(msg, Msg::Relayout) { relayout = true } else { u.handle(msg) }
-                    m = rx.try_recv().ok();
+                    m = if taken < PUMP_BATCH { rx.try_recv().ok() } else { None };
                 }
                 if relayout { u.set_expanded_size(); }
+                if taken >= PUMP_BATCH { glib::timeout_future(Duration::from_millis(1)).await; }
             }
         });
     }
@@ -5289,7 +5250,9 @@ mod art_worker_tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
-    const IMG: &[u8] = b"\x89PNG synthetic cover bytes";
+    const IMG: &[u8] = image_loader::TINY_PNG;
+
+    fn agent(secs: u64) -> ureq::Agent { art_http::loopback_agent(Duration::from_secs(secs)) }
 
     #[derive(Default)]
     struct Shared { log: std::sync::Mutex<Vec<String>>, active: AtomicUsize, max_active: AtomicUsize, release: AtomicBool, stop: AtomicBool }
@@ -5356,11 +5319,11 @@ mod art_worker_tests {
         d
     }
 
-    fn next_art(rx: &async_channel::Receiver<Msg>, within: Duration) -> Option<(String, String)> {
+    fn next_art(rx: &async_channel::Receiver<Msg>, within: Duration) -> Option<(String, String, image_loader::DecodedImage)> {
         let end = Instant::now() + within;
         while Instant::now() < end {
             match rx.try_recv() {
-                Ok(Msg::Art(u, p)) => return Some((u, p)),
+                Ok(Msg::Art { url, path, image }) => return Some((url, path.to_string_lossy().into_owned(), image)),
                 Ok(_) => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
@@ -5378,10 +5341,11 @@ mod art_worker_tests {
         let srv = serve(Arc::new(|_, s, _| ok(s, IMG)));
         let d = tmpdir("small");
         let (tx, rx) = async_channel::unbounded();
-        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(5));
+        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(5), agent(5));
         let url = format!("http://127.0.0.1:{}/c.png", srv.port);
         w.submit(url.clone());
-        let (u, p) = next_art(&rx, Duration::from_secs(10)).expect("cover delivered");
+        let (u, p, img) = next_art(&rx, Duration::from_secs(10)).expect("cover delivered");
+        assert_eq!((img.width, img.height, img.alpha), (1, 1, true));
         assert_eq!(u, url);
         assert_eq!(std::fs::read(&p).unwrap(), IMG);
         assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
@@ -5396,7 +5360,7 @@ mod art_worker_tests {
         }));
         let d = tmpdir("advertised");
         let (tx, rx) = async_channel::unbounded();
-        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(5));
+        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(5), agent(5));
         w.submit(format!("http://127.0.0.1:{}/big", srv.port));
         assert!(next_art(&rx, Duration::from_secs(3)).is_none());
         assert!(names(&d).is_empty(), "{:?}", names(&d));
@@ -5416,7 +5380,7 @@ mod art_worker_tests {
         }));
         let d = tmpdir("chunked");
         let (tx, rx) = async_channel::unbounded();
-        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(10));
+        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(10), agent(10));
         w.submit(format!("http://127.0.0.1:{}/chunked", srv.port));
         assert!(next_art(&rx, Duration::from_secs(4)).is_none());
         assert!(names(&d).is_empty(), "{:?}", names(&d));
@@ -5433,7 +5397,7 @@ mod art_worker_tests {
         let d = tmpdir("stall");
         let (_tx, rx) = async_channel::bounded::<String>(1);
         let start = Instant::now();
-        let r = fetch_art_in(&d, &format!("http://127.0.0.1:{}/stall", srv.port), &rx, Duration::from_secs(1));
+        let r = fetch_art_in(&agent(1), &d, &format!("http://127.0.0.1:{}/stall", srv.port), &rx, Duration::from_secs(1));
         let took = start.elapsed();
         assert!(r.is_none());
         assert!(took < Duration::from_secs(2), "took {took:?}");
@@ -5453,7 +5417,7 @@ mod art_worker_tests {
         }));
         let d = tmpdir("retry");
         let (_tx, rx) = async_channel::bounded::<String>(1);
-        let p = fetch_art_in(&d, &format!("http://127.0.0.1:{}/r", srv.port), &rx, Duration::from_secs(2)).expect("retry succeeds");
+        let p = fetch_art_in(&agent(2), &d, &format!("http://127.0.0.1:{}/r", srv.port), &rx, Duration::from_secs(2)).expect("retry succeeds");
         assert_eq!(std::fs::read(&p).unwrap(), IMG);
         assert_eq!(srv.st.log.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&d);
@@ -5467,14 +5431,14 @@ mod art_worker_tests {
         }));
         let d = tmpdir("latest");
         let (tx, rx) = async_channel::unbounded();
-        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(30));
+        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(30), agent(30));
         let url = |n: usize| format!("http://127.0.0.1:{}/{n}", srv.port);
         w.submit(url(0));
         let end = Instant::now() + Duration::from_secs(10);
         while srv.st.log.lock().unwrap().is_empty() && Instant::now() < end { std::thread::sleep(Duration::from_millis(10)); }
         for n in 1..=9 { w.submit(url(n)); }
         srv.st.release.store(true, Ordering::SeqCst);
-        let (u, p) = next_art(&rx, Duration::from_secs(10)).expect("latest cover delivered");
+        let (u, p, _) = next_art(&rx, Duration::from_secs(10)).expect("latest cover delivered");
         assert_eq!(u, url(9));
         assert!(std::path::Path::new(&p).exists());
         assert!(next_art(&rx, Duration::from_millis(500)).is_none(), "no stale cover may follow");
@@ -5487,8 +5451,53 @@ mod art_worker_tests {
     fn unsupported_scheme_is_not_downloaded() {
         let d = tmpdir("scheme");
         let (_tx, rx) = async_channel::bounded::<String>(1);
-        assert!(fetch_art_in(&d, "ftp://127.0.0.1/x", &rx, Duration::from_secs(1)).is_none());
+        assert!(fetch_art_in(&agent(1), &d, "ftp://127.0.0.1/x", &rx, Duration::from_secs(1)).is_none());
         assert!(names(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undecodable_cover_is_neither_delivered_nor_kept() {
+        let srv = serve(Arc::new(|_, s, _| ok(s, b"\x89PNG synthetic cover bytes")));
+        let d = tmpdir("undecodable");
+        let (tx, rx) = async_channel::unbounded();
+        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(5), agent(5));
+        w.submit(format!("http://127.0.0.1:{}/bad.png", srv.port));
+        assert!(next_art(&rx, Duration::from_secs(2)).is_none());
+        assert!(names(&d).is_empty(), "{:?}", names(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn production_agent_never_contacts_loopback_servers() {
+        let srv = serve(Arc::new(|_, s, _| ok(s, IMG)));
+        let d = tmpdir("policy");
+        let (tx, rx) = async_channel::unbounded();
+        let w = ArtWorker::with(tx, d.clone(), Duration::from_secs(3), art_http::agent(Duration::from_secs(3)));
+        w.submit(format!("http://127.0.0.1:{}/c.png", srv.port));
+        assert!(next_art(&rx, Duration::from_secs(2)).is_none());
+        assert!(srv.st.log.lock().unwrap().is_empty(), "the policy must refuse before any connection");
+        assert!(names(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn local_cover_is_decoded_off_thread_and_special_files_are_skipped() {
+        let d = tmpdir("local");
+        let png = d.join("cover file.png");
+        std::fs::write(&png, IMG).unwrap();
+        let fifo = d.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = async_channel::unbounded();
+        let w = ArtWorker::with(tx, d.join("cache"), Duration::from_secs(3), agent(3));
+        w.submit(format!("file://{}", fifo.display()));
+        assert!(next_art(&rx, Duration::from_millis(500)).is_none());
+        w.submit(format!("file://{}", png.to_string_lossy().replace(' ', "%20")));
+        let (u, p, img) = next_art(&rx, Duration::from_secs(5)).expect("local cover delivered");
+        assert!(u.starts_with("file://"));
+        assert_eq!(std::path::Path::new(&p), png.as_path());
+        assert_eq!((img.width, img.height), (1, 1));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

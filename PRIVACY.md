@@ -10,7 +10,11 @@ Waybar Pill Bar is an open-source desktop plugin that runs only on your own comp
 - You can revoke access at any time at https://myaccount.google.com/permissions, and delete the two files above to remove the local copies.
 
 ## Other data
-The app also reads local system state (media, network, battery, clipboard history, AI tool usage logs) to display it. All of it stays on your computer. Clipboard history is kept in a private file in `~/.local/share/waybar-notch/`.
+The app reads local system state (media, network, battery, clipboard history, AI tool usage logs) to display it. Most of it stays on your computer. Clipboard history is kept in a private file in `~/.local/share/waybar-notch/`.
+
+Two features contact the network about what you play, and nothing else about your media leaves the computer:
+- **Lyrics:** the Media tab asks LRCLIB (`lrclib.net`) for lyrics, sending the current track's artist, title and duration as query parameters. There is no API key and no account. Responses are size-limited.
+- **Cover art:** when a media player supplies an artwork URL (`http` or `https`), the app, and the optional `media-art` Waybar helper if you enable it, fetch that URL from whatever server the player named. That server sees your IP address and the request. Only public internet addresses are contacted; private, loopback and link-local addresses are refused. Local artwork files are read from disk only.
 
 ## Use of Google user data
 Use of information received from Google APIs adheres to the [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy), including the Limited Use requirements.

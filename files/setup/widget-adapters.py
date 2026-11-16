@@ -8,16 +8,24 @@ Panel.qml gets named, paired managed blocks (`// >>> waybar-pill-bar anchor NAME
 of the stock 1.1.0 file, plus a small, count-checked rewrite of the stock design tokens outside those blocks.
 WaybarPillAnchor.qml is a new sibling file (the content-host adapter). Credentials, the manifest, BarWidget.qml and the
 daemon are never touched. Reinstalling replaces only managed blocks; unmanaged edits survive."""
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
+import secrets
 import stat
 import sys
-import tempfile
 
 PLUGIN_ID = "io.github.ricky.whatsapp"
 ANCHOR_FILE = "WaybarPillAnchor.qml"
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# One validation policy for the install record and filesystem trust: the plugin helper owns it.
+_loader = importlib.machinery.SourceFileLoader("waybar_pill_plugin", os.path.join(HERE, "..", "scripts", "waybar-pill-plugin"))
+_spec = importlib.util.spec_from_loader("waybar_pill_plugin", _loader)
+_helper = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_helper)
 
 
 class AdapterError(Exception):
@@ -386,55 +394,66 @@ def patch_panel(text, path):
 
 # ------------------------------------------------------------------------------------------------------ file access
 
-def config_root(config_root=None):
-    return config_root or os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+def config_root(config=None):
+    """The effective configured root (XDG_CONFIG_HOME or ~/.config). An explicit argument must be that same root, so
+    it cannot steer the adapter or the record's destination policy elsewhere."""
+    effective = _helper.config_home()
+    if config is not None and os.path.normpath(config) != effective:
+        raise AdapterError("%s is not the configured Omarchy config root" % config)
+    return effective
 
 
 def read_regular(path):
+    """Text of an owned regular file reached without following links; None when it is absent."""
     try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        raise AdapterError("cannot inspect %s: %s" % (path, e))
-    if not stat.S_ISREG(st.st_mode):
-        raise AdapterError("%s is not a regular file" % path)
+        dfd = _helper.open_directory_chain(os.path.dirname(path), own_from=_helper.trust_root(path))
+        if dfd is None:
+            return None
+        try:
+            fd = _helper.open_leaf(dfd, os.path.basename(path), path)
+        except FileNotFoundError:
+            return None
+        finally:
+            os.close(dfd)
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
     try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
+        with os.fdopen(fd, "rb") as f:
+            return f.read().decode("utf-8")
     except (OSError, UnicodeDecodeError) as e:
         raise AdapterError("cannot read %s: %s" % (path, e))
 
 
+def read_source(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise AdapterError("adapter source %s cannot be read: %s" % (path, e))
+
+
 def sha256_of(path):
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    try:
+        return _helper.sha256_of(path)
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
 
 
 def install_record():
-    """{absolute path: record entry} from the plugin install record; {} when plugin mode was never set up."""
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".local", "state")
-    path = os.path.join(base, "waybar-notch", "plugin-install.json")
+    """{absolute path: record entry} from the validated plugin install record; {} when plugin mode was never set up."""
     try:
-        with open(path, encoding="utf-8") as f:
-            m = json.load(f)
-    except FileNotFoundError:
+        m = _helper.read_marker()
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
+    if m is None:
         return {}
-    except (OSError, ValueError) as e:
-        raise AdapterError("%s is unreadable: %s" % (path, e))
-    if not isinstance(m, dict) or not isinstance(m.get("files"), list):
-        raise AdapterError("%s is malformed" % path)
-    return {e.get("path"): e for e in m["files"] if isinstance(e, dict)}
+    return {e["path"]: e for e in m["files"]}
 
 
 def check_recorded_unchanged(path, record):
     """The install record is the conflict authority: a recorded file whose hash moved is the user's now."""
     entry = record.get(path)
-    if entry and entry.get("installed_sha256") and os.path.lexists(path) and sha256_of(path) != entry["installed_sha256"]:
+    if entry and entry["installed_sha256"] and os.path.lexists(path) and sha256_of(path) != entry["installed_sha256"]:
         raise AdapterError("%s was modified since the last setup; not overwriting it" % path)
 
 
@@ -444,45 +463,78 @@ def check_adapter_ownership(path, record):
     if not os.path.lexists(path):
         return
     entry = record.get(path)
-    if entry is None or entry.get("existed") is not False:
+    if entry is None or entry["existed"] is not False:
         raise AdapterError("%s already exists and is not a Pill Bar adapter recorded by the installer" % path)
     check_recorded_unchanged(path, record)
 
 
 def planned_whatsapp_adapter(config=None):
     """target absolute path -> proposed content; {} when the WhatsApp plugin is not installed."""
-    plugin = os.path.join(config_root(config), "omarchy", "plugins", PLUGIN_ID)
-    if not os.path.isdir(plugin):
+    root = config_root(config)
+    record = install_record()  # a malformed or untrusted record blocks everything before any file is read
+    plugin = os.path.join(root, "omarchy", "plugins", PLUGIN_ID)
+    try:
+        pfd = _helper.open_directory_chain(plugin, own_from=_helper.trust_root(plugin))
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
+    if pfd is None:
         return {}
+    os.close(pfd)
     panel_path = os.path.join(plugin, "Panel.qml")
     anchor_path = os.path.join(plugin, ANCHOR_FILE)
     panel = read_regular(panel_path)
     if panel is None:
         raise AdapterError("%s is missing" % panel_path)
-    existing = read_regular(anchor_path)  # also rejects symlinks and non-regular files
-    source = read_regular(os.path.join(HERE, "..", "qml", ANCHOR_FILE))
-    if source is None:
-        raise AdapterError("adapter source %s is missing" % os.path.join(HERE, "..", "qml", ANCHOR_FILE))
-    record = install_record()
+    read_regular(anchor_path)  # also rejects symlinks and non-regular files
+    source = read_source(os.path.join(HERE, "..", "qml", ANCHOR_FILE))
     check_adapter_ownership(anchor_path, record)
     check_recorded_unchanged(panel_path, record)
-    del existing
     return {panel_path: patch_panel(panel, panel_path), anchor_path: source}
 
 
 def write_atomic(path, content):
-    fd, tmp = tempfile.mkstemp(prefix=".pill-adapter-", dir=os.path.dirname(path))
+    """Publish through an exclusive private temporary; an existing owned file keeps its exact permission bits, a new
+    adapter is 0644. The permissions are set on the descriptor before the file becomes visible."""
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
-    except BaseException:
+        dfd = _helper.open_directory_chain(os.path.dirname(path), own_from=_helper.trust_root(path))
+        if dfd is None:
+            raise AdapterError("%s has no parent directory" % path)
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            mode = 0o644
+            try:
+                st = os.stat(os.path.basename(path), dir_fd=dfd, follow_symlinks=False)
+                _helper.check_leaf(st, path)
+                mode = stat.S_IMODE(st.st_mode)
+            except FileNotFoundError:
+                pass
+            name = os.path.basename(path)
+            tmp = ".pill-adapter-%s" % secrets.token_hex(8)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fchmod(f.fileno(), mode)
+                    os.fsync(f.fileno())
+                os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except BaseException:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dfd)
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
+
+
+def preflight_destination(path):
+    """The destination's ancestry is trusted and an existing leaf is an owned regular file."""
+    try:
+        _helper.leaf_present(path)
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
 
 
 def main(argv):
@@ -495,6 +547,8 @@ def main(argv):
             for p in plan:
                 print(p)
         else:
+            for p in plan:
+                preflight_destination(p)
             for p, content in plan.items():
                 write_atomic(p, content)
     except (AdapterError, OSError) as e:

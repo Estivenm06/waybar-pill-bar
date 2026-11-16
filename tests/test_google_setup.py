@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "files", "scripts", "google-setup.py")
@@ -211,6 +212,81 @@ class GuideTests(unittest.TestCase):
             m.write_private(target, "SECRET")
         self.assertNotIn("SECRET", str(cm.exception))
         self.assertEqual(os.listdir(self.conf), ["x.json"])
+
+    def load(self):
+        loader = importlib.machinery.SourceFileLoader("gs_under_test", SCRIPT)
+        spec = importlib.util.spec_from_loader("gs_under_test", loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        return m
+
+    def test_symlinked_leaf_is_refused_and_sentinel_unchanged(self):
+        os.makedirs(self.conf, mode=0o700)
+        sentinel = os.path.join(self.tmp, "sentinel")
+        with open(sentinel, "w") as f:
+            f.write("KEEP")
+        os.symlink(sentinel, os.path.join(self.conf, "google.json"))
+        with self.assertRaises(RuntimeError) as cm:
+            self.load().write_private(os.path.join(self.conf, "google.json"), "SECRET")
+        self.assertNotIn("SECRET", str(cm.exception))
+        with open(sentinel) as f:
+            self.assertEqual(f.read(), "KEEP")
+        self.assertEqual(sorted(os.listdir(self.conf)), ["google.json"])
+
+    def test_symlinked_config_directory_is_refused(self):
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere, mode=0o700)
+        os.makedirs(os.path.dirname(self.conf))
+        os.symlink(elsewhere, self.conf)
+        with self.assertRaises(RuntimeError):
+            self.load().write_private(os.path.join(self.conf, "google.json"), "SECRET")
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_fifo_leaf_is_refused_without_blocking(self):
+        os.makedirs(self.conf, mode=0o700)
+        fifo = os.path.join(self.conf, "google.json")
+        os.mkfifo(fifo)
+        with self.assertRaises(RuntimeError):
+            self.load().write_private(fifo, "SECRET")
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+
+    def test_group_writable_directory_is_refused_unchanged(self):
+        os.makedirs(self.conf, mode=0o700)
+        os.chmod(self.conf, 0o770)
+        with self.assertRaises(RuntimeError):
+            self.load().write_private(os.path.join(self.conf, "google.json"), "SECRET")
+        self.assertEqual(stat.S_IMODE(os.stat(self.conf).st_mode), 0o770)
+        self.assertEqual(os.listdir(self.conf), [])
+
+    def test_foreign_owned_directory_is_refused(self):
+        os.makedirs(self.conf, mode=0o700)
+        m = self.load()
+        stub = mock.Mock()
+        with mock.patch.object(m, "_plugin", return_value=stub), \
+                mock.patch.object(m.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(RuntimeError):
+                m.write_private(os.path.join(self.conf, "google.json"), "SECRET")
+        self.assertEqual(os.listdir(self.conf), [])
+
+    def test_loose_owned_directory_is_tightened_on_write(self):
+        os.makedirs(self.conf, mode=0o700)
+        os.chmod(self.conf, 0o755)
+        self.load().write_private(os.path.join(self.conf, "google.json"), "{}")
+        self.assertEqual(stat.S_IMODE(os.stat(self.conf).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.conf, "google.json")).st_mode), 0o600)
+
+    def test_guide_refuses_bad_destination_before_publishing_anything(self):
+        os.makedirs(self.conf, mode=0o700)
+        sentinel = os.path.join(self.tmp, "sentinel")
+        with open(sentinel, "w") as f:
+            f.write("KEEP")
+        os.symlink(sentinel, os.path.join(self.conf, "google.json"))
+        rc, out = self.drive([("Project ID (", b"\n")])
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(os.listdir(self.conf), ["google.json"])
+        with open(sentinel) as f:
+            self.assertEqual(f.read(), "KEEP")
 
 
 if __name__ == "__main__":

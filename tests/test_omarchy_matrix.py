@@ -112,7 +112,7 @@ c.sendall(b'{"ok": true, "active": false, "stage": "connect-relay"}\\n')
 r, _ = relay.accept()
 rb = r.makefile("rb")
 open(%r, "a").write("HELLO " + rb.readline().decode())
-r.sendall(b'{"op":"ready","version":1}\\n')
+r.sendall(b'{"op":"ready","version":2}\\n')
 open(%r, "a").write("ACK " + buf.readline().decode())
 c.sendall(b'{"ok": true, "active": true}\\n')
 while c.recv(1024):
@@ -144,7 +144,7 @@ open(%r, "a").write("EOF\\n")
         seen = log_text()
         self.assertIn('ACK {"op":"relay-ready","version":1}', seen, "staged activation never completed: " + seen)
         self.assertLess(seen.index("LINE"), seen.index("HELLO"))  # lease first, then the relay hello
-        self.assertIn('HELLO {"op":"hello","version":1}', seen)
+        self.assertIn('HELLO {"op":"hello","version":2}', seen)
         self.assertNotIn("EOF", seen)  # the lease stays open while the shell is alive
         qs.terminate()
         qs.wait(10)

@@ -47,6 +47,7 @@ fi
 [ -f "$ROOT/manifest.json" ] || { echo "manifest.json missing: run this from the plugin checkout"; exit 1; }
 have omarchy && omarchy plugin list --json >/dev/null 2>&1 || { echo "Omarchy plugin support not found (omarchy plugin list --json failed)."; exit 1; }
 STATEPY="$SRC/setup/plugin-state.py"
+python3 "$STATEPY" validate || { echo "The plugin install record failed validation; nothing was changed."; exit 1; }
 echo "== Building the Rust notch"
 ( cd "$ROOT/notch" && cargo build --release --locked -q )
 PFILES=("$HOME/.local/bin/waybar-notch" "$W/config.jsonc" "$W/style.css" "$W/pill-theme.css"

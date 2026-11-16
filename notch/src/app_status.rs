@@ -292,8 +292,13 @@ mod tests {
             std::fs::write(&p, "").unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // SAFETY: tests of this module run in one process and only these tests read PATH.
-        unsafe { std::env::set_var("PATH", &bin); }
+        // Prepend (never replace) PATH: image decoding in other tests spawns bwrap from it.
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        if !std::env::split_paths(&old).any(|p| p == bin) {
+            let joined = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&old))).unwrap();
+            // SAFETY: tests run single-threaded (--test-threads=1) and mutate PATH only here.
+            unsafe { std::env::set_var("PATH", joined); }
+        }
         let bar = json!({"custom/steam": {"signal": 7}, "custom/spotify": {"signal": 7}});
         let mut t = Tracker::new(dir.join("cache"), &json!({ "apps": apps }), &bar).unwrap();
         t.ensure_script = dir.join("missing-script");

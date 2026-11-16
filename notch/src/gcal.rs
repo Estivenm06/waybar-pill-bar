@@ -3,6 +3,7 @@
 //! `{"client_id": "...", "client_secret": "..."}` to ~/.config/waybar-notch/google.json. The first connect opens the browser;
 //! the refresh token is stored in ~/.local/share/waybar-notch/google-token.json (mode 0600).
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use crate::private_files;
 use chrono::{DateTime, Duration as CDur, Local, NaiveDate, NaiveDateTime};
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -48,15 +49,31 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into()
 }
 
-fn read_json(path: &str) -> Option<Value> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+/// `Ok(None)` only when the config genuinely does not exist or has no client id; unsafe files are errors.
+fn creds() -> Result<Option<(String, String)>, String> {
+    let Some(v) = private_files::read_private_json(std::path::Path::new(&config_path()))? else { return Ok(None) };
+    let Some(id) = v["client_id"].as_str().filter(|s| !s.is_empty()) else { return Ok(None) };
+    let secret = v["client_secret"].as_str().unwrap_or("").to_string();
+    Ok(Some((id.to_string(), secret)))
 }
 
-fn creds() -> Option<(String, String)> {
-    let v = read_json(&config_path())?;
-    let id = v["client_id"].as_str().filter(|s| !s.is_empty())?.to_string();
-    let secret = v["client_secret"].as_str().unwrap_or("").to_string();
-    Some((id, secret))
+/// Only plain HTTPS links with a host, no userinfo and no control characters may become a Join target.
+/// The provider is not restricted: Meet, Zoom, Teams and others all use HTTPS.
+fn join_url(value: &str) -> Option<String> {
+    if value.is_empty() || value.chars().any(|c| c.is_control()) { return None; }
+    let uri = gtk4::glib::Uri::parse(value, gtk4::glib::UriFlags::NONE).ok()?;
+    if uri.scheme() != "https" || uri.userinfo().is_some() { return None; }
+    if uri.host().map_or(true, |h| h.is_empty()) { return None; }
+    Some(value.to_string())
+}
+
+/// First valid HTTPS target among `hangoutLink` and the video entry points.
+fn event_link(it: &Value) -> Option<String> {
+    it["hangoutLink"].as_str().and_then(join_url).or_else(|| {
+        it["conferenceData"]["entryPoints"].as_array()?.iter()
+            .filter(|e| e["entryPointType"].as_str() == Some("video"))
+            .find_map(|e| e["uri"].as_str().and_then(join_url))
+    })
 }
 
 fn enc(s: &str) -> String {
@@ -97,26 +114,7 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Atomically publishes `value` at `path`: the secret never exists in a file readable by others (the
 /// temporary file is created 0600), and the old file survives any failure before the final rename.
 fn write_token_at(path: &std::path::Path, value: &Value) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = path.parent().ok_or_else(|| format!("invalid token path {}", path.display()))?;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let text = value.to_string();
-    for _ in 0..16 {
-        let tmp = dir.join(format!(".google-token.tmp.{}.{}", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
-        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("cannot write {}: {e}", path.display())),
-        };
-        let res = f.write_all(text.as_bytes()).and_then(|_| f.flush()).and_then(|_| f.sync_all()).and_then(|_| std::fs::rename(&tmp, path));
-        if let Err(e) = res {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("cannot write {}: {e}", path.display()));
-        }
-        return Ok(());
-    }
-    Err(format!("cannot write {}: no unused temporary name", path.display()))
+    private_files::write_private_file(path, value.to_string().as_bytes(), ".google-token.tmp", &TMP_SEQ)
 }
 
 fn save_token(refresh: &str, access: &str, expires_in: i64) -> Result<(), String> {
@@ -225,7 +223,7 @@ pub const ERR_NO_CONFIG: &str = "missing ~/.config/waybar-notch/google.json";
 /// Browser sign-in: blocks until the redirect arrives (up to 3 minutes). Run off the UI thread.
 /// `open` receives the consent URL (the app launches a browser, the CLI can print it instead).
 pub fn authorize(open: &dyn Fn(&str)) -> Result<(), String> {
-    let (id, secret) = creds().ok_or(ERR_NO_CONFIG)?;
+    let (id, secret) = creds()?.ok_or(ERR_NO_CONFIG)?;
     let state = random_token()?;
     let verifier = random_token()?;
     let challenge = pkce_challenge(&verifier)?;
@@ -248,8 +246,8 @@ pub fn authorize(open: &dyn Fn(&str)) -> Result<(), String> {
 }
 
 fn access_token() -> Result<String, Update> {
-    let (id, secret) = creds().ok_or(Update::NoConfig)?;
-    let t = read_json(&token_path()).ok_or(Update::NeedAuth)?;
+    let (id, secret) = creds().map_err(Update::Error)?.ok_or(Update::NoConfig)?;
+    let t = private_files::read_private_json(std::path::Path::new(&token_path())).map_err(Update::Error)?.ok_or(Update::NeedAuth)?;
     let refresh = t["refresh_token"].as_str().ok_or(Update::NeedAuth)?.to_string();
     if let (Some(a), Some(exp)) = (t["access_token"].as_str(), t["expires_at"].as_i64()) {
         if !a.is_empty() && exp > Local::now().timestamp() + 60 { return Ok(a.to_string()); }
@@ -297,10 +295,7 @@ pub fn fetch() -> Update {
     for it in v["items"].as_array().into_iter().flatten() {
         if it["status"].as_str() == Some("cancelled") { continue; }
         let (Some((start, all_day)), Some((end, _))) = (parse_time(&it["start"]), parse_time(&it["end"])) else { continue };
-        let link = it["hangoutLink"].as_str().map(str::to_string).or_else(|| {
-            it["conferenceData"]["entryPoints"].as_array()?.iter()
-                .find(|e| e["entryPointType"].as_str() == Some("video"))?["uri"].as_str().map(str::to_string)
-        });
+        let link = event_link(it);
         out.push(Event {
             title: it["summary"].as_str().unwrap_or("(no title)").to_string(),
             start, end, all_day, link,
@@ -472,20 +467,32 @@ mod tests {
     }
 
     #[test]
-    fn token_write_replaces_symlink_not_referent() {
+    fn token_write_refuses_symlink_and_leaves_referent() {
         let dir = tmpdir("symlink");
         let target = dir.join("victim");
         std::fs::write(&target, "keep").unwrap();
         let link = dir.join("google-token.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        write_token_at(&link, &serde_json::json!({"refresh_token": "r"})).unwrap();
+        assert!(write_token_at(&link, &serde_json::json!({"refresh_token": "r"})).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
-        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn token_rename_failure_propagates_and_leaves_no_secret() {
+    fn token_write_refuses_symlinked_directory() {
+        let dir = tmpdir("symdir");
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let linked = dir.join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert!(write_token_at(&linked.join("google-token.json"), &serde_json::json!({"refresh_token": "r"})).is_err());
+        assert!(std::fs::read_dir(&real).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_nonregular_destination_is_refused_and_leaves_no_secret() {
         let dir = tmpdir("rename");
         let dest = dir.join("google-token.json");
         std::fs::create_dir(&dest).unwrap();
@@ -498,16 +505,59 @@ mod tests {
 
     #[test]
     fn token_write_failure_keeps_old_token() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tmpdir("keep");
         let dest = dir.join("google-token.json");
         write_token_at(&dest, &serde_json::json!({"refresh_token": "old"})).unwrap();
         let old = std::fs::read(&dest).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // every candidate temporary name is taken: the write fails before touching the old token
+        let start = TMP_SEQ.load(Ordering::Relaxed);
+        let collisions: Vec<_> = (0..16).map(|i| dir.join(format!(".google-token.tmp.{}.{}", std::process::id(), start + i))).collect();
+        for c in &collisions { std::fs::write(c, b"sentinel").unwrap(); }
         let res = write_token_at(&dest, &serde_json::json!({"refresh_token": "new"}));
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(res.is_err());
         assert_eq!(std::fs::read(&dest).unwrap(), old);
+        for c in &collisions { assert_eq!(std::fs::read(c).unwrap(), b"sentinel"); }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn join_url_accepts_https_providers() {
+        for u in [
+            "https://meet.google.com/abc-defg-hij",
+            "https://zoom.us/j/123456789?pwd=abc",
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting",
+            "https://example.org:8443/room",
+        ] {
+            assert_eq!(join_url(u).as_deref(), Some(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn join_url_rejects_unsafe_targets() {
+        for u in [
+            "", "file:///etc/passwd", "javascript:alert(1)", "http://meet.google.com/x", "zoommtg://zoom.us/join?confno=1",
+            "steam://run/1", "https://", "https:///path", "https://user:pw@meet.google.com/x", "https://user@meet.google.com/x",
+            "not a url", "meet.google.com/abc", "https://meet.google.com/a\nb", "https://meet.google.com/a\u{7}b",
+            "https://meet.google.com/\u{0}", "//meet.google.com/x", "/relative",
+        ] {
+            assert_eq!(join_url(u), None, "{u:?}");
+        }
+    }
+
+    #[test]
+    fn event_link_falls_through_invalid_candidates() {
+        let it = serde_json::json!({
+            "hangoutLink": "javascript:alert(1)",
+            "conferenceData": { "entryPoints": [
+                { "entryPointType": "phone", "uri": "https://example.org/phone" },
+                { "entryPointType": "video", "uri": "file:///etc/passwd" },
+                { "entryPointType": "video", "uri": "https://zoom.us/j/1" },
+            ] }
+        });
+        assert_eq!(event_link(&it).as_deref(), Some("https://zoom.us/j/1"));
+        let none = serde_json::json!({ "hangoutLink": "http://x.example/", "conferenceData": { "entryPoints": [{ "entryPointType": "video", "uri": "tel:1" }] } });
+        assert_eq!(event_link(&none), None);
+        let hang = serde_json::json!({ "hangoutLink": "https://meet.google.com/a-b-c" });
+        assert_eq!(event_link(&hang).as_deref(), Some("https://meet.google.com/a-b-c"));
     }
 }

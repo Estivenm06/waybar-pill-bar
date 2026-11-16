@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lifecycle and control for the Waybar Pill Bar Omarchy service plugin.
 
-Usage: waybar-pill-plugin mode | start | serve | active | reload | toggle | stop | recover | record-generated PATH...
+Usage: waybar-pill-plugin mode | start | serve | active | reload | toggle | stop | recover | runtime-dir | record-generated PATH...
 
 Only `serve` ever launches the product, and only after the plugin's QML service has opened the lease socket. The lease
 socket's EOF (plugin disabled, removed, or the shell exiting) ends the session and restores what the session changed."""
@@ -10,6 +10,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import secrets
 import select
 import signal
 import socket
@@ -67,18 +69,289 @@ def write_atomic(path, text, mode=0o600):
         raise
 
 
-def read_marker():
-    """None when the plugin was never set up; a malformed marker is an error, never a fallback."""
+# ---- trusted filesystem policy
+# Directory ancestry is walked from "/" with descriptors opened O_DIRECTORY|O_NOFOLLOW, so a later path substitution
+# cannot redirect an action. Ancestors must belong to root or the effective user and must not be writable by other
+# accounts (a root-owned sticky directory such as /tmp is the one exception). Dedicated directories, from `own_from`
+# downwards, must belong to the effective user.
+
+MAX_STATE_BYTES = 1 << 20
+BACKUP_RE = re.compile(r"^backup-\d{8}-\d{6}(?:-(?:[2-9]|[1-9][0-9]+))?$")
+SHA_RE = re.compile(r"^(?:[0-9a-f]{64})?$")
+SCRIPT_NAMES = ("google-setup.py", "waybar-pill-plugin", "waybar-plugin-widgets", "waybar-volume-osd.py",
+                "waybar-brightness-key", "waybar-popupctl", "waybar-app.sh", "waybar-bgapp.sh", "media-follow.py",
+                "media-eq.py", "media-art.py")
+WHATSAPP_PLUGIN = "io.github.ricky.whatsapp"
+WHATSAPP_FILES = ("Panel.qml", "WaybarPillAnchor.qml")
+JOURNAL_PHASES = ("preparing", "active", "restoring")
+
+
+def config_home():
+    base = os.environ.get("XDG_CONFIG_HOME", "")
+    return os.path.normpath(base) if base and os.path.isabs(base) else os.path.join(home(), ".config")
+
+
+def installation_paths():
+    """Exact set of absolute destinations install.sh may write; nothing else is ever restored or deleted."""
+    h = home()
+    if not h or not os.path.isabs(h) or os.path.normpath(h) != h:
+        raise PluginError("HOME is not an absolute normalized path")
+    w = os.path.join(h, ".config", "waybar")
+    paths = {os.path.join(h, ".local", "bin", "waybar-notch"),
+             os.path.join(w, "config.jsonc"), os.path.join(w, "style.css"), os.path.join(w, "pill-theme.css"),
+             os.path.join(h, ".config", "omarchy", "hooks", "theme-set.d", "50-waybar-pill-bar"),
+             os.path.join(h, ".config", "omarchy", "hooks", "font-set.d", "50-waybar-pill-bar"),
+             os.path.join(h, ".local", "share", "waybar-notch", "setup", "waybar-setup.py"),
+             os.path.join(h, ".local", "share", "waybar-notch", "setup", "apps-catalog.json"),
+             os.path.join(h, ".config", "hypr", "autostart.lua"), os.path.join(h, ".config", "hypr", "bindings.lua")}
+    paths.update(os.path.join(w, "scripts", n) for n in SCRIPT_NAMES)
+    plugin = os.path.join(config_home(), "omarchy", "plugins", WHATSAPP_PLUGIN)
+    paths.update(os.path.join(plugin, n) for n in WHATSAPP_FILES)
+    return frozenset(paths)
+
+
+def trust_root(path, default=None):
+    """The directory from which `path`'s ancestry must belong to the effective user."""
+    for root in (home(), config_home()):
+        if path == root or path.startswith(root.rstrip("/") + "/"):
+            return root
+    return default if default is not None else os.path.dirname(path)
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _verify_dir(fd, path, owned):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PluginError("%s is not a directory" % path)
+    mode = stat.S_IMODE(st.st_mode)
+    if owned:
+        if st.st_uid != os.geteuid():
+            raise PluginError("%s is not owned by you" % path)
+        if mode & 0o022:
+            raise PluginError("%s is writable by other accounts" % path)
+    else:
+        if st.st_uid not in (0, os.geteuid()):
+            raise PluginError("%s belongs to another account" % path)
+        if mode & 0o022 and not (st.st_uid == 0 and mode & stat.S_ISVTX):
+            raise PluginError("%s is writable by other accounts" % path)
+    return st
+
+
+def open_directory_chain(path, own_from=None, create=False, create_mode=0o700):
+    """Descriptor of the directory `path` after validating every ancestor, or None when some component is missing
+    (and `create` is false). The caller closes the descriptor. Raises PluginError for links or untrusted owners."""
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path or "\0" in path:
+        raise PluginError("%s is not an absolute normalized path" % path)
+    fd = os.open("/", _DIR_FLAGS)
+    cur = ""
     try:
-        with open(marker_path()) as f:
-            m = json.load(f)
+        _verify_dir(fd, "/", False)
+        for comp in [c for c in path.split("/") if c]:
+            cur += "/" + comp
+            try:
+                try:
+                    nfd = os.open(comp, _DIR_FLAGS, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        return None
+                    try:
+                        os.mkdir(comp, create_mode, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    nfd = os.open(comp, _DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                raise PluginError("%s is not a trusted directory (%s)" % (cur, e.strerror or type(e).__name__))
+            os.close(fd)
+            fd = nfd
+            owned = own_from is not None and (cur == own_from or cur.startswith(own_from.rstrip("/") + "/"))
+            _verify_dir(fd, cur, owned)
+        result, fd = fd, None
+        return result
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def validate_directory_chain(path, own_from=None):
+    """True when the directory exists with a trusted ancestry, False when its tail is missing; PluginError otherwise."""
+    fd = open_directory_chain(path, own_from)
+    if fd is None:
+        return False
+    os.close(fd)
+    return True
+
+
+def check_leaf(st, path, state=False):
+    if not stat.S_ISREG(st.st_mode):
+        raise PluginError("%s is not a regular file" % path)
+    if st.st_uid != os.geteuid():
+        raise PluginError("%s is not owned by you" % path)
+    if state and (st.st_nlink != 1 or stat.S_IMODE(st.st_mode) & 0o022):
+        raise PluginError("%s has unsafe links or permissions" % path)
+
+
+def open_leaf(dfd, name, path, state=False):
+    """Read-only descriptor of an owned regular file inside `dfd`; never follows a link or blocks on a FIFO."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
     except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise PluginError("%s cannot be opened safely (%s)" % (path, e.strerror or type(e).__name__))
+    try:
+        check_leaf(os.fstat(fd), path, state)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def leaf_present(path, own_from=None):
+    """Whether an owned regular file exists at `path` (False when absent); an unsafe leaf or parent is an error."""
+    dfd = open_directory_chain(os.path.dirname(path), own_from if own_from is not None else trust_root(path))
+    if dfd is None:
+        return False
+    try:
+        try:
+            st = os.stat(os.path.basename(path), dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        check_leaf(st, path)
+        return True
+    finally:
+        os.close(dfd)
+
+
+def _no_duplicates(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError("duplicate key")
+        out[k] = v
+    return out
+
+
+def _no_constant(_):
+    raise ValueError("non-finite number")
+
+
+def trusted_state_json(path):
+    """Decoded JSON of a record in a dedicated state directory, or None when it does not exist. Never creates or
+    tightens anything, and never echoes file content."""
+    d, name = os.path.split(path)
+    dfd = open_directory_chain(d, own_from=d)
+    if dfd is None:
         return None
-    except (OSError, ValueError) as e:
-        raise PluginError("%s is unreadable: %s" % (marker_path(), e))
-    if not isinstance(m, dict) or m.get("version") != 1 or m.get("mode") != "plugin" or not isinstance(m.get("files"), list):
-        raise PluginError("%s is malformed or from an unsupported version" % marker_path())
+    try:
+        try:
+            fd = open_leaf(dfd, name, path, state=True)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(MAX_STATE_BYTES + 1)
+    finally:
+        os.close(dfd)
+    if len(data) > MAX_STATE_BYTES:
+        raise PluginError("%s is too large" % path)
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+    except ValueError:
+        raise PluginError("%s is malformed" % path)
+
+
+def write_state_json(path, value):
+    """Atomically publish a record as 0600 in its dedicated state directory (created 0700; an owned looser one is
+    tightened). Callers validate the record first."""
+    data = (json.dumps(value, indent=2) + "\n").encode()
+    if len(data) > MAX_STATE_BYTES:
+        raise PluginError("%s would be too large" % path)
+    d, name = os.path.split(path)
+    dfd = open_directory_chain(d, own_from=d, create=True)
+    tmp = ".tmp.%s" % secrets.token_hex(8)
+    try:
+        os.fchmod(dfd, 0o700)
+        try:
+            check_leaf(os.stat(name, dir_fd=dfd, follow_symlinks=False), path, state=True)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+
+
+def remove_state(path):
+    d, name = os.path.split(path)
+    dfd = open_directory_chain(d, own_from=d)
+    if dfd is None:
+        return
+    try:
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(dfd)
+
+
+def validate_record(m):
+    """Schema and footprint-allowlist validation of the install record; raises PluginError, never echoes content."""
+    where = marker_path()
+    if not isinstance(m, dict) or type(m.get("version")) is not int or m["version"] != 1 or m.get("mode") != "plugin":
+        raise PluginError("%s is malformed or from an unsupported version" % where)
+    backup, files = m.get("backup_dir"), m.get("files")
+    if not isinstance(backup, str) or not isinstance(files, list):
+        raise PluginError("%s is malformed" % where)
+    if os.path.dirname(backup) != os.path.join(home(), ".config", "waybar") or not BACKUP_RE.match(os.path.basename(backup)):
+        raise PluginError("%s names a backup directory outside the installation footprint" % where)
+    allowed = installation_paths()
+    seen = set()
+    for e in files:
+        if not isinstance(e, dict) or set(e) != {"path", "existed", "installed_sha256"}:
+            raise PluginError("%s has a malformed file entry" % where)
+        p, existed, sha = e["path"], e["existed"], e["installed_sha256"]
+        if not isinstance(p, str) or not os.path.isabs(p) or os.path.normpath(p) != p:
+            raise PluginError("%s has a malformed file path" % where)
+        if p not in allowed:
+            raise PluginError("%s lists a path outside the installation footprint" % where)
+        if p in seen:
+            raise PluginError("%s lists a path twice" % where)
+        seen.add(p)
+        if type(existed) is not bool or not isinstance(sha, str) or not SHA_RE.match(sha):
+            raise PluginError("%s has a malformed file entry" % where)
     return m
+
+
+def read_marker():
+    """None when the plugin was never set up; an untrusted or malformed marker is an error, never a fallback."""
+    m = trusted_state_json(marker_path())
+    if m is None:
+        return None
+    return validate_record(m)
+
+
+def validate_journal(j):
+    if not isinstance(j, dict) or type(j.get("version")) is not int or j["version"] != 1:
+        raise PluginError("recovery journal is malformed or from an unsupported version")
+    added = j.get("disabled_plugins_added")
+    if j.get("phase") not in JOURNAL_PHASES or type(j.get("bar_hidden_before")) is not bool \
+            or type(j.get("waybar_was_active")) is not bool or not isinstance(added, list) \
+            or not all(isinstance(i, str) for i in added) or len(set(added)) != len(added):
+        raise PluginError("recovery journal is malformed")
+    return j
 
 
 def mode():
@@ -89,8 +362,16 @@ def mode():
 
 
 def sha256_of(path):
+    """SHA-256 of an owned regular file reached without following any link."""
+    dfd = open_directory_chain(os.path.dirname(path), trust_root(path))
+    if dfd is None:
+        raise FileNotFoundError(path)
+    try:
+        fd = open_leaf(dfd, os.path.basename(path), path)
+    finally:
+        os.close(dfd)
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with os.fdopen(fd, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -108,7 +389,7 @@ def record_generated_files(paths):
             raise PluginError("%s is not part of the plugin install record" % p)
     for p in real:
         entries[p]["installed_sha256"] = sha256_of(p)
-    write_atomic(marker_path(), json.dumps(m, indent=2) + "\n")
+    write_state_json(marker_path(), m)
 
 
 def runtime_dir(create=True):
@@ -116,15 +397,15 @@ def runtime_dir(create=True):
     if not root or not os.path.isabs(root):
         raise PluginError("XDG_RUNTIME_DIR is not set to an absolute path")
     st = os.lstat(root) if os.path.lexists(root) else None
-    if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-        raise PluginError("XDG_RUNTIME_DIR is not a directory owned by you")
+    if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        raise PluginError("XDG_RUNTIME_DIR is not a private directory owned by you")
     d = os.path.join(root, "waybar-pill-plugin")
     if not os.path.lexists(d):
         if not create:
             return d
         os.mkdir(d, 0o700)
     st = os.lstat(d)
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
         raise PluginError("%s is a symlink, not yours, or not mode 0700" % d)
     return d
 
@@ -238,7 +519,7 @@ class Session:
 
     # ---- journal
     def save_journal(self, j):
-        write_atomic(journal_path(), json.dumps(j, indent=2) + "\n")
+        write_state_json(journal_path(), validate_journal(j))
 
     # ---- transaction
     def preflight(self):
@@ -418,15 +699,10 @@ class Session:
 def restore(session=None):
     """Undo a journaled session. The journal is kept if anything could not be restored."""
     s = session or Session()
-    try:
-        with open(journal_path()) as f:
-            j = json.load(f)
-    except FileNotFoundError:
+    j = trusted_state_json(journal_path())
+    if j is None:
         return
-    except (OSError, ValueError) as e:
-        raise PluginError("recovery journal unreadable: %s" % e)
-    if j.get("version") != 1:
-        raise PluginError("recovery journal has an unsupported version")
+    validate_journal(j)
     j["phase"] = "restoring"
     s.save_journal(j)
     failed = []
@@ -447,7 +723,7 @@ def restore(session=None):
     if failed:
         print("waybar-pill-plugin: restoration incomplete (%s); run: waybar-pill-plugin recover" % "; ".join(failed), file=sys.stderr)
         return
-    os.unlink(journal_path())
+    remove_state(journal_path())
 
 
 # ---- server
@@ -705,6 +981,9 @@ def main(argv):
         return serve()
     if c == "recover" and len(argv) == 1:
         return recover()
+    if c == "runtime-dir" and len(argv) == 1:
+        print(runtime_dir())
+        return 0
     if c == "record-generated" and len(argv) > 1:
         record_generated_files(argv[1:])
         return 0

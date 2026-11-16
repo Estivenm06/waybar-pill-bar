@@ -1,17 +1,30 @@
 //! Notification cards (notch-style black pills) for notifications forwarded by the Omarchy shell's relay.
 //! Cards hang below the right-hand Waybar pill. Do-Not-Disturb is shared with the Omarchy state file so the Controls
 //! tile and Waybar keep working.
+//!
+//! Everything a notification sender controls is bounded here: at most five active cards, at most five retiring
+//! widgets/timers, a bounded GTK-side event consumer, and file icons decoded by one worker thread (never on the GTK
+//! thread) through capacity-five channels.
 use gtk::{gdk, glib, prelude::*};
-use crate::notification_relay::Command;
+use crate::image_loader::{self, DecodedImage};
+use crate::notification_relay::{Command, Event};
 use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 const MAX_CARDS: usize = 5;
+const MAX_RETIRING: usize = 5;
 const DEFAULT_MS: u64 = 6000;
 const SLIDE_MS: u32 = 240;
+/// File icons are shown at 36 logical pixels; 72 covers a 2x scale.
+const ICON_EDGE: i32 = 72;
+const ICON_QUEUE: usize = 5;
+/// Events (or icon completions) the GTK thread handles before yielding to its main loop.
+pub const EVENT_BATCH: usize = 16;
 
 pub const REASON_EXPIRED: u32 = 1;
 pub const REASON_DISMISSED: u32 = 2;
@@ -45,17 +58,140 @@ pub fn set_dnd(on: bool) {
     let _ = std::fs::write(&p, format!("{{\n  \"version\": 3,\n  \"dnd\": {on}\n}}\n"));
 }
 
+// ------------------------------------------------------------------ bounded consumption
+
+/// Handles items from `rx` on the GLib main loop: at most [`EVENT_BATCH`] per turn, then a one-millisecond timeout
+/// future so timers, drawing and input run between batches of a flood. Below the batch size it sleeps on the channel.
+/// `handle` returns `false` to stop consuming.
+pub async fn consume<T>(rx: async_channel::Receiver<T>, mut handle: impl FnMut(T) -> bool) {
+    while let Ok(first) = rx.recv().await {
+        if !handle(first) { return; }
+        let mut taken = 1;
+        while taken < EVENT_BATCH {
+            let Ok(item) = rx.try_recv() else { break };
+            if !handle(item) { return; }
+            taken += 1;
+        }
+        if taken == EVENT_BATCH { glib::timeout_future(Duration::from_millis(1)).await; }
+    }
+}
+
+/// The one ordered handling path of a relay event: Do-Not-Disturb rejection, card creation or closure, then exactly
+/// one acknowledgement so the shell may send another event.
+pub fn dispatch(ev: Event, dnd: impl FnOnce() -> bool, relay: &std::sync::mpsc::Sender<Command>, show: impl FnOnce(Note), close: impl FnOnce(u32)) {
+    let seq = match ev {
+        Event::Notify { seq, note } => {
+            if note.urgency < 2 && dnd() {
+                // swallowed: the sender sees a normal expiry
+                let _ = relay.send(Command::Close { id: note.id, reason: REASON_EXPIRED });
+            } else {
+                show(note);
+            }
+            seq
+        }
+        Event::Closed { seq, id } => {
+            close(id);
+            seq
+        }
+    };
+    let _ = relay.send(Command::Ack { seq });
+}
+
+// ------------------------------------------------------------------ file icons
+
+/// Which card generation may still receive an icon for a notification id. Every new card (including a replacement
+/// of the same id) starts a new generation; closing a card ends it.
+#[derive(Default)]
+struct IconGenerations {
+    last: u64,
+    current: HashMap<u32, u64>,
+}
+
+impl IconGenerations {
+    fn begin(&mut self, id: u32) -> u64 {
+        self.last += 1;
+        self.current.insert(id, self.last);
+        self.last
+    }
+
+    fn end(&mut self, id: u32) {
+        self.current.remove(&id);
+    }
+
+    fn accepts(&self, id: u32, generation: u64) -> bool {
+        self.current.get(&id) == Some(&generation)
+    }
+}
+
+pub struct IconJob {
+    pub id: u32,
+    pub generation: u64,
+    pub path: PathBuf,
+}
+
+pub struct IconDone {
+    pub id: u32,
+    pub generation: u64,
+    pub image: Result<DecodedImage, String>,
+}
+
+/// One decoder thread for every notification icon. Requests wait in a queue of five; when it is full the oldest
+/// not-yet-started job is discarded for the newest. Completions are returned through a second queue of five.
+pub struct IconWorker {
+    jobs: async_channel::Sender<IconJob>,
+    oldest: async_channel::Receiver<IconJob>,
+}
+
+impl IconWorker {
+    pub fn start(load: impl Fn(&Path) -> Result<DecodedImage, String> + Send + 'static) -> (IconWorker, async_channel::Receiver<IconDone>) {
+        let (jobs, rx) = async_channel::bounded::<IconJob>(ICON_QUEUE);
+        let (done_tx, done_rx) = async_channel::bounded::<IconDone>(ICON_QUEUE);
+        let oldest = rx.clone();
+        let _ = std::thread::Builder::new().name("notify-icons".into()).spawn(move || {
+            while let Ok(job) = rx.recv_blocking() {
+                let image = load(&job.path);
+                if done_tx.send_blocking(IconDone { id: job.id, generation: job.generation, image }).is_err() { return; }
+            }
+        });
+        (IconWorker { jobs, oldest }, done_rx)
+    }
+
+    pub fn submit(&self, mut job: IconJob) {
+        loop {
+            match self.jobs.try_send(job) {
+                Ok(()) | Err(async_channel::TrySendError::Closed(_)) => return,
+                Err(async_channel::TrySendError::Full(j)) => {
+                    job = j;
+                    let _ = self.oldest.try_recv(); // drop the oldest job that has not started
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ UI
 struct Card {
     id: u32,
     rev: gtk::Revealer,
+    icon: gtk::Image,
     timer: RefCell<Option<glib::SourceId>>,
+}
+
+/// A widget sliding out; its removal timer is cancelled if the queue overflows.
+struct Retiring {
+    token: u64,
+    rev: gtk::Revealer,
+    timer: glib::SourceId,
 }
 
 pub struct NotifyUi {
     win: gtk::ApplicationWindow,
     col: gtk::Box,
     cards: RefCell<Vec<Rc<Card>>>,
+    retiring: RefCell<VecDeque<Retiring>>,
+    retire_token: Cell<u64>,
+    gens: RefCell<IconGenerations>,
+    icons: IconWorker,
     hidden: Cell<bool>,
     animations: Cell<bool>,
     mon: RefCell<String>,
@@ -93,7 +229,38 @@ impl NotifyUi {
         col.set_halign(gtk::Align::End);
         col.set_valign(gtk::Align::Start);
         win.set_child(Some(&col));
-        Rc::new(NotifyUi { win, col, cards: RefCell::new(Vec::new()), hidden: Cell::new(false), animations: Cell::new(true), mon: RefCell::new(String::new()), relay })
+        let (icons, done) = IconWorker::start(|p| image_loader::load_file(p, ICON_EDGE));
+        let ui = Rc::new(NotifyUi {
+            win, col, cards: RefCell::new(Vec::new()), retiring: RefCell::new(VecDeque::new()), retire_token: Cell::new(0),
+            gens: RefCell::new(IconGenerations::default()), icons, hidden: Cell::new(false), animations: Cell::new(true),
+            mon: RefCell::new(String::new()), relay,
+        });
+        let weak = Rc::downgrade(&ui);
+        glib::MainContext::default().spawn_local(consume(done, move |d| match weak.upgrade() {
+            Some(u) => { u.apply_icon(d); true }
+            None => false,
+        }));
+        ui
+    }
+
+    /// Consume relay events on the GTK main loop (bounded batches); every event is acknowledged once handled.
+    pub fn run_events(self: &Rc<Self>, events: async_channel::Receiver<Event>) {
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(consume(events, move |ev| {
+            let Some(u) = weak.upgrade() else { return false };
+            let (shower, closer) = (u.clone(), u.clone());
+            dispatch(ev, dnd_on, &u.relay, move |n| shower.show(n), move |id| closer.close(id, REASON_CLOSED, true));
+            true
+        }));
+    }
+
+    /// A finished icon decode: applied only while the card that asked for it is still the active one for that id.
+    fn apply_icon(&self, done: IconDone) {
+        if !self.gens.borrow().accepts(done.id, done.generation) { return; }
+        let Ok(image) = done.image else { return }; // rejected or undecodable: the fallback icon stays
+        if let Some(card) = self.cards.borrow().iter().find(|c| c.id == done.id) {
+            card.icon.set_paintable(Some(&image_loader::texture(image)));
+        }
     }
 
     fn emit_closed(&self, id: u32, reason: u32) {
@@ -135,7 +302,8 @@ impl NotifyUi {
         if self.animations.get() { SLIDE_MS } else { 0 }
     }
 
-    fn make_card(self: &Rc<Self>, n: &Note) -> gtk::Box {
+    /// The card widget, its icon (a fallback until a file icon is decoded) and the local file to decode, if any.
+    fn make_card(self: &Rc<Self>, n: &Note) -> (gtk::Box, gtk::Image, Option<PathBuf>) {
         let card = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         card.add_css_class("ncard");
         card.set_overflow(gtk::Overflow::Hidden);
@@ -153,13 +321,14 @@ impl NotifyUi {
         inner.set_margin_bottom(10);
         inner.set_hexpand(true);
 
-        let img = if n.icon.starts_with('/') || n.icon.starts_with("file://") {
-            gtk::Image::from_file(n.icon.trim_start_matches("file://"))
-        } else if !n.icon.is_empty() {
+        // A sender-supplied file is never opened here: the fallback shows at once and a worker decodes the file.
+        let local = n.icon.starts_with('/') || n.icon.starts_with("file://");
+        let img = if !local && !n.icon.is_empty() {
             gtk::Image::from_icon_name(&n.icon)
         } else {
             gtk::Image::from_icon_name("dialog-information-symbolic")
         };
+        let icon_path = if local { image_loader::local_path(&n.icon) } else { None };
         img.set_pixel_size(36);
         img.set_valign(gtk::Align::Start);
         img.add_css_class("nicon");
@@ -220,21 +389,24 @@ impl NotifyUi {
             u.close(id, REASON_DISMISSED, true);
         });
         card.add_controller(click);
-        card
+        (card, img, icon_path)
     }
 
     pub fn show(self: &Rc<Self>, n: Note) {
-        // a replaces_id update swaps the card in place of the old one
-        self.close(n.id, REASON_CLOSED, false);
+        // a replaces_id update swaps the card in place of the old one; the old widget goes away synchronously
+        self.close_with(n.id, REASON_CLOSED, false, false);
 
+        let (widget, icon, icon_path) = self.make_card(&n);
         let rev = gtk::Revealer::new();
         rev.set_transition_type(gtk::RevealerTransitionType::SlideDown);
         rev.set_transition_duration(self.slide_ms());
-        rev.set_child(Some(&self.make_card(&n)));
+        rev.set_child(Some(&widget));
         self.col.prepend(&rev);
 
-        let card = Rc::new(Card { id: n.id, rev: rev.clone(), timer: RefCell::new(None) });
+        let card = Rc::new(Card { id: n.id, rev: rev.clone(), icon, timer: RefCell::new(None) });
         self.cards.borrow_mut().insert(0, card.clone());
+        let generation = self.gens.borrow_mut().begin(n.id);
+        if let Some(path) = icon_path { self.icons.submit(IconJob { id: n.id, generation, path }); }
 
         let ms = match (n.timeout_ms, n.urgency) {
             (_, 2) | (0, _) => 0,
@@ -252,12 +424,17 @@ impl NotifyUi {
         self.sync_visibility();
         rev.set_reveal_child(true);
 
-        // cap the stack: dismiss the oldest
+        // cap the stack: expire the oldest without animating it
         let overflow = { let c = self.cards.borrow(); if c.len() > MAX_CARDS { Some(c[c.len() - 1].id) } else { None } };
-        if let Some(id) = overflow { self.close(id, REASON_EXPIRED, true); }
+        if let Some(id) = overflow { self.close_with(id, REASON_EXPIRED, true, false); }
     }
 
+    /// Close a card. Dismissals and expiries slide out; a sender-side closure (replacement or external close) does not.
     pub fn close(self: &Rc<Self>, id: u32, reason: u32, notify: bool) {
+        self.close_with(id, reason, notify, reason != REASON_CLOSED);
+    }
+
+    fn close_with(self: &Rc<Self>, id: u32, reason: u32, notify: bool, animate: bool) {
         let card = {
             let mut cards = self.cards.borrow_mut();
             match cards.iter().position(|c| c.id == id) {
@@ -265,18 +442,178 @@ impl NotifyUi {
                 None => return,
             }
         };
+        self.gens.borrow_mut().end(id);
         if let Some(t) = card.timer.borrow_mut().take() { t.remove(); }
         if notify { self.emit_closed(id, reason); }
-        let (u, rev) = (self.clone(), card.rev.clone());
-        if self.hidden.get() || !self.win.is_visible() {
+        self.retire(card.rev.clone(), animate);
+    }
+
+    /// Remove a closed card's widget, sliding it out when asked. At most [`MAX_RETIRING`] widgets (each with one
+    /// timer) are ever in flight: the oldest is removed immediately when a sixth arrives.
+    fn retire(self: &Rc<Self>, rev: gtk::Revealer, animate: bool) {
+        if !animate || self.hidden.get() || !self.win.is_visible() {
             self.col.remove(&rev);
             self.sync_visibility();
             return;
         }
+        loop {
+            let oldest = {
+                let mut q = self.retiring.borrow_mut();
+                if q.len() < MAX_RETIRING { break; }
+                q.pop_front()
+            };
+            if let Some(old) = oldest {
+                old.timer.remove();
+                self.col.remove(&old.rev);
+            }
+        }
+        let token = self.retire_token.get() + 1;
+        self.retire_token.set(token);
         rev.set_reveal_child(false);
-        glib::timeout_add_local_once(Duration::from_millis(self.slide_ms() as u64 + 30), move || {
-            u.col.remove(&rev);
-            u.sync_visibility();
+        let u = self.clone();
+        let timer = glib::timeout_add_local_once(Duration::from_millis(self.slide_ms() as u64 + 30), move || u.finish_retire(token));
+        self.retiring.borrow_mut().push_back(Retiring { token, rev, timer });
+    }
+
+    fn finish_retire(&self, token: u64) {
+        let done = {
+            let mut q = self.retiring.borrow_mut();
+            q.iter().position(|r| r.token == token).and_then(|i| q.remove(i))
+        };
+        // the timer that called us has fired and is gone; only the widget is left to remove
+        if let Some(r) = done {
+            self.col.remove(&r.rev);
+            self.sync_visibility();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    fn note(id: u32, urgency: u8) -> Note {
+        Note { id, app: "A".into(), icon: String::new(), summary: "S".into(), body: "B".into(), actions: Vec::new(), urgency, timeout_ms: -1 }
+    }
+
+    fn tiny() -> DecodedImage {
+        DecodedImage { width: 1, height: 1, rowstride: 4, alpha: true, bytes: glib::Bytes::from_owned(vec![0u8; 4]) }
+    }
+
+    /// Runs `dispatch` and reports (shown ids, closed ids, relay commands as strings).
+    fn run(ev: Event, dnd: bool) -> (Vec<u32>, Vec<u32>, Vec<String>) {
+        let (rtx, rrx) = mpsc::channel();
+        let (shown, closed) = (std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        dispatch(ev, || dnd, &rtx, |n| shown.borrow_mut().push(n.id), |id| closed.borrow_mut().push(id));
+        drop(rtx);
+        let cmds = rrx.try_iter().map(|c| match c {
+            Command::Ack { seq } => format!("ack {seq}"),
+            Command::Close { id, reason } => format!("close {id} {reason}"),
+            Command::Action { id, key } => format!("action {id} {key}"),
+        }).collect();
+        (shown.into_inner(), closed.into_inner(), cmds)
+    }
+
+    #[test]
+    fn every_event_is_acknowledged_exactly_once() {
+        assert_eq!(run(Event::Notify { seq: 4, note: note(7, 1) }, false), (vec![7], vec![], vec!["ack 4".to_string()]));
+        assert_eq!(run(Event::Notify { seq: 5, note: note(7, 2) }, true), (vec![7], vec![], vec!["ack 5".to_string()]), "critical ignores Do-Not-Disturb");
+        assert_eq!(run(Event::Closed { seq: 6, id: 7 }, true), (vec![], vec![7], vec!["ack 6".to_string()]));
+    }
+
+    #[test]
+    fn do_not_disturb_expires_the_notification_and_still_acknowledges() {
+        for urgency in [0, 1] {
+            let (shown, closed, cmds) = run(Event::Notify { seq: 9, note: note(3, urgency) }, true);
+            assert!(shown.is_empty() && closed.is_empty());
+            assert_eq!(cmds, vec![format!("close 3 {REASON_EXPIRED}"), "ack 9".to_string()], "the expiry reaches the sender before the next event is allowed");
+        }
+    }
+
+    #[test]
+    fn do_not_disturb_is_only_read_for_notify_events() {
+        let (rtx, _rrx) = mpsc::channel();
+        dispatch(Event::Closed { seq: 1, id: 1 }, || panic!("a closed event must not consult Do-Not-Disturb"), &rtx, |_| {}, |_| {});
+    }
+
+    #[test]
+    fn stale_icon_completions_cannot_update_a_newer_card() {
+        let mut g = IconGenerations::default();
+        let first = g.begin(7);
+        assert!(g.accepts(7, first));
+        let replacement = g.begin(7); // a replaces_id update builds a new card for the same id
+        assert!(!g.accepts(7, first), "the old card's decode must be ignored");
+        assert!(g.accepts(7, replacement));
+        assert!(!g.accepts(8, replacement), "another id never matches");
+        g.end(7); // the card was closed before its icon arrived
+        assert!(!g.accepts(7, replacement));
+        let reborn = g.begin(7);
+        assert!(reborn > replacement && g.accepts(7, reborn) && !g.accepts(7, replacement));
+    }
+
+    #[test]
+    fn a_full_icon_queue_discards_the_oldest_unstarted_job() {
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<PathBuf>();
+        let (worker, done) = IconWorker::start(move |p| {
+            started_tx.send(p.to_path_buf()).unwrap();
+            gate_rx.recv().unwrap(); // deterministic gate: the worker finishes only when the test says so
+            Ok(tiny())
         });
+        let job = |id: u32| IconJob { id, generation: id as u64 * 10, path: PathBuf::from(format!("/icon/{id}")) };
+        worker.submit(job(1));
+        assert_eq!(started_rx.recv().unwrap(), PathBuf::from("/icon/1")); // job 1 is running and blocked
+        for id in 2..=7 { worker.submit(job(id)); } // five fit; the sixth evicts the oldest waiting job (2)
+        for _ in 0..6 { gate_tx.send(()).unwrap(); }
+        let got: Vec<(u32, u64)> = (0..6).map(|_| { let d = done.recv_blocking().unwrap(); assert!(d.image.is_ok()); (d.id, d.generation) }).collect();
+        assert_eq!(got, vec![(1, 10), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70)]);
+    }
+
+    #[test]
+    fn decoder_errors_come_back_as_errors_not_panics() {
+        let (worker, done) = IconWorker::start(|_| Err("rejected".to_string()));
+        worker.submit(IconJob { id: 1, generation: 1, path: PathBuf::from("/nope") });
+        let d = done.recv_blocking().unwrap();
+        assert_eq!((d.id, d.generation, d.image.err().as_deref()), (1, 1, Some("rejected")));
+    }
+
+    #[test]
+    fn the_consumer_yields_to_the_main_loop_between_batches() {
+        let ctx = glib::MainContext::new();
+        let total = EVENT_BATCH * 3;
+        let (tx, rx) = async_channel::unbounded::<usize>();
+        for i in 0..total { tx.try_send(i).unwrap(); }
+        drop(tx);
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let at_heartbeat = Arc::new(AtomicUsize::new(usize::MAX));
+        ctx.block_on(async {
+            let (c, beat, attach_ctx) = (consumed.clone(), at_heartbeat.clone(), ctx.clone());
+            consume(rx, move |_| {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // a default-priority idle callback: it can only run once the consumer gives the loop a turn
+                    let (c, beat) = (c.clone(), beat.clone());
+                    glib::idle_source_new(None, glib::Priority::DEFAULT, move || {
+                        beat.store(c.load(Ordering::SeqCst), Ordering::SeqCst);
+                        glib::ControlFlow::Break
+                    }).attach(Some(&attach_ctx));
+                }
+                true
+            }).await;
+        });
+        assert_eq!(consumed.load(Ordering::SeqCst), total, "every queued event is eventually handled");
+        assert_eq!(at_heartbeat.load(Ordering::SeqCst), EVENT_BATCH, "the main loop ran after one batch, long before the flood was consumed");
+    }
+
+    #[test]
+    fn the_consumer_sleeps_below_the_batch_size_and_can_stop() {
+        let ctx = glib::MainContext::new();
+        let (tx, rx) = async_channel::unbounded::<u32>();
+        for i in 0..5 { tx.try_send(i).unwrap(); }
+        let seen = std::cell::RefCell::new(Vec::new());
+        ctx.block_on(consume(rx, |i| { seen.borrow_mut().push(i); i < 3 }));
+        assert_eq!(*seen.borrow(), vec![0, 1, 2, 3], "handle returning false stops consumption");
+        drop(tx);
     }
 }

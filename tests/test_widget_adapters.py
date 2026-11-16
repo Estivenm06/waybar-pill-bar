@@ -66,10 +66,13 @@ class Base(unittest.TestCase):
         self.anchor = os.path.join(self.plugin, "WaybarPillAnchor.qml")
         self.m = load_adapters()
         # the module reads the install record from the environment: keep it inside the temporary HOME
-        for k, v in (("HOME", self.home), ("XDG_STATE_HOME", os.path.join(self.home, ".local", "state"))):
+        for k, v in (("HOME", self.home), ("XDG_STATE_HOME", os.path.join(self.home, ".local", "state")),
+                     ("XDG_CONFIG_HOME", self.cfg)):
             old = os.environ.get(k)
             os.environ[k] = v
             self.addCleanup(lambda k=k, old=old: os.environ.pop(k, None) if old is None else os.environ.__setitem__(k, old))
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
 
     def install_panel(self, text=STOCK):
         os.makedirs(self.plugin, exist_ok=True)
@@ -254,6 +257,97 @@ class InstallRecordTests(Base):
             self.assertEqual(self.cli(STATEPY, "begin", *paths).returncode, 0)
             self.assertEqual(self.cli(ADAPTERS, "apply").returncode, 0)
             self.assertEqual(self.cli(STATEPY, "finish").returncode, 0)
+
+
+class PrivateAdapterTests(Base):
+    SECRET = "// synthetic private comment, not for other accounts\n"
+
+    def test_private_panel_modes_survive_apply_reapply_and_uninstall(self):
+        for mode in (0o600, 0o640):
+            with self.subTest(mode=oct(mode)):
+                self.install_panel(STOCK + self.SECRET)
+                os.chmod(self.panel, mode)
+                original = self.read(self.panel)
+                paths = self.cli(ADAPTERS, "paths").stdout.split()
+                for _ in range(2):  # apply, then reapply through the record
+                    self.assertEqual(self.cli(STATEPY, "begin", *paths).returncode, 0)
+                    r = self.cli(ADAPTERS, "apply")
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(self.cli(STATEPY, "finish").returncode, 0)
+                    self.assertEqual(os.stat(self.panel).st_mode & 0o7777, mode)
+                    self.assertIn(self.SECRET, self.read(self.panel))
+                    self.assertEqual(os.stat(self.anchor).st_mode & 0o7777, 0o644)
+                self.assertEqual([n for n in os.listdir(self.plugin) if n.startswith(".pill-adapter-")], [])
+                self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
+                self.assertEqual(self.read(self.panel), original)
+                self.assertEqual(os.stat(self.panel).st_mode & 0o7777, mode)
+                self.assertFalse(os.path.exists(self.anchor))
+
+    def state_path(self):
+        return os.path.join(self.home, ".local", "state", "waybar-notch", "plugin-install.json")
+
+    def test_malformed_or_untrusted_records_block_paths_and_apply(self):
+        self.install_panel()
+        os.chmod(self.panel, 0o600)
+        sentinel = os.path.join(self.tmp, "sentinel")
+        with open(sentinel, "w") as f:
+            f.write("keep")
+        good = {"version": 1, "mode": "plugin", "files": [],
+                "backup_dir": os.path.join(self.home, ".config", "waybar", "backup-20260101-000000")}
+        records = {
+            "garbage": "{nope",
+            "outside path": dict(good, files=[{"path": sentinel, "existed": False, "installed_sha256": ""}]),
+            "relative path": dict(good, files=[{"path": "Panel.qml", "existed": False, "installed_sha256": ""}]),
+            "backup naming home": dict(good, backup_dir=self.home),
+            "no files": {"version": 1, "mode": "plugin"},
+            "duplicate": dict(good, files=[{"path": self.anchor, "existed": False, "installed_sha256": ""}] * 2),
+        }
+        os.makedirs(os.path.dirname(self.state_path()))
+        for why, rec in records.items():
+            with self.subTest(why):
+                with open(self.state_path(), "w") as f:
+                    f.write(rec if isinstance(rec, str) else json.dumps(rec))
+                for cmd in ("paths", "apply"):
+                    r = self.cli(ADAPTERS, cmd)
+                    self.assertNotEqual(r.returncode, 0, (why, cmd))
+                    self.assertNotIn(sentinel, r.stdout)
+                self.assertEqual(self.read(self.panel), STOCK)
+                self.assertEqual(os.stat(self.panel).st_mode & 0o777, 0o600)
+                self.assertFalse(os.path.exists(self.anchor))
+        os.unlink(self.state_path())
+        os.symlink(sentinel, self.state_path())
+        for cmd in ("paths", "apply"):
+            self.assertNotEqual(self.cli(ADAPTERS, cmd).returncode, 0)
+        self.assertEqual(self.read(self.panel), STOCK)
+
+    def test_unsafe_plugin_directory_and_foreign_config_roots_are_refused(self):
+        self.install_panel()
+        os.chmod(self.plugin, 0o775)
+        for cmd in ("paths", "apply"):
+            self.assertNotEqual(self.cli(ADAPTERS, cmd).returncode, 0)
+        self.assertEqual(self.read(self.panel), STOCK)
+        self.assertFalse(os.path.exists(self.anchor))
+        os.chmod(self.plugin, 0o755)
+        with self.assertRaises(self.m.AdapterError):
+            self.m.planned_whatsapp_adapter(os.path.join(self.tmp, "other-config"))
+        self.assertEqual(self.cli(ADAPTERS, "apply").returncode, 0)
+
+    def test_custom_xdg_config_root_works_with_a_trusted_ancestry(self):
+        cfg = os.path.join(self.tmp, "xdg-config")
+        plugin = os.path.join(cfg, "omarchy", "plugins", "io.github.ricky.whatsapp")
+        os.makedirs(plugin)
+        with open(os.path.join(plugin, "Panel.qml"), "w") as f:
+            f.write(STOCK)
+        env = dict(self.env(), XDG_CONFIG_HOME=cfg)
+        run = lambda script, *a: subprocess.run([sys.executable, script, *a], env=env, capture_output=True, text=True)
+        paths = run(ADAPTERS, "paths").stdout.split()
+        self.assertEqual(sorted(paths), sorted([os.path.join(plugin, "Panel.qml"), os.path.join(plugin, "WaybarPillAnchor.qml")]))
+        self.assertEqual(run(STATEPY, "begin", *paths).returncode, 0)
+        self.assertEqual(run(ADAPTERS, "apply").returncode, 0)
+        self.assertEqual(run(STATEPY, "finish").returncode, 0)
+        self.assertEqual(run(STATEPY, "uninstall").returncode, 0)
+        with open(os.path.join(plugin, "Panel.qml")) as f:
+            self.assertEqual(f.read(), STOCK)
 
 
 def real_session():

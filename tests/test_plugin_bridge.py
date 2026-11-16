@@ -44,6 +44,8 @@ class Base(unittest.TestCase):
         os.mkdir(self.rt, 0o700)
         self.saved = dict(os.environ)
         self.addCleanup(self.restore_env)
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
         os.environ.update(HOME=self.home, XDG_RUNTIME_DIR=self.rt,
                           XDG_STATE_HOME=os.path.join(self.home, ".local", "state"),
                           XDG_CONFIG_HOME=os.path.join(self.home, ".config"))
@@ -56,7 +58,16 @@ class Base(unittest.TestCase):
     def write_marker(self, files=()):
         os.makedirs(self.h.state_dir(), exist_ok=True)
         with open(self.h.marker_path(), "w") as f:
-            json.dump({"version": 1, "mode": "plugin", "backup_dir": os.path.join(self.tmp, "bk"), "files": list(files)}, f)
+            json.dump({"version": 1, "mode": "plugin", "backup_dir": os.path.join(self.home, ".config", "waybar", "backup-20260101-000000"),
+                       "files": list(files)}, f)
+
+    def place(self, rel, text=""):
+        """A regular file at `rel` under the temporary HOME (parents created)."""
+        p = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
 
 
 class Fixture(Base):
@@ -397,11 +408,8 @@ class RuntimeTests(Base):
             self.h.mode()
 
     def test_record_generated_updates_only_registered_paths(self):
-        a = os.path.join(self.tmp, "a.css")
-        b = os.path.join(self.tmp, "b.css")
-        for p in (a, b):
-            with open(p, "w") as f:
-                f.write("old")
+        a = self.place(".config/waybar/style.css", "old")
+        b = self.place(".config/waybar/pill-theme.css", "old")
         self.write_marker([{"path": a, "existed": False, "installed_sha256": self.h.sha256_of(a)}])
         with open(a, "w") as f:
             f.write("regenerated")
@@ -410,6 +418,28 @@ class RuntimeTests(Base):
         self.h.record_generated_files([a])
         with open(self.h.marker_path()) as f:
             self.assertEqual(json.load(f)["files"][0]["installed_sha256"], self.h.sha256_of(a))
+        self.assertEqual(stat.S_IMODE(os.stat(self.h.marker_path()).st_mode), 0o600)
+
+    def test_runtime_root_must_be_private(self):
+        os.chmod(self.rt, 0o750)
+        with self.assertRaises(self.h.PluginError):
+            self.h.runtime_dir()
+        self.assertFalse(os.path.exists(os.path.join(self.rt, "waybar-pill-plugin")))
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "waybar-pill-plugin"), "runtime-dir"],
+                           capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_runtime_dir_cli_prints_only_the_private_path(self):
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "waybar-pill-plugin"), "runtime-dir"],
+                           capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        self.assertEqual((r.returncode, r.stdout), (0, os.path.join(self.rt, "waybar-pill-plugin") + "\n"))
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.rt, "waybar-pill-plugin")).st_mode), 0o700)
+        for bad in ("", "relative", os.path.join(self.tmp, "missing")):
+            r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "waybar-pill-plugin"), "runtime-dir"],
+                               capture_output=True, text=True, env=dict(os.environ, XDG_RUNTIME_DIR=bad))
+            self.assertNotEqual(r.returncode, 0, bad)
+            self.assertEqual(r.stdout, "")
 
 
 class ScriptTests(Base):
@@ -504,13 +534,12 @@ class InstallRecordTests(Base):
                               env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
 
     def test_uninstall_restores_bytes_and_modes_and_baseline_survives_resetup(self):
-        old = os.path.join(self.tmp, "old.lua")
-        new = os.path.join(self.tmp, "created.sh")
-        with open(old, "w") as f:
-            f.write("mine")
+        old = self.place(".config/hypr/autostart.lua", "mine")
+        new = os.path.join(self.home, ".config", "waybar", "scripts", "waybar-app.sh")
         os.chmod(old, 0o640)
-        os.unlink(self.h.marker_path()) if os.path.exists(self.h.marker_path()) else None
+        os.utime(old, (1_000_000_000, 1_000_000_000))
         self.assertEqual(self.run_state("begin", old, new).returncode, 0)
+        os.makedirs(os.path.dirname(new), exist_ok=True)
         for p, t in ((old, "managed"), (new, "script")):
             with open(p, "w") as f:
                 f.write(t)
@@ -524,12 +553,14 @@ class InstallRecordTests(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(old) as f:
             self.assertEqual(f.read(), "mine")
-        self.assertEqual(stat.S_IMODE(os.stat(old).st_mode), 0o640)
+        st = os.stat(old)
+        self.assertEqual((stat.S_IMODE(st.st_mode), int(st.st_mtime)), (0o640, 1_000_000_000))
         self.assertFalse(os.path.exists(new))
         self.assertFalse(os.path.exists(self.h.marker_path()))
 
     def _managed(self, content=b"mine\x00\xff", mode=0o600):
-        old = os.path.join(self.tmp, "old.bin")
+        old = os.path.join(self.home, ".config", "hypr", "bindings.lua")
+        os.makedirs(os.path.dirname(old), exist_ok=True)
         with open(old, "wb") as f:
             f.write(content)
         os.chmod(old, mode)
@@ -577,18 +608,17 @@ class InstallRecordTests(Base):
             dst.write(src.read(2))
             dst.flush()
             raise OSError(errno.EIO, "synthetic failure")
-        cases = (("copyfileobj", partial_eio),
-                 ("copystat", um.Mock(side_effect=OSError(errno.EIO, "synthetic failure"))),
-                 ("replace", um.Mock(side_effect=PermissionError(errno.EACCES, "synthetic failure"))))
-        for name, fake in cases:
+        cases = (("shutil", "copyfileobj", partial_eio),
+                 ("os", "utime", um.Mock(side_effect=OSError(errno.EIO, "synthetic failure"))),
+                 ("os", "replace", um.Mock(side_effect=PermissionError(errno.EACCES, "synthetic failure"))))
+        for module, name, fake in cases:
             with self.subTest(name=name):
                 if os.path.exists(self.h.marker_path()):
                     os.unlink(self.h.marker_path())
                 old, mod = self._managed()
                 with open(self.h.marker_path()) as f:
                     record = f.read()
-                target = mod.os if name == "replace" else mod.shutil
-                with um.patch.object(target, name, fake):
+                with um.patch.object(getattr(mod, module), name, fake):
                     with self.assertRaises(mod.PluginError) as cm:
                         mod.uninstall()
                 self.assertNotIn("mine", str(cm.exception))
@@ -597,7 +627,7 @@ class InstallRecordTests(Base):
                 self.assertEqual(stat.S_IMODE(os.stat(old).st_mode), 0o644)
                 with open(self.h.marker_path()) as f:
                     self.assertEqual(f.read(), record)
-                self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".restore.")], [])
+                self.assertEqual([n for n in os.listdir(os.path.dirname(old)) if n.startswith(".restore.")], [])
 
     def test_restore_ignores_predictable_symlink_temp_name(self):
         old, mod = self._managed()
@@ -614,25 +644,23 @@ class InstallRecordTests(Base):
             self.assertEqual(f.read(), b"victim")
 
     def test_modified_owned_file_blocks_uninstall_and_keeps_everything(self):
-        f1 = os.path.join(self.tmp, "owned")
+        f1 = os.path.join(self.home, ".config", "waybar", "style.css")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
-        with open(f1, "w") as f:
-            f.write("ours")
+        self.place(".config/waybar/style.css", "ours")
         self.run_state("finish")
         with open(f1, "w") as f:
             f.write("user edit")
         r = self.run_state("uninstall")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("owned", r.stderr)
+        self.assertIn("modified", r.stderr)
         with open(f1) as f:
             self.assertEqual(f.read(), "user edit")
         self.assertTrue(os.path.exists(self.h.marker_path()))
 
     def test_resetup_refuses_to_overwrite_user_edits(self):
-        f1 = os.path.join(self.tmp, "owned")
+        f1 = os.path.join(self.home, ".config", "waybar", "style.css")
         self.run_state("begin", f1)
-        with open(f1, "w") as f:
-            f.write("ours")
+        self.place(".config/waybar/style.css", "ours")
         self.run_state("finish")
         with open(f1, "w") as f:
             f.write("user edit")
@@ -643,7 +671,7 @@ class InstallRecordTests(Base):
         os.makedirs(os.path.dirname(lua))
         with open(lua, "w") as f:
             f.write("-- >>> waybar-pill-bar BEGIN (managed block) >>>\n")
-        r = self.run_state("begin", os.path.join(self.tmp, "x"))
+        r = self.run_state("begin", os.path.join(self.home, ".config", "waybar", "config.jsonc"))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("Legacy standalone files detected", r.stderr)
         self.assertFalse(os.path.exists(self.h.marker_path()))
@@ -660,9 +688,9 @@ class InstallBackupPrivacyTests(Base):
         return self.h.read_marker()["backup_dir"]
 
     def test_backup_root_is_private_and_restore_keeps_bytes_and_mode(self):
-        priv = os.path.join(self.tmp, "priv")
-        os.mkdir(priv, 0o700)
-        src = os.path.join(priv, "secret.conf")
+        priv = os.path.join(self.home, ".config", "hypr")
+        os.makedirs(priv, 0o700)
+        src = os.path.join(priv, "autostart.lua")
         with open(src, "w") as f:
             f.write("synthetic secret")
         os.chmod(src, 0o644)
@@ -681,22 +709,19 @@ class InstallBackupPrivacyTests(Base):
         with open(src) as f:
             self.assertEqual(f.read(), "synthetic secret")
         self.assertEqual(stat.S_IMODE(os.stat(src).st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(os.stat(priv).st_mode), 0o700, "the private source directory is never widened")
 
     def test_recorded_loose_root_is_tightened_before_reuse(self):
-        f1 = os.path.join(self.tmp, "a")
-        with open(f1, "w") as f:
-            f.write("x")
+        f1 = self.place(".config/waybar/config.jsonc", "x")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
         root = self.backup_dir()
         os.chmod(root, 0o755)
-        f2 = os.path.join(self.tmp, "b")
-        with open(f2, "w") as f:
-            f.write("y")
+        f2 = self.place(".config/waybar/style.css", "y")
         self.assertEqual(self.run_state("begin", f2).returncode, 0)
         self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
 
     def test_symlinked_or_missing_recorded_root_is_rejected_untouched(self):
-        f1 = os.path.join(self.tmp, "a")
+        f1 = os.path.join(self.home, ".config", "waybar", "config.jsonc")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
         root = self.backup_dir()
         with open(self.h.marker_path()) as f:
@@ -705,11 +730,11 @@ class InstallBackupPrivacyTests(Base):
         os.mkdir(victim, 0o755)
         shutil.rmtree(root)
         os.symlink(victim, root)
-        r = self.run_state("begin", os.path.join(self.tmp, "b"))
+        r = self.run_state("begin", os.path.join(self.home, ".config", "waybar", "style.css"))
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
         os.unlink(root)
-        r = self.run_state("begin", os.path.join(self.tmp, "b"))
+        r = self.run_state("begin", os.path.join(self.home, ".config", "waybar", "style.css"))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("missing", r.stderr)
         with open(self.h.marker_path()) as f:
@@ -735,6 +760,365 @@ class InstallBackupPrivacyTests(Base):
         self.assertEqual(len({base, a, b}), 3)
         self.assertEqual(stat.S_IMODE(os.stat(a).st_mode), 0o700)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "nowhere")))
+
+
+class RecordAttackTests(Base):
+    """A forged or unsafe install record must fail validation before any desktop command, deletion, restoration or
+    permission change. Fake desktop commands log every call."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = os.path.join(self.tmp, "bin")
+        os.mkdir(self.bin)
+        self.log = os.path.join(self.tmp, "calls.log")
+        for name in ("omarchy", "omarchy-shell", "systemctl", "busctl", "hyprctl"):
+            p = os.path.join(self.bin, name)
+            with open(p, "w") as f:
+                f.write('#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n' % (name, self.log))
+            os.chmod(p, 0o755)
+        self.env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"], PYTHONDONTWRITEBYTECODE="1")
+        self.sentinel = os.path.join(self.tmp, "sentinel.txt")
+        with open(self.sentinel, "w") as f:
+            f.write("keep me")
+        self.orig = self.place(".config/hypr/autostart.lua", "mine")
+        os.chmod(self.orig, 0o640)
+        os.utime(self.orig, (1_000_000_000, 1_000_000_000))
+        self.created = os.path.join(self.home, ".config", "waybar", "style.css")
+        self.script = os.path.join(self.home, ".config", "waybar", "scripts", "waybar-app.sh")
+        self.assertEqual(self.state("begin", self.orig, self.created, self.script).returncode, 0)
+        os.makedirs(os.path.dirname(self.script))
+        for p in (self.orig, self.created, self.script):
+            with open(p, "w") as f:
+                f.write("managed " + os.path.basename(p))
+        self.assertEqual(self.state("finish").returncode, 0)
+        self.root = self.h.read_marker()["backup_dir"]
+        with open(self.h.marker_path()) as f:
+            self.pristine = json.load(f)
+
+    def state(self, *args):
+        return subprocess.run([sys.executable, STATEPY, *args], capture_output=True, text=True, env=self.env)
+
+    def uninstall_sh(self, env=None):
+        return subprocess.run(["bash", os.path.join(ROOT, "uninstall.sh")], capture_output=True, text=True,
+                              env=env or self.env, stdin=subprocess.DEVNULL)
+
+    def calls(self):
+        try:
+            with open(self.log) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def snapshot(self):
+        """Bytes and permission bits of everything an attack must not disturb (links are not followed)."""
+        out = {}
+        for top in (self.home, self.sentinel):
+            walk = [top] if os.path.isfile(top) else [os.path.join(d, n) for d, ds, fs in os.walk(top) for n in ds + fs] + [top]
+            for p in walk:
+                st = os.lstat(p)
+                body = None
+                if stat.S_ISLNK(st.st_mode):
+                    body = os.readlink(p)
+                elif stat.S_ISREG(st.st_mode):
+                    with open(p, "rb") as f:
+                        body = f.read()
+                out[p] = (stat.S_IMODE(st.st_mode), body)
+        return out
+
+    def forge(self, mutate):
+        with open(self.h.marker_path()) as f:
+            m = json.load(f)
+        mutate(m)
+        with open(self.h.marker_path(), "w") as f:
+            json.dump(m, f)
+
+    def assert_blocked(self, why):
+        before = self.snapshot()
+        r = self.state("validate")
+        self.assertNotEqual(r.returncode, 0, why)
+        self.assertEqual(self.state("uninstall").returncode == 0, False, why)
+        r = self.uninstall_sh()
+        self.assertNotEqual(r.returncode, 0, why)
+        self.assertEqual(self.calls(), [], "no desktop command may run: " + why)
+        self.assertEqual(self.snapshot(), before, why)
+        with open(self.sentinel) as f:
+            self.assertEqual(f.read(), "keep me")
+
+    def test_valid_record_validates_and_validate_is_read_only(self):
+        before = self.snapshot()
+        r = self.state("validate")
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_validate_accepts_an_absent_record(self):
+        os.unlink(self.h.marker_path())
+        self.assertEqual(self.state("validate").returncode, 0)
+
+    def test_validate_does_not_tighten_or_create_state(self):
+        os.chmod(self.h.state_dir(), 0o755)
+        self.assertEqual(self.state("validate").returncode, 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.h.state_dir()).st_mode), 0o755)
+        shutil.rmtree(os.path.dirname(self.h.state_dir()))
+        self.assertEqual(self.state("validate").returncode, 0)
+        self.assertFalse(os.path.exists(self.h.state_dir()))
+
+    def test_paths_outside_the_footprint_are_rejected(self):
+        def add(path):
+            return lambda m: m["files"].append({"path": path, "existed": False, "installed_sha256": ""})
+        for why, mutate in (
+                ("sentinel", add(self.sentinel)),
+                ("traversal", add(os.path.join(self.home, ".config", "waybar", "scripts", "..", "..", "..", "..", "sentinel.txt"))),
+                ("relative", add("sentinel.txt")),
+                ("unknown script name", add(os.path.join(self.home, ".config", "waybar", "scripts", "evil.sh"))),
+                ("home itself", add(self.home)),
+                ("non-string", lambda m: m["files"].append({"path": 5, "existed": False, "installed_sha256": ""})),
+                ("duplicate", lambda m: m["files"].append(dict(m["files"][0]))),
+                ("bad existed", lambda m: m["files"][0].update(existed="yes")),
+                ("bad hash", lambda m: m["files"][0].update(installed_sha256="ABC")),
+                ("extra key", lambda m: m["files"][0].update(extra=1)),
+                ("missing key", lambda m: m["files"][0].pop("existed")),
+                ("backup naming HOME", lambda m: m.update(backup_dir=self.home)),
+                ("backup naming sentinel", lambda m: m.update(backup_dir=self.sentinel)),
+                ("backup traversal", lambda m: m.update(backup_dir=os.path.join(self.home, ".config", "waybar", "backup-20260101-000000", ".."))),
+                ("missing backup", lambda m: m.pop("backup_dir")),
+                ("files not a list", lambda m: m.update(files={})),
+                ("version true", lambda m: m.update(version=True)),
+                ("mode", lambda m: m.update(mode="standalone"))):
+            with self.subTest(why):
+                self.forge(mutate)
+                self.assert_blocked(why)
+                with open(self.h.marker_path(), "w") as f:  # a pristine record for the next case
+                    json.dump(self.pristine, f)
+
+    def test_duplicate_json_keys_are_rejected(self):
+        with open(self.h.marker_path()) as f:
+            text = f.read()
+        with open(self.h.marker_path(), "w") as f:
+            f.write(text.rstrip().rstrip("}") + ', "files": []}')
+        self.assert_blocked("duplicate files key")
+
+    def test_oversized_and_malformed_records_are_rejected(self):
+        for why, data in (("malformed", b"{nope"), ("huge", b'{"x":"' + b"a" * (1 << 20) + b'"}'), ("array", b"[]"), ("nan", b'{"version": NaN}')):
+            with self.subTest(why):
+                with open(self.h.marker_path(), "wb") as f:
+                    f.write(data)
+                self.assert_blocked(why)
+
+    def test_allowed_leaf_symlink_is_rejected(self):
+        os.unlink(self.created)
+        os.symlink(self.sentinel, self.created)
+        self.assert_blocked("leaf symlink")
+
+    def test_symlinked_parent_is_rejected(self):
+        scripts = os.path.dirname(self.script)
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.rename(scripts, elsewhere)
+        os.symlink(elsewhere, scripts)
+        self.assert_blocked("symlinked parent")
+
+    def test_symlinked_or_foreign_backup_sources_are_rejected(self):
+        src = self.root + self.orig
+        os.unlink(src)
+        os.symlink(self.sentinel, src)
+        self.assert_blocked("backup source symlink")
+        os.unlink(src)
+        shutil.copy2(self.sentinel, src)
+        d = os.path.dirname(src)
+        moved = os.path.join(self.tmp, "evil")
+        os.rename(d, moved)
+        os.symlink(moved, d)
+        self.assert_blocked("backup parent symlink")
+
+    def test_symlinked_backup_root_is_rejected(self):
+        moved = os.path.join(self.tmp, "movedroot")
+        os.rename(self.root, moved)
+        os.symlink(moved, self.root)
+        self.assert_blocked("backup root symlink")
+
+    def test_group_writable_state_ancestry_is_rejected_without_chmod(self):
+        for target in (self.h.state_dir(), os.path.dirname(self.h.state_dir())):
+            with self.subTest(target):
+                os.chmod(target, 0o775 if target != self.h.state_dir() else 0o770)
+                self.assert_blocked("writable " + target)
+                self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o775 if target != self.h.state_dir() else 0o770)
+                os.chmod(target, 0o755)
+
+    def test_group_writable_footprint_parent_is_rejected(self):
+        os.chmod(os.path.dirname(self.script), 0o775)
+        self.assert_blocked("writable scripts directory")
+
+    def test_state_record_that_is_a_symlink_or_fifo_is_rejected(self):
+        os.rename(self.h.marker_path(), self.sentinel + ".real")
+        os.symlink(self.sentinel, self.h.marker_path())
+        self.assert_blocked("record symlink")
+        os.unlink(self.h.marker_path())
+        os.symlink(os.path.join(self.tmp, "dangling"), self.h.marker_path())  # `-e` alone would call this absent
+        self.assert_blocked("dangling record")
+        os.unlink(self.h.marker_path())
+        os.mkfifo(self.h.marker_path())
+        self.assert_blocked("record fifo")
+
+    def test_foreign_owner_is_rejected_by_mocked_fstat(self):
+        from unittest import mock
+        ps = load(STATEPY, "plugin_state_foreign")
+        with mock.patch.object(ps.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertNotEqual(ps.validate(), 0)
+            with self.assertRaises(ps.PluginError):
+                ps.helper.read_marker()
+        self.assertEqual(ps.validate(), 0)
+
+    def test_unfinished_install_blocks_uninstall_but_not_validation(self):
+        self.forge(lambda m: m["files"][1].update(installed_sha256=""))
+        before = self.snapshot()
+        self.assertEqual(self.state("validate").returncode, 0)
+        r = self.state("uninstall")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("never finalized", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotEqual(self.uninstall_sh().returncode, 0)
+        with open(self.created) as f:
+            self.assertEqual(f.read(), "managed style.css")
+
+    def test_a_missing_destination_still_restores_its_backup(self):
+        os.unlink(self.orig)
+        r = self.state("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.orig) as f:
+            self.assertEqual(f.read(), "mine")
+
+    def test_uninstall_script_restores_originals_and_removes_only_known_files(self):
+        unrelated = self.place(".config/waybar/scripts/user-own.sh", "mine too")
+        r = self.uninstall_sh()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.orig) as f:
+            self.assertEqual(f.read(), "mine")
+        st = os.stat(self.orig)
+        self.assertEqual((stat.S_IMODE(st.st_mode), int(st.st_mtime)), (0o640, 1_000_000_000))
+        self.assertFalse(os.path.exists(self.created) or os.path.exists(self.script))
+        with open(unrelated) as f:
+            self.assertEqual(f.read(), "mine too")
+        self.assertFalse(os.path.exists(self.h.marker_path()))
+        self.assertIn("hyprctl reload", self.calls())
+
+    def test_custom_xdg_dirs_and_missing_whatsapp_checkout_work(self):
+        state = os.path.join(self.tmp, "custom-state")
+        cfg = os.path.join(self.tmp, "custom-cfg")
+        os.mkdir(state)
+        os.mkdir(cfg)
+        env = dict(self.env, XDG_STATE_HOME=state, XDG_CONFIG_HOME=cfg)
+        panel = os.path.join(cfg, "omarchy", "plugins", "io.github.ricky.whatsapp", "Panel.qml")
+        run = lambda *a: subprocess.run([sys.executable, STATEPY, *a], capture_output=True, text=True, env=env)
+        self.assertEqual(run("validate").returncode, 0)  # no record in the new state dir
+        os.makedirs(os.path.dirname(panel))
+        with open(panel, "w") as f:
+            f.write("stock")
+        self.assertEqual(run("begin", panel).returncode, 0)
+        with open(panel, "w") as f:
+            f.write("patched")
+        self.assertEqual(run("finish").returncode, 0)
+        self.assertEqual(run("validate").returncode, 0)
+        self.assertEqual(run("uninstall").returncode, 0)
+        with open(panel) as f:
+            self.assertEqual(f.read(), "stock")
+        # and a different configured root does not allow the previous one's destinations
+        self.assertEqual(run("begin", os.path.join(self.tmp, "elsewhere", "Panel.qml")).returncode, 1)
+
+    def test_begin_rejects_paths_outside_the_footprint_before_changing_anything(self):
+        before = self.snapshot()
+        for p in (self.sentinel, os.path.join(self.home, ".bashrc"), "relative"):
+            r = self.state("begin", self.created, p)
+            self.assertNotEqual(r.returncode, 0, p)
+            self.assertIn("footprint", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_begin_refuses_unsafe_destination_leaves_without_creating_a_backup(self):
+        os.unlink(self.created)
+        os.symlink(self.sentinel, self.created)
+        before = self.snapshot()
+        r = self.state("begin", os.path.join(self.home, ".config", "waybar", "pill-theme.css"), self.created)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+
+
+class JournalAttackTests(Fixture):
+    """The recovery journal is validated before any shell/plugin/service operation and is never rewritten when bad."""
+
+    def write_raw(self, data):
+        os.makedirs(self.h.state_dir(), exist_ok=True)
+        with open(self.h.journal_path(), "wb") as f:
+            f.write(data)
+
+    GOOD = {"version": 1, "phase": "active", "bar_hidden_before": False,
+            "disabled_plugins_added": ["omarchy.notifications"], "waybar_was_active": False}
+
+    def test_malformed_or_untrusted_journals_trigger_nothing_and_are_not_rewritten(self):
+        dup = json.dumps(self.GOOD)[:-1] + ', "phase": "active"}'
+        cases = {"json": b"{nope", "dup": dup.encode(), "array": b"[]",
+                 "version": json.dumps(dict(self.GOOD, version=True)).encode(),
+                 "version2": json.dumps(dict(self.GOOD, version=2)).encode(),
+                 "phase": json.dumps(dict(self.GOOD, phase="done")).encode(),
+                 "bar": json.dumps(dict(self.GOOD, bar_hidden_before="no")).encode(),
+                 "waybar": json.dumps(dict(self.GOOD, waybar_was_active=1)).encode(),
+                 "plugins": json.dumps(dict(self.GOOD, disabled_plugins_added="omarchy.osd")).encode(),
+                 "plugin types": json.dumps(dict(self.GOOD, disabled_plugins_added=[1])).encode(),
+                 "plugin dup": json.dumps(dict(self.GOOD, disabled_plugins_added=["a", "a"])).encode()}
+        before_shell = self.get_shell()
+        for why, data in cases.items():
+            with self.subTest(why):
+                self.write_raw(data)
+                with self.assertRaises(self.h.PluginError):
+                    self.h.restore(self.h.Session(self.runner, self.popen))
+                self.assertEqual(self.calls, [])
+                with open(self.h.journal_path(), "rb") as f:
+                    self.assertEqual(f.read(), data)
+                self.assertEqual(self.get_shell(), before_shell)
+
+    def test_symlinked_fifo_and_loose_journals_are_refused(self):
+        sentinel = os.path.join(self.tmp, "sentinel")
+        with open(sentinel, "w") as f:
+            f.write(json.dumps(self.GOOD))
+        os.symlink(sentinel, self.h.journal_path())
+        with self.assertRaises(self.h.PluginError):
+            self.h.restore(self.h.Session(self.runner, self.popen))
+        os.unlink(self.h.journal_path())
+        os.mkfifo(self.h.journal_path())
+        with self.assertRaises(self.h.PluginError):
+            self.h.restore(self.h.Session(self.runner, self.popen))
+        os.unlink(self.h.journal_path())
+        self.write_raw(json.dumps(self.GOOD).encode())
+        os.chmod(self.h.journal_path(), 0o666)
+        with self.assertRaises(self.h.PluginError):
+            self.h.restore(self.h.Session(self.runner, self.popen))
+        self.assertEqual(self.calls, [])
+        with open(sentinel) as f:
+            self.assertEqual(json.load(f), self.GOOD)
+
+    def test_recover_cli_with_a_bad_journal_runs_no_desktop_command(self):
+        bin_dir = os.path.join(self.tmp, "bin")
+        os.mkdir(bin_dir)
+        log = os.path.join(self.tmp, "cli.log")
+        for name in ("omarchy", "omarchy-shell", "systemctl", "busctl"):
+            p = os.path.join(bin_dir, name)
+            with open(p, "w") as f:
+                f.write('#!/bin/sh\necho "%s $*" >> "%s"\nexit 1\n' % (name, log))
+            os.chmod(p, 0o755)
+        self.write_raw(b'{"version": 1, "phase": "bogus"}')
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "waybar-pill-plugin"), "recover"], capture_output=True,
+                           text=True, env=dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], PYTHONDONTWRITEBYTECODE="1"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(log))
+        with open(self.h.journal_path(), "rb") as f:
+            self.assertEqual(f.read(), b'{"version": 1, "phase": "bogus"}')
+
+    def test_valid_crash_journal_restores_exactly_the_recorded_clone_ids(self):
+        self.set_shell({"disabledPlugins": ["omarchy.notifications", "user.my-toasts", "omarchy.osd", "user.other"]})
+        open(self.flag, "w").close()
+        journal = dict(self.GOOD, disabled_plugins_added=["omarchy.notifications", "user.my-toasts"])
+        self.write_raw(json.dumps(journal).encode())
+        self.h.restore(self.h.Session(self.runner, self.popen))
+        self.assertEqual(self.get_shell()["disabledPlugins"], ["omarchy.osd", "user.other"])
+        self.assertFalse(os.path.exists(self.h.journal_path()))
+        self.assertEqual(self.procs, [])
 
 
 class ShellConfigModeTests(Fixture):
