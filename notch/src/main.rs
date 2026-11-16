@@ -1821,6 +1821,11 @@ fn weather_snapshot(icon: &str, status: Option<&str>, previous: Option<WeatherIn
         .unwrap_or_else(|| WeatherInfo { compact: icon.to_string(), location: "Weather unavailable".into(), wind: String::new() })
 }
 
+/// A failed fetch (network not up yet after a shell restart) must not leave "unavailable" for 10 minutes.
+fn weather_poll_delay(fetched: bool) -> Duration {
+    Duration::from_secs(if fetched { 600 } else { 30 })
+}
+
 fn weather_thread(tx: async_channel::Sender<Msg>) {
     std::thread::spawn(move || {
         const CLOUD: &str = "\u{f0c2}";
@@ -1833,12 +1838,11 @@ fn weather_thread(tx: async_channel::Sender<Msg>) {
                 .filter(|s| !s.is_empty());
             let icon = run("omarchy-weather-icon").unwrap_or_else(|| CLOUD.to_string());
             let status = run("omarchy-weather-status");
-            let fetched = status.as_deref().and_then(|s| parse_weather_status(&icon, s)).is_some();
+            let delay = weather_poll_delay(status.as_deref().and_then(|s| parse_weather_status(&icon, s)).is_some());
             let snap = weather_snapshot(&icon, status.as_deref(), last.take());
             last = Some(snap.clone());
             if tx.send_blocking(Msg::Weather(snap)).is_err() { return; }
-            // A failed fetch (network not up yet after a shell restart) must not leave "unavailable" for 10 minutes.
-            std::thread::sleep(Duration::from_secs(if fetched { 600 } else { 30 }));
+            std::thread::sleep(delay);
         }
     });
 }
@@ -4749,6 +4753,15 @@ mod tests {
         for bad in ["Weather unavailable", "A · Temp 1°C", "A · Temp  · Wind 1", " · Temp 1 · Wind 2", "A · T 1 · Wind 2", "A · Temp 1 · W 2", "A · Temp 1 · Wind 2 · x"] {
             assert!(parse_weather_status("i", bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn failed_weather_fetch_is_retried_soon_and_a_good_one_waits() {
+        assert_eq!(weather_poll_delay(false), Duration::from_secs(30));
+        assert_eq!(weather_poll_delay(true), Duration::from_secs(600));
+        let ok = parse_weather_status("i", "Example City · Temp 1°C · Wind 2km/h").is_some();
+        assert_eq!(weather_poll_delay(ok), Duration::from_secs(600));
+        assert_eq!(weather_poll_delay(parse_weather_status("i", "Weather unavailable").is_some()), Duration::from_secs(30));
     }
 
     #[test]
