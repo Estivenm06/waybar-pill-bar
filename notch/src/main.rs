@@ -1833,10 +1833,12 @@ fn weather_thread(tx: async_channel::Sender<Msg>) {
                 .filter(|s| !s.is_empty());
             let icon = run("omarchy-weather-icon").unwrap_or_else(|| CLOUD.to_string());
             let status = run("omarchy-weather-status");
+            let fetched = status.as_deref().and_then(|s| parse_weather_status(&icon, s)).is_some();
             let snap = weather_snapshot(&icon, status.as_deref(), last.take());
             last = Some(snap.clone());
             if tx.send_blocking(Msg::Weather(snap)).is_err() { return; }
-            std::thread::sleep(Duration::from_secs(600));
+            // A failed fetch (network not up yet after a shell restart) must not leave "unavailable" for 10 minutes.
+            std::thread::sleep(Duration::from_secs(if fetched { 600 } else { 30 }));
         }
     });
 }
