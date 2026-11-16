@@ -212,6 +212,19 @@ fn strip_markup(s: &str) -> String {
     out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
 }
 
+/// Cards show at most a few lines; laying out thousands of characters (one unbreakable word is enough) makes
+/// GTK ask the GPU for a surface far beyond its limits and crashes the whole process. Clip before layout.
+const CARD_APP_CHARS: usize = 64;
+const CARD_SUMMARY_CHARS: usize = 160;
+const CARD_BODY_CHARS: usize = 400;
+
+fn clip_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((end, _)) => s[..end].to_string(),
+        None => s.to_string(),
+    }
+}
+
 impl NotifyUi {
     pub fn new(app: &gtk::Application, relay: std::sync::mpsc::Sender<Command>) -> Rc<Self> {
         let win = gtk::ApplicationWindow::new(app);
@@ -337,24 +350,26 @@ impl NotifyUi {
         let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
         text.set_hexpand(true);
         if !n.app.is_empty() {
-            let app = gtk::Label::new(Some(&n.app));
+            let app = gtk::Label::new(Some(&clip_chars(&n.app, CARD_APP_CHARS)));
             app.add_css_class("napp");
             app.set_xalign(0.0);
             text.append(&app);
         }
-        let sum = gtk::Label::new(Some(&strip_markup(&n.summary)));
+        let sum = gtk::Label::new(Some(&clip_chars(&strip_markup(&n.summary), CARD_SUMMARY_CHARS)));
         sum.add_css_class("nsum");
         sum.set_xalign(0.0);
         sum.set_wrap(true);
+        sum.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         sum.set_lines(2);
         sum.set_ellipsize(gtk::pango::EllipsizeMode::End);
         sum.set_max_width_chars(34);
         text.append(&sum);
         if !n.body.is_empty() {
-            let body = gtk::Label::new(Some(&strip_markup(&n.body)));
+            let body = gtk::Label::new(Some(&clip_chars(&strip_markup(&n.body), CARD_BODY_CHARS)));
             body.add_css_class("nbody");
             body.set_xalign(0.0);
             body.set_wrap(true);
+            body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
             body.set_lines(3);
             body.set_ellipsize(gtk::pango::EllipsizeMode::End);
             body.set_max_width_chars(38);
@@ -493,6 +508,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn card_text_is_clipped_on_char_boundaries() {
+        assert_eq!(clip_chars("short", 10), "short");
+        assert_eq!(clip_chars(&"x".repeat(20000), CARD_BODY_CHARS).chars().count(), CARD_BODY_CHARS);
+        assert_eq!(clip_chars("éééé", 2), "éé");
+        assert_eq!(clip_chars("", 3), "");
+    }
 
     fn note(id: u32, urgency: u8) -> Note {
         Note { id, app: "A".into(), icon: String::new(), summary: "S".into(), body: "B".into(), actions: Vec::new(), urgency, timeout_ms: -1 }

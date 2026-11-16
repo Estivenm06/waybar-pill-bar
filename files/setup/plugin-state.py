@@ -109,6 +109,14 @@ def backup_path(m, p):
     return m["backup_dir"] + p
 
 
+def generated_paths():
+    """Product outputs that are rebuilt or regenerated after setup (a dev/updated binary, the theme stylesheet the
+    theme/font hooks rewrite). A changed hash on these is normal, never a user edit, so it must not block a
+    re-setup or an uninstall. Everything else keeps the strict modified-file protection."""
+    return {os.path.join(helper.home(), ".local", "bin", "waybar-notch"),
+            os.path.join(helper.home(), ".config", "waybar", "pill-theme.css")}
+
+
 def backup_present(m, p):
     """Whether a safe backup copy of `p` exists; a link or foreign/special file there is an error."""
     src = backup_path(m, p)
@@ -201,8 +209,8 @@ def begin(files):
             return fail("Legacy standalone files detected; remove the old standalone installation with its original uninstaller before running ./install.sh.")
         if m is not None:
             check_private_root(m["backup_dir"])
-            mod = [e["path"] for e in m["files"] if e["installed_sha256"] and helper.leaf_present(e["path"])
-                   and helper.sha256_of(e["path"]) != e["installed_sha256"]]
+            mod = [e["path"] for e in m["files"] if e["installed_sha256"] and e["path"] not in generated_paths()
+                   and helper.leaf_present(e["path"]) and helper.sha256_of(e["path"]) != e["installed_sha256"]]
             if mod:
                 return fail("modified since the last setup, not overwriting: " + ", ".join(mod))
             private_root(m["backup_dir"])
@@ -300,7 +308,7 @@ def uninstall_preflight():
             present = helper.leaf_present(p)
             if present and not e["installed_sha256"]:
                 conflicts.append(p + " (installation was never finalized)")
-            elif present and helper.sha256_of(p) != e["installed_sha256"]:
+            elif present and p not in generated_paths() and helper.sha256_of(p) != e["installed_sha256"]:
                 conflicts.append(p + " (modified)")
             if e["existed"] and not backup_present(m, p):
                 conflicts.append(p + " (backup missing)")

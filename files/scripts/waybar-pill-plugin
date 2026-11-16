@@ -423,13 +423,16 @@ def request(op, timeout=5.0):
     except (FileNotFoundError, ConnectionRefusedError):
         return None
     with s:
-        s.sendall((json.dumps({"op": op}) + "\n").encode())
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
+        try:
+            s.sendall((json.dumps({"op": op}) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        except (ConnectionResetError, BrokenPipeError):
+            return None  # the backend closed the socket while shutting down: no session to talk to
     try:
         return json.loads(buf.decode())
     except ValueError:

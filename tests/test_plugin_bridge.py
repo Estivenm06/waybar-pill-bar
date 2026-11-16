@@ -384,6 +384,26 @@ class ServeTests(Fixture):
 
 
 class RuntimeTests(Base):
+    def test_backend_resetting_the_connection_reads_as_no_session(self):
+        import socket
+        import struct
+        import threading
+        path = os.path.join(self.h.runtime_dir(), "control.sock")
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def reset():
+            conn, _ = srv.accept()
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # close() sends a reset
+            conn.close()
+
+        t = threading.Thread(target=reset, daemon=True)
+        t.start()
+        self.assertIsNone(self.h.request("active", 2.0))
+        t.join(5)
+
     def test_symlinked_or_foreign_runtime_dir_is_refused(self):
         real = os.path.join(self.tmp, "elsewhere")
         os.mkdir(real, 0o700)
@@ -656,6 +676,29 @@ class InstallRecordTests(Base):
         with open(f1) as f:
             self.assertEqual(f.read(), "user edit")
         self.assertTrue(os.path.exists(self.h.marker_path()))
+
+    def test_rebuilt_binary_and_regenerated_theme_do_not_block_resetup_or_uninstall(self):
+        binary = os.path.join(self.home, ".local", "bin", "waybar-notch")
+        theme = os.path.join(self.home, ".config", "waybar", "pill-theme.css")
+        style = os.path.join(self.home, ".config", "waybar", "style.css")
+        self.assertEqual(self.run_state("begin", binary, theme, style).returncode, 0)
+        for rel in (".local/bin/waybar-notch", ".config/waybar/pill-theme.css", ".config/waybar/style.css"):
+            self.place(rel, "ours")
+        self.assertEqual(self.run_state("finish").returncode, 0)
+        for p in (binary, theme):  # a rebuild and a theme change after setup
+            with open(p, "w") as f:
+                f.write("rebuilt or regenerated")
+        self.assertEqual(self.run_state("begin", binary, theme, style).returncode, 0)
+        self.place(".local/bin/waybar-notch", "ours again")
+        self.place(".config/waybar/pill-theme.css", "ours again")
+        self.run_state("finish")
+        for p in (binary, theme):
+            with open(p, "w") as f:
+                f.write("changed again")
+        r = self.run_state("uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(binary) or os.path.exists(theme))
+        self.assertFalse(os.path.exists(self.h.marker_path()))
 
     def test_resetup_refuses_to_overwrite_user_edits(self):
         f1 = os.path.join(self.home, ".config", "waybar", "style.css")

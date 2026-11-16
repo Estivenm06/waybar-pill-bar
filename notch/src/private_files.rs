@@ -204,6 +204,19 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    #[test]
+    fn real_root_owned_paths_are_refused_without_being_touched() {
+        if unsafe { libc::geteuid() } == 0 { return; }
+        let dir = std::path::Path::new("/etc/ssl");
+        let file = std::path::Path::new("/etc/hostname");
+        let (Ok(dm), Ok(fm)) = (std::fs::metadata(dir), std::fs::metadata(file)) else { return };
+        if dm.uid() != 0 || fm.uid() != 0 { return; }
+        let before = (dm.mode(), fm.mode());
+        assert!(secure_private_dir(dir).is_err(), "a root-owned dedicated directory must be refused");
+        assert!(read_private_bytes(file, 1024).is_err(), "a root-owned file must be refused");
+        assert_eq!((std::fs::metadata(dir).unwrap().mode(), std::fs::metadata(file).unwrap().mode()), before);
+    }
+
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("pf-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
