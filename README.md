@@ -12,7 +12,9 @@ A notification card, shown at the top right while the plugin is enabled:
 
 ![A notification card below the right pill](docs/preview-notification.png)
 
-The screenshots show the bar and a sample notification only; the expanded notch is not pictured.
+The expanded notch (hover the middle pill): greeting, clock and weather, battery, volume, Wi-Fi and Bluetooth status, the media player, the calendar and the tab bar for the music, calendar, clipboard, AI usage and settings pages. The weather, city, network name, volume and track are sample data; the battery level and clock come from the capture machine.
+
+![The expanded notch with sample data](preview.png)
 
 Target: Omarchy 4.x with the **Lua Hyprland config** (`~/.config/hypr/autostart.lua`, `bindings.lua`, the `o.bind` / `o.window` / `o.exec_on_start` API). Omarchy 3.x (`.conf` configs) is not supported; the installer stops with `This installer targets Omarchy 4.x (Lua Hyprland config).` if it does not find the Lua files.
 
