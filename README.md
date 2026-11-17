@@ -2,6 +2,18 @@
 
 A pill-style Waybar plus a Rust "notch" for **Arch Linux + Omarchy 4.x (Hyprland, Wayland)**. One `./install.sh` gives you translucent rounded pills, an expanding notch (media, calendar, clipboard, AI usage, quick controls), click popups, notification cards and a volume/brightness overlay. Colors and font follow your active Omarchy theme and restyle live when you change the theme or font. No personal data is included: the installer substitutes your own `$HOME`.
 
+## Preview
+
+The bar: workspaces and plugin widgets on the left, the notch (media, weather, status) in the middle, system status and clock on the right. Colors follow your Omarchy theme.
+
+![The pill bar across the top of the screen](docs/preview-bar.png)
+
+A notification card, shown at the top right while the plugin is enabled:
+
+![A notification card below the right pill](docs/preview-notification.png)
+
+The screenshots show the bar and a sample notification only; the expanded notch is not pictured.
+
 Target: Omarchy 4.x with the **Lua Hyprland config** (`~/.config/hypr/autostart.lua`, `bindings.lua`, the `o.bind` / `o.window` / `o.exec_on_start` API). Omarchy 3.x (`.conf` configs) is not supported; the installer stops with `This installer targets Omarchy 4.x (Lua Hyprland config).` if it does not find the Lua files.
 
 ## Installation (Omarchy plugin)
