@@ -6,7 +6,34 @@
   "author": "Estivenm06",
   "license": "MIT",
   "description": "Rust pill bar and notch service. Enabling provisions managed files and replaces the native bar, notifications and OSD; disabling or removal restores files and the native desktop. Preferences and credentials remain.",
-  "kinds": ["service"],
-  "entryPoints": { "service": "Service.qml" },
-  "keepLoaded": true
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  },
+  "keepLoaded": true,
+  "requirements": {
+    "pacman": [
+      "playerctl",
+      "jq",
+      "libpulse",
+      "pamixer",
+      "libxkbcommon",
+      "wayland",
+      "pkgconf",
+      "bluez-utils",
+      "networkmanager",
+      "upower",
+      "power-profiles-daemon",
+      "rust",
+      "fontconfig"
+    ],
+    "optional": [
+      "wl-clipboard",
+      "cava",
+      "sqlite"
+    ],
+    "note": "Enabling the plugin installs missing packages with pacman through pkexec (or sudo in a terminal). Set PILL_BAR_NO_AUTO_INSTALL=1 to only list them."
+  }
 }

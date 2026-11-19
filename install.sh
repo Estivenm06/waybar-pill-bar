@@ -11,7 +11,8 @@
 #   --provision    build the notch and install the managed files (the developer/recovery entry point)
 #   --no-restart   skip the Hyprland reload and config-error check
 #   --reconfigure  ask again which AI usage tiles and apps to show (needs a terminal; automatic setup never prompts)
-# Nothing is installed from packages, no OAuth sign-in is requested and nothing prompts. Undo: disable or remove the
+# Missing packages from manifest.json "requirements" are installed with pacman (pkexec dialog, or sudo in a terminal;
+# PILL_BAR_NO_AUTO_INSTALL=1 only lists them). No OAuth sign-in is requested. Undo: disable or remove the
 # plugin, or run ./uninstall.sh.
 set -euo pipefail
 SRC="$(dirname "$(readlink -f "$0")")/files"
@@ -34,21 +35,22 @@ fi
 export PYTHONDONTWRITEBYTECODE=1
 have() { command -v "$1" >/dev/null 2>&1; }
 
-echo "== Checking dependencies (nothing is installed automatically)"
+echo "== Installing missing packages listed in manifest.json (requirements)"
+bash "$SRC/setup/requirements.sh" "$ROOT/manifest.json" || true
+echo "== Checking dependencies"
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 missing=()
 for c in playerctl jq pactl pamixer python3 bluetoothctl nmcli upower powerprofilesctl hyprctl cargo fc-match; do
   have "$c" || missing+=("$c")
 done
 pkg-config --exists xkbcommon wayland-client 2>/dev/null || missing+=("libxkbcommon + wayland")
-have cava || echo "Note: cava not found, the notch equalizer shows decorative bars. Install with: sudo pacman -S --needed cava"
-have wl-copy || echo "Note: wl-clipboard not found, the clipboard tab cannot paste. Install with: sudo pacman -S --needed wl-clipboard"
-have sqlite3 || echo "Note: sqlite3 not found, Copilot CLI usage stays hidden. Install with: sudo pacman -S --needed sqlite"
+have cava || echo "Note: cava not found, the notch equalizer shows decorative bars."
+have wl-copy || echo "Note: wl-clipboard not found, the clipboard tab cannot paste."
+have sqlite3 || echo "Note: sqlite3 not found, Copilot CLI usage stays hidden."
 if [ ${#missing[@]} -gt 0 ]; then
   echo "Missing: ${missing[*]}"
-  echo "Arch packages: sudo pacman -S --needed playerctl jq libpulse pamixer libxkbcommon wayland pkgconf bluez-utils networkmanager upower power-profiles-daemon rust fontconfig wl-clipboard cava"
-  have cargo || echo "Rust is required to build the notch: sudo pacman -S --needed rust"
-  echo "Install them, then enable the plugin again."; exit 1
+  echo "Install them (see manifest.json requirements): sudo pacman -S --needed $(jq -r '.requirements.pacman | join(" ")' "$ROOT/manifest.json")"
+  echo "Then enable the plugin again."; exit 1
 fi
 if [ ! -e "$H/autostart.lua" ] && [ ! -e "$H/bindings.lua" ]; then
   echo "This plugin targets Omarchy 4.x (Lua Hyprland config)."; exit 1

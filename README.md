@@ -27,7 +27,7 @@ Target: Omarchy 4.x with the **Lua Hyprland config** (`~/.config/hypr/autostart.
 
 Pill Bar is an Omarchy **service plugin** (`waybar.pill-bar`). `Service.qml` holds a lease on a durable backend that provisions the checkout before starting the Rust notch. Disable, removal or shell exit closes the lease: the backend stops its children and restores the native bar, notifications, OSD and session-managed files. Only the WhatsApp adapter files and their original backups remain across shell restart or logout while Pill Bar stays enabled.
 
-1. Install the pacman packages listed under [Requirements](#requirements--what-you-must-do) (the script only checks and stops if something is missing).
+1. Nothing to install by hand: enabling the plugin installs the packages from `manifest.json` (`requirements`) that are missing, see [Requirements](#requirements--what-you-must-do).
 2. Install and enable:
 
 ```
@@ -38,7 +38,7 @@ omarchy plugin disable waybar.pill-bar
 
 Needs Omarchy 4.x with the Lua Hyprland config and `omarchy plugin list --json` working; setup stops otherwise.
 
-- Enabling builds automatically while the native desktop remains available. Setup never installs packages, prompts, requests OAuth or restarts the shell. Build failures leave the native desktop usable; inspect `${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log`.
+- Enabling builds automatically while the native desktop remains available. Setup installs missing packages from the manifest (below), never requests OAuth and never restarts the shell. Build failures leave the native desktop usable; inspect `${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log`.
 - Every enable recovers stale session files, then snapshots a fresh baseline. Retained WhatsApp adapter entries keep their original backups rather than treating patched files as originals. All proposed files and their hashes are prepared before publishing. Disable/removal restores originals and removes the install record and product backup tree. User preferences, credentials, build cache and durable recovery helpers remain.
 - While enabled, one `waybar-notch` process draws the selected output's pills, notch, OSD and notification cards. The backend stops the native Waybar unit and disables native notifications/OSD through `shell.json`, restoring only what it changed. Inactive helpers never restart the product.
 - Notifications: Quickshell keeps owning `org.freedesktop.Notifications` (its bus name is process-wide and cannot be released). `Service.qml` loads `NotificationRelay.qml` on the backend's request and forwards each notification to the notch over `$XDG_RUNTIME_DIR/waybar-pill-plugin/notifications.sock` (NDJSON v2 with sequence numbers, acknowledgements and bounded queues, peer-authenticated by PID); the notch renders its usual cards and sends actions/closures back so the sender gets the real D-Bus signals. Activation only reports success after that relay handshake; any failure restores the native desktop. The notch binary itself never claims a notification name and refuses to start without `--notification-relay <shell-pid>`.
@@ -108,11 +108,16 @@ omarchy plugin enable waybar.pill-bar      # rebuilds the notch from the new sou
 
 ## Requirements / what you must do
 
-1. **Install the packages** (the installer only checks, it never installs):
+1. **Packages are installed for you.** `manifest.json` lists them under `requirements` (`pacman` = required, `optional` = nice to have). When you enable the plugin, provisioning installs whatever is missing with `pacman -S --needed`:
+   - from the Omarchy shell (the normal `omarchy plugin enable ...`): `pkexec` shows the Omarchy password dialog;
+   - from a terminal (`./install.sh --provision`): `sudo` asks in that terminal;
+   - `PILL_BAR_NO_AUTO_INSTALL=1` turns it off; the missing packages are then only listed.
+
+   Only names from the manifest are passed to pacman. Optional packages (`wl-clipboard`, `cava`, `sqlite`) never block the plugin. Required: `playerctl jq libpulse pamixer libxkbcommon wayland pkgconf bluez-utils networkmanager upower power-profiles-daemon rust fontconfig` (a `cargo` from rustup also satisfies `rust`). To install them yourself first:
    ```bash
-   sudo pacman -S --needed playerctl jq libpulse pamixer libxkbcommon wayland pkgconf bluez-utils networkmanager upower power-profiles-daemon rust fontconfig wl-clipboard cava
+   sudo pacman -S --needed $(jq -r '.requirements.pacman + .requirements.optional | join(" ")' ~/.config/omarchy/plugins/waybar.pill-bar/manifest.json)
    ```
-   The guided Google login needs only an interactive terminal and your normal browser.
+   `files/setup/requirements.sh --check` lists what is missing without installing anything. The guided Google login needs only an interactive terminal and your normal browser.
 2. **Enable the plugin** through Omarchy, as above. Build output lives in `${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch/target`, never inside the watched plugin checkout.
 3. **Configure Google Calendar separately**, if wanted. Automatic enable never requests credentials or starts OAuth. Preferences and tokens survive disable/removal.
 4. Logging out and in is not required. A newly installed WhatsApp adapter or changed plugin QML may need one `omarchy-restart-shell`.
@@ -137,7 +142,7 @@ omarchy plugin enable waybar.pill-bar      # rebuilds the notch from the new sou
 ./install.sh --provision [--no-restart] [--reconfigure]
 ```
 
-Normal use needs only Omarchy enable/disable. The developer entry point checks dependencies, builds into the external cache, stages every output, snapshots originals, prepares all after-images and hashes, then publishes atomically. It never installs packages or requests OAuth. Recover any prior manual provision before running it again.
+Normal use needs only Omarchy enable/disable. The developer entry point checks dependencies, builds into the external cache, stages every output, snapshots originals, prepares all after-images and hashes, then publishes atomically. It installs missing manifest packages (see Requirements) but never requests OAuth. Recover any prior manual provision before running it again.
 
 ## Uninstall
 
