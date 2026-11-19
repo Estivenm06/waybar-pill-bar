@@ -1,0 +1,42 @@
+name: Prebuilt notch
+
+# Keeps the downloadable notch (GitHub release v<manifest version>) in step with the sources.
+#   verify  : check that the currently listed snapshot belongs to the sources of this commit (changes nothing)
+#   publish : verify the commit (tests), then build and publish the snapshot for it
+# A push that changes the Rust sources publishes automatically, so installs never fall back to compiling for long.
+on:
+  push:
+    branches: [main]
+    paths: ["notch/**", "manifest.json", "release.sh", "files/setup/source-hash.sh", ".github/workflows/release.yml"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "verify = check the currently listed snapshot; publish = verify and publish a newer upstream commit"
+        type: choice
+        options: [verify, publish]
+        default: verify
+
+permissions:
+  contents: write
+
+jobs:
+  notch:
+    runs-on: ubuntu-latest
+    # built on Arch so the binary links against the libraries Omarchy users have
+    container: archlinux:latest
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed base-devel git rust jq zstd curl github-cli libxkbcommon wayland pkgconf fontconfig
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Verify the listed snapshot
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'verify'
+        run: ./release.sh --verify
+      - name: Verify and publish
+        if: github.event_name == 'push' || inputs.action == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./release.sh --publish
