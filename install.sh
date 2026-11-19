@@ -64,10 +64,24 @@ python3 "$SRC/scripts/waybar-pill-plugin" validate-checkout "$ROOT"
 # Build products and staging stay outside the plugin directory, which Omarchy watches for changes.
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch"
 export CARGO_TARGET_DIR="$CACHE/target"
-echo "== Building the Rust notch"
-( cd "$ROOT/notch" && cargo build --release --locked -q )
 BIN="$CARGO_TARGET_DIR/release/waybar-notch"
-[ -x "$BIN" ] || { echo "The build did not produce $BIN"; exit 1; }
+notify() { have omarchy-notification-send && omarchy-notification-send -g "$(printf '\uf013')" "Pill Bar" "$1" >/dev/null 2>&1 || true; }
+# A content hash of the sources, not file times: git operations touch times without changing code.
+SRC_HASH=$(cd "$ROOT/notch" && { cat Cargo.toml Cargo.lock; find src -type f | LC_ALL=C sort | xargs cat; } | sha256sum | cut -d' ' -f1)
+STAMP="$CACHE/built-source.sha256"
+if [ -x "$BIN" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$SRC_HASH" ]; then
+  echo "== Rust notch is already built for these sources (skipping the build)"
+else
+  echo "== Building the Rust notch"
+  notify "Building the notch. This takes 1 to 2 minutes; the bar appears when it is ready."
+  if ! ( cd "$ROOT/notch" && cargo build --release --locked -q ); then
+    notify "The build failed, so the native bar stays. Details: ${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log"
+    exit 1
+  fi
+  [ -x "$BIN" ] || { echo "The build did not produce $BIN"; exit 1; }
+  mkdir -p -m 700 "$CACHE"
+  printf '%s\n' "$SRC_HASH" > "$STAMP"
+fi
 
 mkdir -p -m 700 "$CACHE"
 STAGE=$(mktemp -d "$CACHE/stage.XXXXXX")
