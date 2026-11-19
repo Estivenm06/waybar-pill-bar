@@ -174,13 +174,13 @@ class SandboxInstall(Base):
         self.bin = os.path.join(self.tmp, "bin")
         os.mkdir(self.bin)
         for n in ("waybar", "playerctl", "pactl", "pamixer", "bluetoothctl", "nmcli", "upower", "powerprofilesctl",
-                  "hyprctl", "fc-match", "pkg-config", "busctl", "omarchy-shell", "uwsm-app"):
+                  "hyprctl", "fc-match", "pkg-config", "busctl", "omarchy-shell", "uwsm-app", "omarchy-notification-send"):
             self.stub(n, "exit 0")
         self.calls_log = os.path.join(self.tmp, "calls.log")
         self.stub("systemctl", 'echo "systemctl $*" >> "%s"; exit 0' % self.calls_log)
         self.stub("omarchy", 'echo "omarchy $*" >> "%s"; [ "$1 $2" = "plugin list" ] && echo "[]"; exit 0' % self.calls_log)
         self.stub("cargo", '''set -eu
-[ "$*" = "build --release --locked -q" ]
+[ "$*" = "build --release --locked --color never" ]
 case "$CARGO_TARGET_DIR" in "$HOME"/.cache/waybar-notch/target) ;; *) exit 90 ;; esac
 echo "cargo $*" >> "%s"
 mkdir -p "$CARGO_TARGET_DIR/release"
@@ -195,7 +195,7 @@ chmod 755 "$CARGO_TARGET_DIR/release/waybar-notch"''' % self.calls_log)
                         CARGO_HOME=os.path.join(self.home, ".cargo"), RUSTUP_HOME=os.path.join(self.home, ".rustup"),
                         XDG_CACHE_HOME=os.path.join(self.home, ".cache"),
                         XDG_DATA_HOME=os.path.join(self.home, ".local", "share"),
-                        PYTHONDONTWRITEBYTECODE="1")
+                        PYTHONDONTWRITEBYTECODE="1", PILL_BAR_NO_AUTO_INSTALL="1", PILL_BAR_NO_PREBUILT="1")
         for name in ("TERM_PROGRAM", "DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
                      "DBUS_SESSION_BUS_ADDRESS", "WAYBAR_PILL_SESSION"):
             self.env.pop(name, None)

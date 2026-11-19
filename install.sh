@@ -65,23 +65,36 @@ python3 "$SRC/scripts/waybar-pill-plugin" validate-checkout "$ROOT"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch"
 export CARGO_TARGET_DIR="$CACHE/target"
 BIN="$CARGO_TARGET_DIR/release/waybar-notch"
-notify() { have omarchy-notification-send && omarchy-notification-send -g "$(printf '\uf013')" "Pill Bar" "$1" >/dev/null 2>&1 || true; }
+. "$SRC/setup/progress.sh"
 # A content hash of the sources, not file times: git operations touch times without changing code.
-SRC_HASH=$(cd "$ROOT/notch" && { cat Cargo.toml Cargo.lock; find src -type f | LC_ALL=C sort | xargs cat; } | sha256sum | cut -d' ' -f1)
+SRC_HASH=$(bash "$SRC/setup/source-hash.sh" "$ROOT")
 STAMP="$CACHE/built-source.sha256"
 if [ -x "$BIN" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$SRC_HASH" ]; then
   echo "== Rust notch is already built for these sources (skipping the build)"
 else
-  echo "== Building the Rust notch"
-  notify "Building the notch. This takes 1 to 2 minutes; the bar appears when it is ready."
-  if ! ( cd "$ROOT/notch" && cargo build --release --locked -q ); then
-    notify "The build failed, so the native bar stays. Details: ${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log"
-    exit 1
+  progress "Setting up the notch: downloading the prebuilt version…"
+  echo "== Looking for a prebuilt notch for these sources"
+  if bash "$SRC/setup/fetch-prebuilt.sh" "$ROOT" "$SRC_HASH" "$CACHE/prebuilt.$$"; then
+    mkdir -p "$(dirname "$BIN")" && mv -f "$CACHE/prebuilt.$$" "$BIN"
+  else
+    echo "== Building the Rust notch"
+    progress "Building the notch from source (1 to 2 minutes)…"
+    total=$(grep -c '^\[\[package\]\]' "$ROOT/notch/Cargo.lock" || true); [ "${total:-0}" -gt 0 ] || total=200
+    if ! ( cd "$ROOT/notch" && cargo build --release --locked --color never 2>&1 ) | {
+        n=0; last=0
+        while IFS= read -r line; do
+          printf '%s\n' "$line"
+          case $line in *Compiling*) n=$((n + 1)); step=$((n * 10 / total)); [ "$step" -gt "$last" ] && [ "$step" -lt 10 ] && { last=$step; progress "Building the notch: $((step * 10))%"; } ;; esac
+        done; }; then
+      progress "The build failed, so the native bar stays. See ${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log"
+      exit 1
+    fi
   fi
-  [ -x "$BIN" ] || { echo "The build did not produce $BIN"; exit 1; }
+  [ -x "$BIN" ] || { echo "The notch binary is missing: $BIN"; progress "Setup failed: no notch binary. See the provision log."; exit 1; }
   mkdir -p -m 700 "$CACHE"
   printf '%s\n' "$SRC_HASH" > "$STAMP"
 fi
+progress "Installing the bar files…"
 
 mkdir -p -m 700 "$CACHE"
 STAGE=$(mktemp -d "$CACHE/stage.XXXXXX")
@@ -166,3 +179,4 @@ if [ "$RESTART" = 1 ]; then
 fi
 DONE=1
 echo "Provisioned. Disabling or removing the plugin restores these files."
+progress "Setup finished. Starting the bar…"
