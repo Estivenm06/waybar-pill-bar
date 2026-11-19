@@ -26,7 +26,7 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Tools
-        run: pacman -Syu --noconfirm --needed base-devel git rust jq zstd curl github-cli libxkbcommon wayland pkgconf fontconfig
+        run: pacman -Syu --noconfirm --needed base-devel git rust jq zstd curl github-cli libxkbcommon wayland pkgconf fontconfig ttf-jetbrains-mono ttf-dejavu
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
