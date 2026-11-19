@@ -1,20 +1,17 @@
 """Omarchy 4.x compatibility matrix (run: python3 -m unittest tests/test_omarchy_matrix.py).
 Covers catalog permutations of the bridge, the real Quickshell runtime loading Service.qml, and a sandboxed
 install/uninstall cycle. Everything runs in a temporary HOME/XDG/runtime; desktop commands are faked."""
-import hashlib
 import json
 import os
 import shutil
-import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_plugin_bridge import Base, Fixture, ROOT, SCRIPTS  # noqa: E402
+from test_plugin_bridge import Base, Fixture, ROOT, load  # noqa: E402
 
 STOCK = [{"id": "omarchy.notifications"}, {"id": "omarchy.osd"}, {"id": "omarchy.bar"}]
 CLONES = [
@@ -73,16 +70,19 @@ class CatalogMatrix(Fixture):
         self.assertEqual(self.get_shell()["disabledPlugins"], ["example.notifications"])
 
 
-@unittest.skipUnless(shutil.which("quickshell"), "quickshell not installed")
+@unittest.skipUnless(shutil.which("quickshell") and shutil.which("dbus-daemon"), "quickshell or dbus-daemon not installed")
 class RealQuickshell(Base):
     def test_service_qml_runs_launcher_and_holds_lease_until_exit(self):
-        scripts = os.path.join(self.home, ".config", "waybar", "scripts")
+        checkout = os.path.join(self.tmp, "checkout with spaces")
+        scripts = os.path.join(checkout, "files", "scripts")
         os.makedirs(scripts)
+        for name in ("Service.qml", "NotificationRelay.qml"):
+            shutil.copy2(os.path.join(ROOT, name), checkout)
         log = os.path.join(self.tmp, "lease.log")
         # stand-in backend: `start` forks a listener on the real control socket path, records the first line and EOF
         with open(os.path.join(scripts, "waybar-pill-plugin"), "w") as f:
             f.write('''import os, socket, sys
-if sys.argv[1:] != ["start"]:
+if sys.argv[1:] != ["start", "--checkout", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))]:
     sys.exit(2)
 d = os.path.join(os.environ["XDG_RUNTIME_DIR"], "waybar-pill-plugin")
 os.makedirs(d, exist_ok=True)
@@ -125,9 +125,12 @@ open(%r, "a").write("EOF\\n")
         self.addCleanup(lambda: bus.poll() is None and (bus.kill(), bus.wait()))
         address = bus.stdout.readline().strip()
         self.assertTrue(address)
-        env = dict(os.environ, QT_QPA_PLATFORM="offscreen", DBUS_SESSION_BUS_ADDRESS=address)
+        env = dict(os.environ, QT_QPA_PLATFORM="offscreen", DBUS_SESSION_BUS_ADDRESS=address,
+                   XDG_CACHE_HOME=os.path.join(self.home, ".cache"), XDG_DATA_HOME=os.path.join(self.home, ".local", "share"))
         env.pop("WAYLAND_DISPLAY", None)
-        qs = subprocess.Popen(["quickshell", "-p", os.path.join(ROOT, "Service.qml")], env=env,
+        env.pop("DISPLAY", None)
+        env.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+        qs = subprocess.Popen(["quickshell", "-p", os.path.join(checkout, "Service.qml")], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         self.addCleanup(lambda: qs.poll() is None and (qs.kill(), qs.wait()))
         def log_text():
@@ -155,32 +158,47 @@ open(%r, "a").write("EOF\\n")
         self.fail("backend never saw EOF after quickshell exited")
 
 
-NEEDED = ["jq", "cargo", "python3", "pkg-config"]
+NEEDED = ["jq", "python3"]
 
 
-@unittest.skipUnless(all(shutil.which(c) for c in NEEDED) and
-                     os.path.exists(os.path.join(ROOT, "notch", "target", "release", "waybar-notch")),
-                     "needs built notch and cargo")
+@unittest.skipUnless(all(shutil.which(c) for c in NEEDED), "needs jq and python3")
 class SandboxInstall(Base):
     def setUp(self):
         super().setUp()
+        self.checkout = os.path.join(self.tmp, "checkout with spaces")
+        os.mkdir(self.checkout)
+        for name in ("install.sh", "uninstall.sh", "manifest.json"):
+            shutil.copy2(os.path.join(ROOT, name), self.checkout)
+        shutil.copytree(os.path.join(ROOT, "files"), os.path.join(self.checkout, "files"))
+        os.mkdir(os.path.join(self.checkout, "notch"))
         self.bin = os.path.join(self.tmp, "bin")
         os.mkdir(self.bin)
         for n in ("waybar", "playerctl", "pactl", "pamixer", "bluetoothctl", "nmcli", "upower", "powerprofilesctl",
-                  "hyprctl", "fc-match"):
+                  "hyprctl", "fc-match", "pkg-config", "busctl", "omarchy-shell", "uwsm-app"):
             self.stub(n, "exit 0")
         self.calls_log = os.path.join(self.tmp, "calls.log")
         self.stub("systemctl", 'echo "systemctl $*" >> "%s"; exit 0' % self.calls_log)
         self.stub("omarchy", 'echo "omarchy $*" >> "%s"; [ "$1 $2" = "plugin list" ] && echo "[]"; exit 0' % self.calls_log)
+        self.stub("cargo", '''set -eu
+[ "$*" = "build --release --locked -q" ]
+case "$CARGO_TARGET_DIR" in "$HOME"/.cache/waybar-notch/target) ;; *) exit 90 ;; esac
+echo "cargo $*" >> "%s"
+mkdir -p "$CARGO_TARGET_DIR/release"
+printf '#!/bin/sh\\nexit 0\\n' > "$CARGO_TARGET_DIR/release/waybar-notch"
+chmod 755 "$CARGO_TARGET_DIR/release/waybar-notch"''' % self.calls_log)
         h = os.path.join(self.home, ".config", "hypr")
         os.makedirs(h)
         for n in ("autostart.lua", "bindings.lua"):
             with open(os.path.join(h, n), "w") as f:
                 f.write("-- user %s\n" % n)
-        self.env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"],
-                        CARGO_HOME=os.path.join(self.saved["HOME"], ".cargo"), RUSTUP_HOME=os.path.join(self.saved["HOME"], ".rustup"),
+        self.env = dict(os.environ, PATH=self.bin + ":/usr/bin:/bin",
+                        CARGO_HOME=os.path.join(self.home, ".cargo"), RUSTUP_HOME=os.path.join(self.home, ".rustup"),
+                        XDG_CACHE_HOME=os.path.join(self.home, ".cache"),
+                        XDG_DATA_HOME=os.path.join(self.home, ".local", "share"),
                         PYTHONDONTWRITEBYTECODE="1")
-        self.env.pop("TERM_PROGRAM", None)
+        for name in ("TERM_PROGRAM", "DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
+                     "DBUS_SESSION_BUS_ADDRESS", "WAYBAR_PILL_SESSION"):
+            self.env.pop(name, None)
 
     def stub(self, name, body):
         p = os.path.join(self.bin, name)
@@ -189,10 +207,111 @@ class SandboxInstall(Base):
         os.chmod(p, 0o755)
 
     def sh(self, *args):
-        return subprocess.run(list(args), cwd=ROOT, env=self.env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return subprocess.run(list(args), cwd=self.checkout, env=self.env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=60)
+
+    def set_shell(self, cfg):
+        Fixture.set_shell(self, cfg)
+
+    def get_shell(self):
+        return Fixture.get_shell(self)
+
+    def manager_desktop(self):
+        self.shell = os.path.join(self.home, ".config", "omarchy", "shell.json")
+        os.makedirs(os.path.dirname(self.shell), exist_ok=True)
+        self.flag = os.path.join(self.home, ".local", "state", "omarchy", "toggles", "bar-off")
+        os.makedirs(os.path.dirname(self.flag), exist_ok=True)
+        self.set_shell({"disabledPlugins": [], "bar": {"keep": "me"}})
+        self.procs = []
+        self.foreign_owner = None
+        self.shell_pid = os.getpid()
+        self.argv = []
+        self.child_exits = False
+        self.calls = []
+        self.addCleanup(lambda: [p.kill() or p.wait() for p in self.procs if p.poll() is None])
+
+    def manager_enable(self):
+        # The manager's service provisions before acquiring the desktop; every external command is a fake.
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        state = load(os.path.join(self.checkout, "files", "setup", "plugin-state.py"), "matrix_state")
+        session = self.h.Session(lambda cmd: Fixture.runner(self, cmd),
+                                 lambda args, **kw: Fixture.popen(self, args, **kw), state=state)
+        self.addCleanup(session.cleanup)
+        session.activate(self.shell_pid, lambda: None)
+        self.assertTrue(session.active)
+        self.assertTrue(os.path.exists(self.flag))
+        self.assertIn("omarchy.notifications", self.get_shell()["disabledPlugins"])
+        return session
+
+    def assert_manager_restored(self):
+        self.assertFalse(os.path.exists(self.h.marker_path()))
+        self.assertFalse(os.path.exists(self.flag))
+        self.assertEqual(self.get_shell(), {"disabledPlugins": [], "bar": {"keep": "me"}})
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "waybar-notch")))
+        for name in ("autostart.lua", "bindings.lua"):
+            with open(os.path.join(self.home, ".config", "hypr", name)) as f:
+                self.assertEqual(f.read(), "-- user %s\n" % name)
+        self.assertTrue(all(p.poll() is not None for p in self.procs))
+
+    def test_manager_add_enable_disable_reenable_remove(self):
+        self.manager_desktop()
+        # Adding a checkout does not run its installer or touch the native desktop.
+        self.assert_manager_restored()
+        self.assertFalse(os.path.exists(self.calls_log))
+        first = self.manager_enable()
+        first.cleanup()
+        self.assert_manager_restored()
+        self.assertTrue(os.path.isdir(self.checkout))
+        self.procs.clear()
+        fifo = os.path.join(self.rt, "waybar-popupd.fifo")
+        if os.path.exists(fifo):
+            os.unlink(fifo)
+        second = self.manager_enable()
+        # Removing an enabled checkout closes the lease; restoration uses the already-loaded state helper.
+        shutil.rmtree(self.checkout)
+        second.cleanup()
+        self.assert_manager_restored()
+        self.assertFalse(os.path.exists(self.checkout))
+
+    def test_install_without_provision_is_inert(self):
+        self.manager_desktop()
+        r = self.sh("bash", "install.sh")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Setup is automatic", r.stdout)
+        shutil.rmtree(self.checkout)
+        self.assert_manager_restored()
+        self.assertFalse(os.path.exists(self.calls_log))
+
+    def test_manager_failed_build_leaves_native_desktop_untouched(self):
+        self.manager_desktop()
+        self.stub("cargo", "exit 42")
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertNotEqual(r.returncode, 0)
+        self.assert_manager_restored()
+        self.assertEqual(self.calls, [])
+
+    def test_manager_reprovision_refuses_existing_record(self):
+        self.manager_desktop()
+        session = self.manager_enable()
+        with open(self.h.marker_path(), "rb") as f:
+            before = f.read()
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertNotEqual(r.returncode, 0)
+        with open(self.h.marker_path(), "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertTrue(session.active)
+        session.cleanup()
+        self.assert_manager_restored()
+
+    def test_manager_add_then_remove_never_provisions(self):
+        self.manager_desktop()
+        shutil.rmtree(self.checkout)
+        self.assert_manager_restored()
+        self.assertFalse(os.path.exists(self.calls_log))
 
     def test_install_then_uninstall_restores_the_user_files(self):
-        r = self.sh("bash", "install.sh", "--no-restart", "--no-google")
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         marker = os.path.join(self.home, ".local", "state", "waybar-notch", "plugin-install.json")
         with open(marker) as f:
@@ -219,13 +338,13 @@ class SandboxInstall(Base):
         self.assertFalse(os.path.exists(helper))
 
     def test_removed_flag_is_a_usage_error_before_any_change(self):
-        r = self.sh("bash", "install.sh", "--plugin", "--no-restart", "--no-google")
+        r = self.sh("bash", "install.sh", "--plugin", "--no-restart")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("Unknown option", r.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
         self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "waybar")))
 
-    def test_uninstall_without_a_record_changes_nothing_even_with_purge(self):
+    def test_uninstall_without_a_record_preserves_unmanaged_files_and_purges_only_credentials(self):
         sentinels = [os.path.join(self.home, ".config", "waybar", "backup-20200101-000000", "config.jsonc"),
                      os.path.join(self.home, ".config", "waybar-notch", "google.json"),
                      os.path.join(self.home, ".local", "share", "waybar-notch", "google-token.json")]
@@ -235,19 +354,23 @@ class SandboxInstall(Base):
                 f.write("sentinel")
         for args in ((), ("--purge",)):
             r = self.sh("bash", "uninstall.sh", *args)
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn("No plugin install record; nothing was changed.", r.stdout)
-        for p in sentinels:
-            with open(p) as f:
-                self.assertEqual(f.read(), "sentinel")
-        self.assertFalse(os.path.exists(self.calls_log))  # Omarchy was never called
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("Plugin files restored.", r.stdout)
+            if not args:
+                for p in sentinels:
+                    with open(p) as f:
+                        self.assertEqual(f.read(), "sentinel")
+        with open(sentinels[0]) as f:
+            self.assertEqual(f.read(), "sentinel")
+        for p in sentinels[1:]:
+            self.assertFalse(os.path.exists(p))
 
     def test_legacy_standalone_files_fail_setup_without_writes(self):
         drop = os.path.join(self.home, ".config", "systemd", "user", "waybar.service.d", "50-waybar-notch.conf")
         os.makedirs(os.path.dirname(drop))
         with open(drop, "w") as f:
             f.write("# Managed by waybar-pill-bar\n")
-        r = self.sh("bash", "install.sh", "--no-restart", "--no-google")
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("Legacy standalone files detected", r.stdout + r.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "state", "waybar-notch", "plugin-install.json")))

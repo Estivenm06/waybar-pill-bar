@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Installer helper: which AI usage tiles and which apps the Waybar setup shows.
+"""Installer helper: which AI usage tiles and which apps the pill bar shows.
 
   waybar-setup.py defaults                          write the config file if it does not exist
   waybar-setup.py ask                               interactive choice, writes the config file
-  waybar-setup.py render-config <config.jsonc>      generate custom/<app> modules + group/apps from the config
   waybar-setup.py render-autostart <in.lua> <out>   add the hidden-workspace rules for background apps
-  waybar-setup.py apply                             re-render the installed Waybar config + autostart from the saved apps (Settings page)
+  waybar-setup.py patch-lua <file> <snippet> <out>  write the proposed Hyprland Lua file: the managed block replaces the
+                                                    existing one in place, or is appended; nothing but <out> is written
+  waybar-setup.py apply                             re-render the installed Hyprland autostart rules from the saved apps (Settings page)
 """
 import fcntl
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -23,7 +23,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "waybar-notch", "config.json")
 WAYBAR = os.path.join(HOME, ".config", "waybar")
-NOTCH_BIN = os.path.join(HOME, ".local", "bin", "waybar-notch")
 RECENT_SECS = 30 * 86400
 
 
@@ -285,117 +284,6 @@ def app_modules(cfg):
     return out
 
 
-def launch_args(a):
-    if "web" in a:
-        return ["omarchy-launch-webapp", a["web"]]
-    return [launch_exe(a)]
-
-
-def status_signal(conf):
-    """Smallest Waybar real-time signal offset (1-30) not used by any other custom module."""
-    managed = {"custom/" + a["id"] for a in catalog()}
-    used = {m.get("signal") for k, m in conf.items() if k.startswith("custom/") and k not in managed and isinstance(m, dict)}
-    for n in range(1, 31):
-        if n not in used:
-            return n
-    raise ConfigError("all Waybar signal numbers 1-30 are used by other custom modules; free one for the app status")
-
-
-WHATSAPP_PLUGIN = "io.github.ricky.whatsapp"
-POWER_PLUGIN = "patcastle.power"
-WIDGETS_HELPER = os.path.join(WAYBAR, "scripts", "waybar-plugin-widgets")
-
-
-def enabled_plugin_widgets():
-    """Ids of the Omarchy plugins Waybar can open (WhatsApp, Power) that are currently enabled. Empty on installs
-    without Omarchy plugin support; a failing or unintelligible catalog is an error, never a guess."""
-    if shutil.which("omarchy-plugin-list") is None:
-        return set()
-    r = subprocess.run(["omarchy", "plugin", "list", "--json"], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise ConfigError("omarchy plugin list failed: " + (r.stderr.strip() or "exit %d" % r.returncode))
-    try:
-        plugins = json.loads(r.stdout)
-        if not isinstance(plugins, list):
-            raise ValueError("not a list")
-        return {p["id"] for p in plugins
-                if p.get("enabled") is True and p.get("id") in (WHATSAPP_PLUGIN, POWER_PLUGIN)}
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
-        raise ConfigError("omarchy plugin list returned an unusable catalog: %s" % e)
-
-
-def render_plugin_widgets(conf, enabled):
-    """Point the WhatsApp and battery modules at their installed Omarchy plugin panels (repeatable). The generated
-    WhatsApp launcher keeps working as the right click."""
-    helper = shlex.quote(WIDGETS_HELPER)
-    mod = conf.get("custom/whatsapp")
-    if WHATSAPP_PLUGIN in enabled and isinstance(mod, dict):
-        conf["custom/whatsapp"] = {"format": "{}", "return-type": "json", "exec": helper + " whatsapp-status",
-                                   "on-click": helper + " open whatsapp", "on-click-right": mod["on-click"],
-                                   "tooltip": True}
-    battery = conf.get("battery")
-    if isinstance(battery, dict):
-        details = shlex.quote(os.path.join(WAYBAR, "scripts", "waybar-popupctl")) + " battery"
-        power = helper + " open power"
-        old_rights = {details, power, os.path.join(WAYBAR, "scripts", "waybar-popupctl") + " battery"}
-        battery["on-click"] = details  # the notch's Battery & Power page
-        if POWER_PLUGIN in enabled:
-            battery["on-click-right"] = power  # the full Power plugin panel
-        elif battery.get("on-click-right") in old_rights:
-            del battery["on-click-right"]
-
-
-def render_apps(conf, cfg):
-    """Rewrite the generated app modules of a Waybar config dict from `cfg` (repeatable: stale entries are removed,
-    group/apps is reinserted after hyprland/workspaces when apps return, dropped when none are left).
-    Status is read from the supervisor's cache once at start and again on one shared real-time signal; an enabled
-    WhatsApp plugin instead streams its own status (no signal)."""
-    entries = app_modules(cfg)
-    enabled = enabled_plugin_widgets()
-    streaming = {"custom/whatsapp"} if WHATSAPP_PLUGIN in enabled else set()
-    sig = status_signal(conf) if any(name not in streaming for name, _, _ in entries) else None  # may raise: nothing modified yet
-    ids = {a["id"] for a in catalog()}
-    for k in [k for k in conf if k.startswith("custom/") and k[len("custom/"):] in ids]:
-        del conf[k]
-    s = os.path.join(WAYBAR, "scripts")
-    bgapp = shlex.quote(os.path.join(s, "waybar-bgapp.sh"))
-    app = shlex.quote(os.path.join(s, "waybar-app.sh"))
-    mods = []
-    for name, a, bg in entries:
-        launch = " ".join(shlex.quote(x) for x in launch_args(a))
-        cls = shlex.quote(a["class"])
-        if bg:
-            click = "%s toggle %s %s %s" % (bgapp, shlex.quote(a["id"]), cls, launch)
-        else:
-            click = "%s click %s %s" % (app, cls, launch)
-        exe = "%s --waybar-app-status %s" % (shlex.quote(NOTCH_BIN), shlex.quote(a["id"]))
-        conf[name] = {"format": a["glyph"], "return-type": "json", "exec": exe, "signal": sig,
-                      "on-click": click, "tooltip": False}
-        mods.append(name)
-    group = conf.setdefault("group/apps", {"orientation": "horizontal"})
-    group["modules"] = mods
-    left = conf["group/left"]["modules"]
-    left = [m for m in left if m != "group/apps"]
-    if mods:
-        at = left.index("hyprland/workspaces") + 1 if "hyprland/workspaces" in left else len(left)
-        left.insert(at, "group/apps")
-    conf["group/left"]["modules"] = left
-    render_plugin_widgets(conf, enabled)
-    return mods
-
-
-def cmd_render_config(path):
-    with open(path) as f:
-        conf = json.load(f)
-    cfg = ensure_config()
-    mods = render_apps(conf, cfg)
-    with open(path, "w") as f:
-        json.dump(conf, f, indent=2)
-        f.write("\n")
-    print("Apps in the first pill: " + (", ".join(m[len("custom/"):] for m in mods) or "none"))
-    print("AI usage tiles: " + (", ".join(cfg.get("ai", [])) or ("all detected" if "ai" not in cfg else "none")))
-
-
 def hypr_re(cls):
     pre = cls.startswith("^")
     post = cls.endswith("$")
@@ -414,22 +302,48 @@ def bg_lines(cfg):
             for _, a, bg in app_modules(cfg) if bg]
 
 
+END_MARK = "-- <<< waybar-pill-bar END <<<"
+BLOCK_RE = re.compile(r"-- >>> waybar-pill-bar BEGIN.*?-- <<< waybar-pill-bar END <<<\n", re.S)
+REINSTALL = "disable and re-enable the plugin to restore the managed block"
+
+
 def cmd_render_autostart(src, dst):
+    """Insert the background-app rules just before the block's end marker."""
     cfg = ensure_config()
     lines = bg_lines(cfg)
     with open(src) as f:
         text = f.read().splitlines()
     out = []
     for ln in text:
-        if ln.startswith("-- Popup animation:"):
+        if ln.rstrip() == END_MARK:
             out.extend(lines)
         out.append(ln)
     with open(dst, "w") as f:
         f.write("\n".join(out) + "\n")
 
 
-BLOCK_RE = re.compile(r"-- >>> waybar-pill-bar BEGIN.*?-- <<< waybar-pill-bar END <<<\n", re.S)
-REINSTALL = "re-run ./install.sh to restore the managed block"
+def cmd_patch_lua(path, snippet, dst):
+    """The proposed content of a Hyprland Lua file. A file that already holds the product block gets it replaced in
+    place; otherwise the block is appended after one separating newline. Duplicated or unpaired markers are refused."""
+    with open(snippet, encoding="utf-8") as f:
+        block = f.read().replace("__HOME__", HOME)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    begins, ends = text.count("-- >>> waybar-pill-bar BEGIN"), text.count(END_MARK)
+    if begins != ends or begins > 1:
+        raise ConfigError("%s has duplicated or unpaired waybar-pill-bar markers; not patching it" % path)
+    if begins:
+        found = BLOCK_RE.search(text)
+        if found is None:
+            raise ConfigError("%s has a malformed waybar-pill-bar block; not patching it" % path)
+        new = text[:found.start()] + block + text[found.end():]
+    else:
+        new = text + "\n" + block
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write(new)
 
 
 def replace_bg_rules(text, lines):
@@ -439,10 +353,10 @@ def replace_bg_rules(text, lines):
         raise ConfigError("autostart.lua has %d waybar-pill-bar managed blocks (need exactly 1); %s" % (len(blocks), REINSTALL))
     block = blocks[0]
     kept = [ln for ln in block.splitlines() if not ln.rstrip().endswith("-- @bg")]
-    anchors = [i for i, ln in enumerate(kept) if ln.startswith("-- Popup animation:")]
-    if len(anchors) != 1:
-        raise ConfigError("the managed block has %d '-- Popup animation:' anchors (need exactly 1); %s" % (len(anchors), REINSTALL))
-    kept[anchors[0]:anchors[0]] = lines
+    ends = [i for i, ln in enumerate(kept) if ln.rstrip() == END_MARK]
+    if len(ends) != 1:
+        raise ConfigError("the managed block has %d end markers (need exactly 1); %s" % (len(ends), REINSTALL))
+    kept[ends[0]:ends[0]] = lines
     new_block = "\n".join(kept) + "\n"
     return text.replace(block, new_block, 1)
 
@@ -482,7 +396,7 @@ def require_plugin_installation():
     """Path of the installed helper, only if its install record says 'plugin'; anything else is an error."""
     helper = os.path.join(WAYBAR, "scripts", "waybar-pill-plugin")
     if not os.path.exists(helper):
-        raise ConfigError("plugin setup has not been run: run ./install.sh in the plugin checkout")
+        raise ConfigError("the plugin is not provisioned: enable waybar.pill-bar first")
     r = subprocess.run([sys.executable, helper, "mode"], capture_output=True, text=True)
     if r.returncode != 0 or r.stdout.strip() != "plugin":
         raise ConfigError("cannot verify the plugin installation: " + (r.stderr.strip() or r.stdout.strip() or "exit %d" % r.returncode))
@@ -490,44 +404,33 @@ def require_plugin_installation():
 
 
 def cmd_apply():
-    """Re-render the installed Waybar config and Hyprland autostart from the saved `apps`, validate, apply, and roll back
-    both files if Hyprland reports new config errors."""
+    """Re-render the Hyprland autostart rules of background apps from the saved `apps`, validate, apply, and roll back
+    if Hyprland reports new config errors."""
     helper = require_plugin_installation()
     cfg = load_config()
     if cfg is None:
         raise ConfigError("%s does not exist" % CONFIG)
-    wconf = os.path.join(WAYBAR, "config.jsonc")
     auto = os.path.join(HOME, ".config", "hypr", "autostart.lua")
-    with open(wconf) as f:
-        conf_text = f.read()
     with open(auto) as f:
         auto_text = f.read()
-    conf = json.loads(conf_text)
-    render_apps(conf, cfg)
-    new_conf = json.dumps(conf, indent=2) + "\n"
-    json.loads(new_conf)
     new_auto = replace_bg_rules(auto_text, bg_lines(cfg))
-    if new_conf == conf_text and new_auto == auto_text:
+    if new_auto == auto_text:
         print("Nothing to change")
     else:
         bk = tempfile.mkdtemp(prefix="backup-%s-" % time.strftime("%Y%m%d-%H%M%S"), dir=WAYBAR)  # 0700 from creation
         os.mkdir(os.path.join(bk, "hypr"), 0o700)
-        shutil.copy2(wconf, os.path.join(bk, "config.jsonc"))
         shutil.copy2(auto, os.path.join(bk, "hypr", "autostart.lua"))
         baseline = set(hypr_errors())
-        write_atomic(wconf, new_conf)
         write_atomic(auto, new_auto)
         hypr_reload()
         fresh = [e for e in hypr_errors() if e not in baseline]
         if fresh:
-            write_atomic(wconf, conf_text)
             write_atomic(auto, auto_text)
             hypr_reload()
-            raise ConfigError("Hyprland rejected the new autostart rules, previous files restored: " + "; ".join(fresh))
-    if new_conf != conf_text or new_auto != auto_text:
-        r = subprocess.run([sys.executable, helper, "record-generated", wconf, auto], capture_output=True, text=True)
+            raise ConfigError("Hyprland rejected the new autostart rules, previous file restored: " + "; ".join(fresh))
+        r = subprocess.run([sys.executable, helper, "record-generated", auto], capture_output=True, text=True)
         if r.returncode != 0:
-            raise ConfigError("could not record the regenerated files: " + r.stderr.strip())
+            raise ConfigError("could not record the regenerated file: " + r.stderr.strip())
     if subprocess.run([sys.executable, helper, "active"]).returncode != 0:
         print("Saved (plugin disabled)")
         return
@@ -546,10 +449,10 @@ def main(argv):
         ensure_config()
     elif c == "ask":
         cmd_ask()
-    elif c == "render-config" and len(argv) == 2:
-        cmd_render_config(argv[1])
     elif c == "render-autostart" and len(argv) == 3:
         cmd_render_autostart(argv[1], argv[2])
+    elif c == "patch-lua" and len(argv) == 4:
+        cmd_patch_lua(argv[1], argv[2], argv[3])
     elif c == "apply" and len(argv) == 1:
         cmd_apply()
     else:

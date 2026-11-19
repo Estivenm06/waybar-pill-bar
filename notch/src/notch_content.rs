@@ -6,7 +6,6 @@
 //!
 //! QML -> Rust: `open`, `mapped`, `interaction`, `close`, `hidden`.   Rust -> QML: `layout`, `suspend`, `hide`, `error`.
 //! The connection ID doubles as the wire `session`; every post-open frame must carry it.
-use crate::Msg;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -16,6 +15,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+
+/// Where connection events go; returns false when the consumer is gone.
+pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
 use std::time::Duration;
 
 pub const VERSION: u64 = 1;
@@ -39,6 +41,8 @@ pub enum Event {
     Hidden { conn: u64 },
     /// EOF, socket error or protocol violation: the connection is finished.
     Gone { conn: u64 },
+    /// The listener itself failed.
+    Failed(String),
 }
 
 pub fn socket_path() -> io::Result<PathBuf> {
@@ -65,11 +69,11 @@ impl Bridge {
     }
 }
 
-pub fn start(shell_pid: i32, tx: async_channel::Sender<Msg>) -> io::Result<Bridge> {
+pub fn start(shell_pid: i32, tx: Sink) -> io::Result<Bridge> {
     start_at(&socket_path()?, shell_pid, tx)
 }
 
-pub fn start_at(path: &Path, shell_pid: i32, tx: async_channel::Sender<Msg>) -> io::Result<Bridge> {
+pub fn start_at(path: &Path, shell_pid: i32, tx: Sink) -> io::Result<Bridge> {
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
@@ -79,7 +83,7 @@ pub fn start_at(path: &Path, shell_pid: i32, tx: async_channel::Sender<Msg>) -> 
         let stream = match listener.accept() {
             Ok((s, _)) => s,
             Err(e) => {
-                let _ = tx.send_blocking(Msg::NotchContentFailed(format!("accept failed: {e}")));
+                let _ = tx(Event::Failed(format!("accept failed: {e}")));
                 return;
             }
         };
@@ -97,7 +101,7 @@ pub fn start_at(path: &Path, shell_pid: i32, tx: async_channel::Sender<Msg>) -> 
         std::thread::spawn(move || {
             read_loop(conn, stream, &tx, &reg);
             reg.lock().unwrap().remove(&conn);
-            let _ = tx.send_blocking(Msg::NotchContent(Event::Gone { conn }));
+            let _ = tx(Event::Gone { conn });
         });
     });
     Ok(Bridge { conns })
@@ -132,7 +136,7 @@ fn read_frame(r: &mut impl BufRead, buf: &mut Vec<u8>) -> io::Result<Option<Valu
 
 fn error_frame(message: &str) -> Value { serde_json::json!({"op": "error", "message": message}) }
 
-fn read_loop(conn: u64, stream: UnixStream, tx: &async_channel::Sender<Msg>, reg: &Conns) {
+fn read_loop(conn: u64, stream: UnixStream, tx: &Sink, reg: &Conns) {
     let reject = |why: &str| {
         if let Some(w) = reg.lock().unwrap().get(&conn) { let _ = w.send(error_frame(why)); }
     };
@@ -149,7 +153,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: &async_channel::Sender<Msg>, reg
         Err(why) => return reject(why),
     };
     let _ = reader.get_ref().set_read_timeout(None);
-    if tx.send_blocking(Msg::NotchContent(Event::Open { conn, output: open })).is_err() { return; }
+    if !tx(Event::Open { conn, output: open }) { return; }
     loop {
         let f = match read_frame(&mut reader, &mut buf) {
             Ok(Some(f)) => f,
@@ -157,7 +161,7 @@ fn read_loop(conn: u64, stream: UnixStream, tx: &async_channel::Sender<Msg>, reg
             Err(e) => return reject(&e.to_string()),
         };
         match parse_frame(conn, &f) {
-            Ok(ev) => { if tx.send_blocking(Msg::NotchContent(ev)).is_err() { return; } }
+            Ok(ev) => { if !tx(ev) { return; } }
             Err(why) => return reject(why),
         }
     }
@@ -294,14 +298,15 @@ mod tests {
         }
     }
 
-    fn recv(rx: &async_channel::Receiver<Msg>) -> Event {
+    fn sink(tx: mpsc::Sender<Event>) -> Sink {
+        let tx = Mutex::new(tx);
+        Arc::new(move |e| tx.lock().unwrap().send(e).is_ok())
+    }
+
+    fn recv(rx: &mpsc::Receiver<Event>) -> Event {
         let end = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match rx.try_recv() {
-                Ok(Msg::NotchContent(e)) => return e,
-                Ok(_) => panic!("unexpected message"),
-                Err(_) => {}
-            }
+            if let Ok(e) = rx.try_recv() { return e; }
             assert!(std::time::Instant::now() < end, "timed out waiting for an event");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -312,8 +317,8 @@ mod tests {
     #[test]
     fn open_layout_mapped_hide_hidden_round_trip() {
         let p = sock("flow");
-        let (tx, rx) = async_channel::unbounded();
-        let bridge = start_at(&p, me(), tx).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let bridge = start_at(&p, me(), sink(tx)).unwrap();
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         let (mut s, mut r) = connect(&p);
         writeln!(s, "{OPEN}").unwrap();
@@ -337,8 +342,8 @@ mod tests {
     #[test]
     fn disconnect_keeps_the_listener_and_ids_never_repeat() {
         let p = sock("again");
-        let (tx, rx) = async_channel::unbounded();
-        let bridge = start_at(&p, me(), tx).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let bridge = start_at(&p, me(), sink(tx)).unwrap();
         let (mut s1, _r1) = connect(&p);
         writeln!(s1, "{OPEN}").unwrap();
         let Event::Open { conn: c1, .. } = recv(&rx) else { panic!() };
@@ -359,8 +364,8 @@ mod tests {
     #[test]
     fn wrong_peer_is_dropped() {
         let p = sock("peer");
-        let (tx, rx) = async_channel::unbounded();
-        start_at(&p, me() + 1, tx).unwrap();
+        let (tx, rx) = mpsc::channel();
+        start_at(&p, me() + 1, sink(tx)).unwrap();
         let (mut s, mut r) = connect(&p);
         let _ = writeln!(s, "{OPEN}");
         assert!(line(&mut r).is_none(), "no reply for a foreign peer");
@@ -381,8 +386,8 @@ mod tests {
         ];
         for (tag, frame) in cases {
             let p = sock(tag);
-            let (tx, rx) = async_channel::unbounded();
-            start_at(&p, me(), tx).unwrap();
+            let (tx, rx) = mpsc::channel();
+            start_at(&p, me(), sink(tx)).unwrap();
             let (mut s, mut r) = connect(&p);
             let _ = writeln!(s, "{frame}");
             assert_eq!(line(&mut r).map(|f| f["op"].clone()), Some(Value::from("error")), "{tag}");
@@ -395,8 +400,8 @@ mod tests {
     #[test]
     fn bad_session_frames_and_eof() {
         let p = sock("late");
-        let (tx, rx) = async_channel::unbounded();
-        start_at(&p, me(), tx).unwrap();
+        let (tx, rx) = mpsc::channel();
+        start_at(&p, me(), sink(tx)).unwrap();
         for (tag, frame) in [
             ("op", "{\"op\":\"nope\",\"session\":CONN}"),
             ("serial", "{\"op\":\"mapped\",\"session\":CONN}"),

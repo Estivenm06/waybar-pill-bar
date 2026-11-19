@@ -51,7 +51,6 @@ impl ClockFormat {
         }
     }
     pub fn chrono_pattern(self) -> &'static str { if self.uses_12h() { "%I:%M %p" } else { "%H:%M" } }
-    pub fn waybar_pattern(self) -> &'static str { if self.uses_12h() { "{:%I:%M %p}" } else { "{:%H:%M}" } }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,7 +64,6 @@ pub struct AppearanceSettings {
     pub background: Option<String>,
     pub foreground: Option<String>,
     pub accent: Option<String>,
-    pub opacity: f64,
     pub font_family: Option<String>,
     pub font_size: u32,
     pub corner_radius: u32,
@@ -108,7 +106,6 @@ impl Default for NotchSettings {
                 background: None,
                 foreground: None,
                 accent: None,
-                opacity: 0.78,
                 font_family: None,
                 font_size: 12,
                 corner_radius: 22,
@@ -188,10 +185,6 @@ impl NotchSettings {
         };
         let output = n.get("monitor").and_then(|m| m.get("output")).and_then(Value::as_str)
             .filter(|s| !s.is_empty() && !s.chars().any(char::is_control)).map(str::to_string);
-        let opacity = match n.get("appearance").and_then(|a| a.get("opacity")).and_then(Value::as_f64) {
-            Some(o) if o.is_finite() => o.clamp(0.55, 1.0),
-            _ => d.appearance.opacity,
-        };
         let font_family = n.get("appearance").and_then(|a| a.get("font_family")).and_then(Value::as_str)
             .filter(|s| valid_font_family(s)).map(str::to_string);
         let clock_format = match n.get("behavior").and_then(|b| b.get("clock_format")).and_then(Value::as_str) {
@@ -205,7 +198,6 @@ impl NotchSettings {
                 background: color_at(n, "background"),
                 foreground: color_at(n, "foreground"),
                 accent: color_at(n, "accent"),
-                opacity,
                 font_family,
                 font_size: int_at(n, "appearance", "font_size", d.appearance.font_size, 10, 18),
                 corner_radius: int_at(n, "appearance", "corner_radius", d.appearance.corner_radius, 0, 40),
@@ -239,7 +231,7 @@ impl NotchSettings {
             },
             "appearance": {
                 "background": a.background, "foreground": a.foreground, "accent": a.accent,
-                "opacity": a.opacity, "font_family": a.font_family, "font_size": a.font_size,
+                "font_family": a.font_family, "font_size": a.font_size,
                 "corner_radius": a.corner_radius,
             },
             "layout": {
@@ -386,13 +378,13 @@ mod tests {
     #[test]
     fn missing_and_wrong_types_use_defaults_and_ranges_clamp() {
         let s = NotchSettings::from_json(&json!({"notch": {
-            "appearance": {"opacity": 0.1, "font_size": "big", "corner_radius": 999, "background": "red", "accent": "#aBc123",
+            "appearance": {"opacity": 0.78, "font_size": "big", "corner_radius": 999, "background": "red", "accent": "#aBc123",
                            "font_family": "bad\nfont"},
             "layout": {"expanded_width": 5000, "collapsed_width": 100.4, "top_margin": -3},
             "behavior": {"collapse_delay_ms": 50, "home_reset_secs": 0, "clock_format": "weird", "animations": "no"},
             "monitor": {"mode": "fixed", "output": ""},
         }}));
-        assert_eq!(s.appearance.opacity, 0.55);
+        assert!(s.to_json()["appearance"].get("opacity").is_none());
         assert_eq!(s.appearance.font_size, 12);
         assert_eq!(s.appearance.corner_radius, 40);
         assert_eq!(s.appearance.background, None);
@@ -424,6 +416,22 @@ mod tests {
         assert_eq!(u(json!(["lock", "settings", "lock", "dnd"])), ["lock", "dnd"]);
         assert!(u(json!([])).is_empty());
         assert_eq!(u(json!(5)), NotchSettings::default().utilities);
+    }
+
+    #[test]
+    fn legacy_opacity_is_ignored_and_preserved_on_save() {
+        let d = tmpdir("opacity");
+        let p = d.join("config.json");
+        std::fs::write(&p, r#"{"sentinel":1,"notch":{"appearance":{"opacity":0.78,"font_size":14,"future":"x"}}}"#).unwrap();
+        let doc = read_document_at(&p).unwrap();
+        let s = NotchSettings::from_json(&doc);
+        assert_eq!(s.appearance.font_size, 14);
+        assert!(s.to_json()["appearance"].get("opacity").is_none());
+        let patch = json!({"notch": {"appearance": {"font_size": 15}}});
+        save_patch_at(&p, patch.as_object().unwrap()).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["sentinel"], 1);
+        assert_eq!(v["notch"]["appearance"], json!({"opacity": 0.78, "font_size": 15, "future": "x"}));
     }
 
     #[test]

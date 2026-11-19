@@ -15,6 +15,9 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
+import contextlib
+import io
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "files", "scripts")
@@ -48,7 +51,18 @@ class Base(unittest.TestCase):
         self.addCleanup(os.umask, old_umask)
         os.environ.update(HOME=self.home, XDG_RUNTIME_DIR=self.rt,
                           XDG_STATE_HOME=os.path.join(self.home, ".local", "state"),
-                          XDG_CONFIG_HOME=os.path.join(self.home, ".config"))
+                          XDG_CONFIG_HOME=os.path.join(self.home, ".config"),
+                          XDG_DATA_HOME=os.path.join(self.home, ".local", "share"),
+                          XDG_CACHE_HOME=os.path.join(self.home, ".cache"))
+        fakebin = os.path.join(self.tmp, "desktop-stubs")
+        os.mkdir(fakebin)
+        for name in ("omarchy", "omarchy-shell", "systemctl", "busctl", "hyprctl",
+                     "notify-send", "pkill", "killall", "waybar"):
+            path = os.path.join(fakebin, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\nexit 1\n")
+            os.chmod(path, 0o755)
+        os.environ["PATH"] = fakebin + os.pathsep + os.environ["PATH"]
         self.h = load(os.path.join(SCRIPTS, "waybar-pill-plugin"), "pill_plugin_under_test")
 
     def restore_env(self):
@@ -69,13 +83,23 @@ class Base(unittest.TestCase):
             f.write(text)
         return p
 
+    def publish(self, path, content, mode="0644", run=None):
+        run = run or self.run_state
+        with tempfile.NamedTemporaryFile(dir=self.tmp, delete=False) as source:
+            source.write(content.encode() if isinstance(content, str) else content)
+        self.addCleanup(os.unlink, source.name)
+        result = run("prepare", path, source.name, mode)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run("publish", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 class Fixture(Base):
     """A fake Omarchy desktop whose state lives in files under the temporary HOME."""
 
     def setUp(self):
         super().setUp()
-        for rel in (".local/bin/waybar-notch", ".config/waybar/scripts/waybar-popupctl", ".config/waybar/config.jsonc"):
+        for rel in (".local/bin/waybar-notch", ".config/waybar/scripts/waybar-popupctl"):
             p = os.path.join(self.home, rel)
             os.makedirs(os.path.dirname(p), exist_ok=True)
             open(p, "w").close()
@@ -121,7 +145,7 @@ class Fixture(Base):
                 os.unlink(self.flag)
             return ok()
         if cmd[:2] == ["hyprctl", "layers"]:
-            return ok('[{"namespace": "waybar"}]')
+            return ok('[{"namespace": "waybar-notch"}]')
         if cmd[:2] == ["systemctl", "--user"]:
             return no  # nothing enabled/active
         return ok()
@@ -132,10 +156,8 @@ class Fixture(Base):
         self.argv.append(args)
         if self.child_exits and len(self.procs) == 1:
             p.wait()
-        if len(self.procs) == 2:
+        if len(self.procs) == 1:
             os.mkfifo(os.path.join(self.rt, "waybar-popupd.fifo"))
-            os.makedirs(os.path.join(self.rt, "waybar-notch"), exist_ok=True)
-            open(os.path.join(self.rt, "waybar-notch", "bar-control.sock"), "w").close()
             for name in ("notifications.sock", "notch-content.sock"):  # the notch's two listeners
                 listener = socket.socket(socket.AF_UNIX)
                 listener.bind(os.path.join(self.rt, "waybar-pill-plugin", name))
@@ -208,8 +230,8 @@ class SessionTests(Fixture):
         s = self.session()
         self.activate(s)
         self.assertEqual(self.relay_calls, 1)
-        self.assertEqual(self.argv[0][1:], ["--waybar-supervisor"])
-        self.assertEqual(self.argv[1][1:], ["--notification-relay", str(self.shell_pid)])
+        self.assertEqual(len(self.argv), 1, "one process draws the notch and the pills")
+        self.assertEqual(self.argv[0][1:], ["--notification-relay", str(self.shell_pid)])
         self.assertTrue(s.active)
         socks = [os.path.join(self.rt, "waybar-pill-plugin", n) for n in ("notifications.sock", "notch-content.sock")]
         for sock in socks:
@@ -234,8 +256,8 @@ class SessionTests(Fixture):
 
     def test_child_exit_during_relay_handshake_rolls_back(self):
         def die():
-            self.procs[1].kill()
-            self.procs[1].wait()
+            self.procs[0].kill()
+            self.procs[0].wait()
         s = self.session()
         with self.assertRaises(self.h.PluginError):
             s.activate(self.shell_pid, die)
@@ -298,7 +320,7 @@ class SessionTests(Fixture):
         before = self.get_shell()
         with self.assertRaises(self.h.PluginError) as cm:
             self.activate(self.session())
-        self.assertIn("run ./install.sh in", str(cm.exception))
+        self.assertIn("not provisioned", str(cm.exception))
         self.assertNotIn("--plugin", str(cm.exception))
         self.assertEqual(self.get_shell(), before)
         self.assertFalse(os.path.exists(self.h.journal_path()))
@@ -333,9 +355,11 @@ class SessionTests(Fixture):
 
 
 class ServeTests(Fixture):
-    def start_server(self):
+    def start_server(self, provisioner=None):
         self.rc = []
-        t = threading.Thread(target=lambda: self.rc.append(self.h.serve(self.runner, self.popen)))
+        self.state = types.SimpleNamespace(uninstall=lambda *args, **kw: 0)
+        t = threading.Thread(target=lambda: self.rc.append(
+            self.h.serve(self.runner, self.popen, state=self.state, provisioner=provisioner)))
         t.start()
         self.addCleanup(t.join, 10)
         for _ in range(100):
@@ -346,9 +370,12 @@ class ServeTests(Fixture):
 
     def lease(self, ack=True):
         c = socket.socket(socket.AF_UNIX)
+        c.settimeout(5)
         c.connect(os.path.join(self.rt, "waybar-pill-plugin", "control.sock"))
+        self.addCleanup(c.close)
         c.sendall(b'{"op":"lease"}\n')
         f = c.makefile()
+        self.addCleanup(f.close)
         if ack:
             self.assertEqual(json.loads(f.readline())["stage"], "connect-relay")
             c.sendall(b'{"op":"relay-ready","version":1}\n')
@@ -358,12 +385,12 @@ class ServeTests(Fixture):
         t = self.start_server()
         c, f = self.lease()
         self.assertTrue(json.loads(f.readline())["active"])
-        self.assertEqual(len(self.procs), 2)
+        self.assertEqual(len(self.procs), 1)
         self.assertTrue(self.h.request("active")["active"])
         c2, f2 = self.lease(ack=False)
         self.assertFalse(json.loads(f2.readline())["ok"])
         self.assertEqual(self.h.serve(self.runner, self.popen), 0)  # lock held: no second pair
-        self.assertEqual(len(self.procs), 2)
+        self.assertEqual(len(self.procs), 1)
         f.close()
         c.close()  # plugin disabled / shell crashed
         t.join(10)
@@ -381,6 +408,122 @@ class ServeTests(Fixture):
         t.join(10)
         self.assertFalse(t.is_alive())
         self.assertTrue(all(p.poll() is not None for p in self.procs))
+
+    def test_provision_waits_for_lease_and_answers_probes_until_cancelled(self):
+        entered = threading.Event()
+        cancelled = threading.Event()
+
+        def provisioner(ctl):
+            entered.set()
+            try:
+                while True:
+                    ctl.pump(0.01)
+            finally:
+                cancelled.set()
+
+        t = self.start_server(provisioner)
+        self.assertFalse(entered.is_set())
+        self.assertEqual(self.h.request("active"), {"ok": True, "active": False})
+        c, f = self.lease(ack=False)
+        self.assertEqual(json.loads(f.readline())["stage"], "provisioning")
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(self.h.request("active"), {"ok": True, "active": False})
+        self.assertFalse(self.h.request("reload")["ok"])
+        c2, f2 = self.lease(ack=False)
+        self.assertFalse(json.loads(f2.readline())["ok"])
+        self.assertEqual(self.procs, [])
+        self.assertEqual(self.get_shell()["disabledPlugins"], [])
+        self.assertFalse(os.path.exists(self.flag))
+        f.close()
+        c.close()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(self.rc, [0])
+
+    def test_stop_cancels_provisioning_without_activating_desktop(self):
+        def provisioner(ctl):
+            while True:
+                ctl.pump(0.01)
+
+        t = self.start_server(provisioner)
+        c, f = self.lease(ack=False)
+        self.assertEqual(json.loads(f.readline())["stage"], "provisioning")
+        self.assertTrue(self.h.request("stop")["ok"])
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(self.procs, [])
+        self.assertEqual(self.get_shell()["disabledPlugins"], [])
+        self.assertFalse(os.path.exists(self.h.journal_path()))
+
+    def test_successful_provision_precedes_relay_and_activation(self):
+        calls = []
+        t = self.start_server(lambda ctl: calls.append("provisioned"))
+        c, f = self.lease(ack=False)
+        self.assertEqual(json.loads(f.readline())["stage"], "provisioning")
+        self.assertEqual(json.loads(f.readline())["stage"], "connect-relay")
+        c.sendall(b'{"op":"relay-ready","version":1}\n')
+        self.assertTrue(json.loads(f.readline())["active"])
+        self.assertEqual(calls, ["provisioned"])
+        f.close()
+        c.close()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+
+
+class GenerationTests(Base):
+    def test_generation_survives_checkout_removal_and_reuses_identical_bytes(self):
+        checkout = os.path.join(self.tmp, "checkout")
+        os.mkdir(checkout)
+        for rel in ("manifest.json", *self.h.CHECKOUT_FILES):
+            path = os.path.join(checkout, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            shutil.copyfile(os.path.join(ROOT, rel), path)
+        files = self.h.validate_checkout(checkout)
+        generation = self.h.stage_generation(files)
+        self.assertTrue(generation.startswith(os.environ["XDG_DATA_HOME"] + os.sep))
+        self.assertEqual(stat.S_IMODE(os.stat(generation).st_mode), 0o700)
+        shutil.rmtree(checkout)
+        self.assertEqual(self.h.stage_generation(files), generation)
+        helper = load(os.path.join(generation, "scripts", "waybar-pill-plugin"), "durable_bridge")
+        state = helper.load_state_module()
+        self.assertEqual(state.validate(), 0)
+        self.assertFalse(any(n.startswith(".stage.") for n in os.listdir(self.h.lifecycle_dir())))
+
+    def test_modified_generation_is_refused_not_repaired(self):
+        files = self.h.validate_checkout(ROOT)
+        generation = self.h.stage_generation(files)
+        path = os.path.join(generation, "scripts", "waybar-pill-plugin")
+        os.chmod(path, 0o600)
+        with open(path, "wb") as f:
+            f.write(b"foreign edit")
+        with self.assertRaises(self.h.PluginError):
+            self.h.stage_generation(files)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"foreign edit")
+
+    def test_failed_generation_publication_leaves_no_partial_generation(self):
+        files = self.h.validate_checkout(ROOT)
+        with mock.patch.object(self.h.os, "rename", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                self.h.stage_generation(files)
+        self.assertEqual(os.listdir(self.h.lifecycle_dir()), [])
+        self.assertTrue(os.path.isdir(self.h.stage_generation(files)))
+
+    def test_cancelled_provision_terminates_only_its_tracked_process_group(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        ctl = mock.Mock()
+        ctl.pump.side_effect = self.h.Cancelled("lease closed")
+        with mock.patch.object(self.h, "validate_checkout"), \
+                mock.patch.object(self.h.subprocess, "Popen", return_value=proc) as spawn, \
+                mock.patch.object(self.h, "terminate_group") as terminate:
+            with self.assertRaises(self.h.Cancelled):
+                self.h.provision(self.tmp, ctl)
+        terminate.assert_called_once_with(proc)
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        self.assertEqual(spawn.call_args.args[0], ["bash", os.path.join(self.tmp, "install.sh"), "--provision"])
+        self.assertEqual(spawn.call_args.kwargs["env"]["WAYBAR_PILL_SESSION"], "1")
 
 
 class RuntimeTests(Base):
@@ -559,15 +702,15 @@ class InstallRecordTests(Base):
         os.chmod(old, 0o640)
         os.utime(old, (1_000_000_000, 1_000_000_000))
         self.assertEqual(self.run_state("begin", old, new).returncode, 0)
-        os.makedirs(os.path.dirname(new), exist_ok=True)
-        for p, t in ((old, "managed"), (new, "script")):
-            with open(p, "w") as f:
-                f.write(t)
+        for p, text in ((old, "managed"), (new, "script")):
+            self.publish(p, text)
         self.assertEqual(self.run_state("finish").returncode, 0)
-        # second setup: the original baseline must not become "managed"
+        self.assertNotEqual(self.run_state("begin", old, new).returncode, 0)
+        self.assertEqual(self.run_state("uninstall").returncode, 0)
+        # A fresh setup starts only after the first baseline has been restored.
         self.assertEqual(self.run_state("begin", old, new).returncode, 0)
-        with open(old, "w") as f:
-            f.write("managed v2")
+        self.publish(old, "managed v2")
+        self.publish(new, "script v2")
         self.assertEqual(self.run_state("finish").returncode, 0)
         r = self.run_state("uninstall")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -586,9 +729,7 @@ class InstallRecordTests(Base):
         os.chmod(old, mode)
         os.utime(old, (1_000_000_000, 1_000_000_000))
         self.assertEqual(self.run_state("begin", old).returncode, 0)
-        with open(old, "wb") as f:
-            f.write(b"managed")
-        os.chmod(old, 0o644)
+        self.publish(old, b"managed")
         self.assertEqual(self.run_state("finish").returncode, 0)
         mod = load(STATEPY, "plugin_state_under_test")
         mod.active_session = lambda: False
@@ -638,10 +779,10 @@ class InstallRecordTests(Base):
                 old, mod = self._managed()
                 with open(self.h.marker_path()) as f:
                     record = f.read()
-                with um.patch.object(getattr(mod, module), name, fake):
-                    with self.assertRaises(mod.PluginError) as cm:
-                        mod.uninstall()
-                self.assertNotIn("mine", str(cm.exception))
+                errors = io.StringIO()
+                with um.patch.object(getattr(mod, module), name, fake), contextlib.redirect_stderr(errors):
+                    self.assertNotEqual(mod.uninstall(), 0)
+                self.assertNotIn("mine", errors.getvalue())
                 with open(old, "rb") as f:
                     self.assertEqual(f.read(), b"managed")
                 self.assertEqual(stat.S_IMODE(os.stat(old).st_mode), 0o644)
@@ -666,8 +807,8 @@ class InstallRecordTests(Base):
     def test_modified_owned_file_blocks_uninstall_and_keeps_everything(self):
         f1 = os.path.join(self.home, ".config", "waybar", "style.css")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
-        self.place(".config/waybar/style.css", "ours")
-        self.run_state("finish")
+        self.publish(f1, "ours")
+        self.assertEqual(self.run_state("finish").returncode, 0)
         with open(f1, "w") as f:
             f.write("user edit")
         r = self.run_state("uninstall")
@@ -677,24 +818,22 @@ class InstallRecordTests(Base):
             self.assertEqual(f.read(), "user edit")
         self.assertTrue(os.path.exists(self.h.marker_path()))
 
-    def test_rebuilt_binary_and_regenerated_theme_do_not_block_resetup_or_uninstall(self):
+    def test_registered_rebuild_and_regenerated_theme_allow_uninstall_and_fresh_setup(self):
         binary = os.path.join(self.home, ".local", "bin", "waybar-notch")
         theme = os.path.join(self.home, ".config", "waybar", "pill-theme.css")
         style = os.path.join(self.home, ".config", "waybar", "style.css")
-        self.assertEqual(self.run_state("begin", binary, theme, style).returncode, 0)
-        for rel in (".local/bin/waybar-notch", ".config/waybar/pill-theme.css", ".config/waybar/style.css"):
-            self.place(rel, "ours")
-        self.assertEqual(self.run_state("finish").returncode, 0)
-        for p in (binary, theme):  # a rebuild and a theme change after setup
-            with open(p, "w") as f:
-                f.write("rebuilt or regenerated")
-        self.assertEqual(self.run_state("begin", binary, theme, style).returncode, 0)
-        self.place(".local/bin/waybar-notch", "ours again")
-        self.place(".config/waybar/pill-theme.css", "ours again")
-        self.run_state("finish")
-        for p in (binary, theme):
-            with open(p, "w") as f:
-                f.write("changed again")
+        for content in ("ours", "ours again"):
+            self.assertEqual(self.run_state("begin", binary, theme, style).returncode, 0)
+            for path in (binary, theme, style):
+                self.publish(path, content)
+            self.assertEqual(self.run_state("finish").returncode, 0)
+            for path in (binary, theme):
+                with open(path, "w") as f:
+                    f.write("rebuilt or regenerated")
+            self.h.record_generated_files([binary, theme])
+            self.assertNotEqual(self.run_state("begin", binary, theme, style).returncode, 0)
+            result = self.run_state("uninstall")
+            self.assertEqual(result.returncode, 0, result.stderr)
         r = self.run_state("uninstall")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(os.path.exists(binary) or os.path.exists(theme))
@@ -703,11 +842,74 @@ class InstallRecordTests(Base):
     def test_resetup_refuses_to_overwrite_user_edits(self):
         f1 = os.path.join(self.home, ".config", "waybar", "style.css")
         self.run_state("begin", f1)
-        self.place(".config/waybar/style.css", "ours")
-        self.run_state("finish")
+        self.publish(f1, "ours")
+        self.assertEqual(self.run_state("finish").returncode, 0)
         with open(f1, "w") as f:
             f.write("user edit")
         self.assertNotEqual(self.run_state("begin", f1).returncode, 0)
+
+    def test_interruption_at_each_install_boundary_can_restore_then_retry(self):
+        old = self.place(".config/waybar/style.css", "original")
+        new = os.path.join(self.home, ".config", "waybar", "config.jsonc")
+        source = self.place("stage", "managed")
+        for boundary in ("begin", "prepare", "publish", "finish"):
+            with self.subTest(boundary=boundary):
+                self.assertEqual(self.run_state("begin", old, new).returncode, 0)
+                if boundary != "begin":
+                    for path in (old, new):
+                        self.assertEqual(self.run_state("prepare", path, source, "0644").returncode, 0)
+                if boundary in ("publish", "finish"):
+                    self.assertEqual(self.run_state("publish", old).returncode, 0)
+                if boundary == "finish":
+                    self.assertEqual(self.run_state("publish", new).returncode, 0)
+                    self.assertEqual(self.run_state("finish").returncode, 0)
+                self.assertNotEqual(self.run_state("begin", old, new).returncode, 0)
+                result = self.run_state("uninstall")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(old) as f:
+                    self.assertEqual(f.read(), "original")
+                self.assertFalse(os.path.exists(new))
+                self.assertFalse(os.path.exists(self.h.marker_path()))
+
+    def test_finish_never_adopts_unprepared_or_changed_bytes(self):
+        path = self.place(".config/waybar/style.css", "original")
+        self.assertEqual(self.run_state("begin", path).returncode, 0)
+        self.assertNotEqual(self.run_state("finish").returncode, 0)
+        self.publish(path, "managed")
+        marker = self.h.read_marker()
+        with open(path, "w") as f:
+            f.write("user edit")
+        self.assertNotEqual(self.run_state("finish").returncode, 0)
+        self.assertNotEqual(self.run_state("publish", path).returncode, 0)
+        self.assertEqual(self.h.read_marker(), marker)
+        with open(path) as f:
+            self.assertEqual(f.read(), "user edit")
+
+    def test_lua_outside_edits_survive_but_block_edits_stop_all_restoration(self):
+        original = "-- user config\n"
+        block = "-- >>> waybar-pill-bar BEGIN (managed block) >>>\nmanaged()\n-- <<< waybar-pill-bar END <<<\n"
+        path = self.place(".config/hypr/bindings.lua", original)
+        other = self.place(".config/waybar/style.css", "original style")
+        self.assertEqual(self.run_state("begin", path, other).returncode, 0)
+        self.publish(path, original + "\n" + block, "0640")
+        self.publish(other, "managed style")
+        self.assertEqual(self.run_state("finish").returncode, 0)
+        edited = "-- outside edit\n" + original + "\n" + block.replace("managed()", "user_change()")
+        with open(path, "w") as f:
+            f.write(edited)
+        result = self.run_state("uninstall")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("block", result.stderr)
+        with open(path) as f:
+            self.assertEqual(f.read(), edited)
+        with open(other) as f:
+            self.assertEqual(f.read(), "managed style")
+        with open(path, "w") as f:
+            f.write("-- outside edit\n" + original + "\n" + block)
+        self.assertEqual(self.run_state("uninstall").returncode, 0)
+        with open(path) as f:
+            self.assertEqual(f.read(), "-- outside edit\n" + original)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
 
     def test_standalone_install_blocks_plugin_setup(self):
         lua = os.path.join(self.home, ".config", "hypr", "autostart.lua")
@@ -718,6 +920,140 @@ class InstallRecordTests(Base):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("Legacy standalone files detected", r.stderr)
         self.assertFalse(os.path.exists(self.h.marker_path()))
+
+
+class RetentionFixture(Base):
+    """Real prepared/published files with no desktop or user-checkout dependencies."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = load(STATEPY, "retention_state")
+        self.checkout = os.path.join(self.tmp, "retention checkout")
+        for rel in ("manifest.json", *self.h.CHECKOUT_FILES):
+            target = os.path.join(self.checkout, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(os.path.join(ROOT, rel), target)
+        self.shell = self.place(".config/omarchy/shell.json", json.dumps({
+            "plugins": [{"id": "waybar.pill-bar"}], "disabledPlugins": [],
+        }))
+        plugin = ".config/omarchy/plugins/io.github.ricky.whatsapp/"
+        self.panel = self.place(plugin + "Panel.qml", "stock panel\n")
+        self.widget = self.place(plugin + "BarWidget.qml", "stock widget\n")
+        self.anchor = os.path.join(self.home, plugin, "WaybarPillAnchor.qml")
+        self.style = self.place(".config/waybar/style.css", "stock style\n")
+        self.adapters = (self.panel, self.widget, self.anchor)
+        self.paths = (*self.adapters, self.style)
+        os.chmod(self.panel, 0o640)
+        os.utime(self.panel, (1_000_000_000, 1_000_000_000))
+        self.assertEqual(self.state.begin(self.paths), 0)
+        for path in self.paths:
+            self.publish(path, "managed " + os.path.basename(path))
+        self.assertEqual(self.state.finish(), 0)
+        self.original_record = self.h.read_marker()
+
+    def run_state(self, *args):
+        return subprocess.run([sys.executable, STATEPY, *args], capture_output=True, text=True,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+
+    def read_text(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def cleanup_session(self, checkout=True):
+        runner = lambda cmd: subprocess.CompletedProcess(cmd, 0, "", "")
+        kwargs = {"checkout": self.checkout} if checkout else {}
+        session = self.h.Session(runner=runner, state=self.state, **kwargs)
+        session.cleanup()
+        return session
+
+    def assert_retained(self):
+        self.assertEqual(self.read_text(self.style), "stock style\n")
+        for path in self.adapters:
+            self.assertEqual(self.read_text(path), "managed " + os.path.basename(path))
+        record = self.h.read_marker()
+        self.assertEqual({e["path"] for e in record["files"]}, set(self.adapters))
+        self.assertEqual(record["backup_dir"], self.original_record["backup_dir"])
+
+    def assert_stock(self):
+        self.assertEqual(self.read_text(self.panel), "stock panel\n")
+        self.assertEqual(self.read_text(self.widget), "stock widget\n")
+        self.assertEqual(self.read_text(self.style), "stock style\n")
+        self.assertFalse(os.path.exists(self.anchor))
+        self.assertIsNone(self.h.read_marker())
+        self.assertFalse(os.path.exists(self.original_record["backup_dir"]))
+        info = os.stat(self.panel)
+        self.assertEqual((stat.S_IMODE(info.st_mode), int(info.st_mtime)), (0o640, 1_000_000_000))
+
+
+class AdapterRetentionTests(RetentionFixture):
+    def test_enabled_shell_restart_retains_only_adapter_files(self):
+        session = self.cleanup_session()
+        self.assert_retained()
+        session.cleanup()
+        self.assert_retained()
+
+    def test_next_begin_publish_preserves_original_stock_and_backups(self):
+        self.cleanup_session()
+        self.assert_retained()
+        self.assertEqual(self.state.begin(self.paths), 0)
+        for path in self.paths:
+            self.publish(path, "managed second generation")
+        self.assertEqual(self.state.finish(self.paths), 0)
+        self.assertEqual(self.h.read_marker()["backup_dir"], self.original_record["backup_dir"])
+        self.assertEqual(self.state.uninstall(active_check=False), 0)
+        self.assert_stock()
+
+    def test_session_without_checkout_always_fully_restores(self):
+        self.cleanup_session(checkout=False)
+        self.assert_stock()
+
+    def test_explicit_recover_restores_retained_stock_while_enabled(self):
+        self.cleanup_session()
+        self.assert_retained()
+        result = subprocess.run([sys.executable, os.path.join(SCRIPTS, "waybar-pill-plugin"), "recover"],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_stock()
+
+    def test_modified_retained_adapter_is_unchanged_during_nonadapter_provision(self):
+        self.cleanup_session()
+        with open(self.panel, "w") as f:
+            f.write("user adapter edit\n")
+        record = self.h.read_marker()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertNotEqual(self.state.begin(self.paths), 0)
+        self.assertEqual(self.h.read_marker(), record)
+        self.assertEqual(self.state.begin([self.style]), 0)
+        self.publish(self.style, "second style")
+        self.assertEqual(self.state.finish([self.style]), 0)
+        self.assertEqual(self.read_text(self.panel), "user adapter edit\n")
+        self.assertEqual(self.read_text(self.style), "second style")
+        self.assertEqual(self.state.uninstall(active_check=False, retain_adapter=True), 0)
+        self.assertEqual(self.read_text(self.style), "stock style\n")
+        self.assertEqual(self.read_text(self.panel), "user adapter edit\n")
+        self.assertIn(self.panel, {e["path"] for e in self.h.read_marker()["files"]})
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertNotEqual(self.state.uninstall(active_check=False), 0)
+        self.assertEqual(self.read_text(self.panel), "user adapter edit\n")
+
+    def test_interrupted_retention_record_write_can_retry_cleanup(self):
+        write_record = self.state.helper.write_state_json
+
+        def interrupted(path, record):
+            if path == self.h.marker_path() and {e["path"] for e in record["files"]} == set(self.adapters):
+                raise OSError("interrupted retention")
+            return write_record(path, record)
+
+        with mock.patch.object(self.state.helper, "write_state_json", side_effect=interrupted):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertNotEqual(self.state.uninstall(active_check=False, retain_adapter=True), 0)
+        self.assertEqual(self.read_text(self.style), "stock style\n")
+        for path in self.adapters:
+            self.assertEqual(self.read_text(path), "managed " + os.path.basename(path))
+        self.assertEqual(self.state.uninstall(active_check=False, retain_adapter=True), 0)
+        self.assert_retained()
+        self.assertEqual(self.state.uninstall(active_check=False), 0)
+        self.assert_stock()
 
 
 class InstallBackupPrivacyTests(Base):
@@ -744,9 +1080,8 @@ class InstallBackupPrivacyTests(Base):
             os.umask(env_umask)
         root = self.backup_dir()
         self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
-        with open(src, "w") as f:
-            f.write("managed")
-        self.run_state("finish")
+        self.publish(src, "managed")
+        self.assertEqual(self.run_state("finish").returncode, 0)
         r = self.run_state("uninstall")
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(src) as f:
@@ -754,17 +1089,16 @@ class InstallBackupPrivacyTests(Base):
         self.assertEqual(stat.S_IMODE(os.stat(src).st_mode), 0o644)
         self.assertEqual(stat.S_IMODE(os.stat(priv).st_mode), 0o700, "the private source directory is never widened")
 
-    def test_recorded_loose_root_is_tightened_before_reuse(self):
+    def test_recorded_loose_root_is_tightened_before_prepare(self):
         f1 = self.place(".config/waybar/config.jsonc", "x")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
         root = self.backup_dir()
         os.chmod(root, 0o755)
-        f2 = self.place(".config/waybar/style.css", "y")
-        self.assertEqual(self.run_state("begin", f2).returncode, 0)
+        self.publish(f1, "managed")
         self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
 
     def test_symlinked_or_missing_recorded_root_is_rejected_untouched(self):
-        f1 = os.path.join(self.home, ".config", "waybar", "config.jsonc")
+        f1 = self.place(".config/waybar/config.jsonc", "original")
         self.assertEqual(self.run_state("begin", f1).returncode, 0)
         root = self.backup_dir()
         with open(self.h.marker_path()) as f:
@@ -773,11 +1107,11 @@ class InstallBackupPrivacyTests(Base):
         os.mkdir(victim, 0o755)
         shutil.rmtree(root)
         os.symlink(victim, root)
-        r = self.run_state("begin", os.path.join(self.home, ".config", "waybar", "style.css"))
+        r = self.run_state("uninstall")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o755)
         os.unlink(root)
-        r = self.run_state("begin", os.path.join(self.home, ".config", "waybar", "style.css"))
+        r = self.run_state("uninstall")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("missing", r.stderr)
         with open(self.h.marker_path()) as f:
@@ -829,10 +1163,8 @@ class RecordAttackTests(Base):
         self.created = os.path.join(self.home, ".config", "waybar", "style.css")
         self.script = os.path.join(self.home, ".config", "waybar", "scripts", "waybar-app.sh")
         self.assertEqual(self.state("begin", self.orig, self.created, self.script).returncode, 0)
-        os.makedirs(os.path.dirname(self.script))
         for p in (self.orig, self.created, self.script):
-            with open(p, "w") as f:
-                f.write("managed " + os.path.basename(p))
+            self.publish(p, "managed " + os.path.basename(p), run=self.state)
         self.assertEqual(self.state("finish").returncode, 0)
         self.root = self.h.read_marker()["backup_dir"]
         with open(self.h.marker_path()) as f:
@@ -1056,8 +1388,7 @@ class RecordAttackTests(Base):
         with open(panel, "w") as f:
             f.write("stock")
         self.assertEqual(run("begin", panel).returncode, 0)
-        with open(panel, "w") as f:
-            f.write("patched")
+        self.publish(panel, "patched", run=run)
         self.assertEqual(run("finish").returncode, 0)
         self.assertEqual(run("validate").returncode, 0)
         self.assertEqual(run("uninstall").returncode, 0)

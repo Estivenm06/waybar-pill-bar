@@ -1,58 +1,13 @@
-//! Compositor state shared by every notch surface: Hyprland IPC, the monitor/fullscreen snapshot, the single
-//! output-selection policy and the layer-window geometry derived from a monitor's logical size.
+//! Compositor state shared by every surface: the Hyprland monitor/workspace/fullscreen snapshot (`Desk`), the
+//! output-selection policy, the notch window geometry derived from a monitor's logical size and the watcher that
+//! keeps `State::desk` and `State::apps` current (`start`).
 use crate::config::{MonitorMode, NotchSettings};
-use crate::{runtime_dir, Msg};
-use gtk4::{gdk, prelude::*};
+use crate::hypr;
+use crate::wayland::Poster;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
-
-// ------------------------------------------------------------------ hyprland sockets
-
-const REQ_TIMEOUT: Duration = Duration::from_millis(800);
-
-/// Connects to the live instance's socket (`.socket.sock` / `.socket2.sock`). `$HYPRLAND_INSTANCE_SIGNATURE` is tried
-/// first, then every instance directory newest-first; a directory only counts if its socket accepts a connection
-/// (a crashed compositor leaves its directory behind).
-pub(crate) fn hypr_open(sock: &str) -> Option<(String, UnixStream)> {
-    let rt = runtime_dir();
-    let try_sig = |sig: &str| UnixStream::connect(format!("{rt}/hypr/{sig}/{sock}")).ok().map(|s| (sig.to_string(), s));
-    if let Some(found) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().filter(|s| !s.is_empty()).and_then(|s| try_sig(&s)) {
-        return Some(found);
-    }
-    let mut ents: Vec<_> = std::fs::read_dir(format!("{rt}/hypr")).ok()?.flatten().collect();
-    ents.sort_by_key(|e| std::cmp::Reverse(e.metadata().and_then(|m| m.modified()).ok()));
-    ents.iter().find_map(|e| try_sig(&e.file_name().to_string_lossy()))
-}
-
-/// Signature of the live Hyprland instance, if one answers.
-pub fn hypr_sig() -> Option<String> {
-    hypr_open(".socket.sock").map(|(s, _)| s)
-}
-
-pub fn hypr_req(cmd: &str) -> Option<String> {
-    let (_, mut s) = hypr_open(".socket.sock")?;
-    s.set_read_timeout(Some(REQ_TIMEOUT)).ok()?;
-    s.set_write_timeout(Some(REQ_TIMEOUT)).ok()?;
-    s.write_all(cmd.as_bytes()).ok()?;
-    let mut out = String::new();
-    s.read_to_string(&mut out).ok()?;
-    Some(out)
-}
-
-fn hypr_json(cmd: &str) -> Result<Value, String> {
-    let text = hypr_req(cmd).ok_or_else(|| format!("hyprland request {cmd} failed"))?;
-    serde_json::from_str(&text).map_err(|e| format!("hyprland {cmd}: {e}"))
-}
-
-pub fn gdk_monitor_by_name(name: &str) -> Option<gdk::Monitor> {
-    let mons = gdk::Display::default()?.monitors();
-    (0..mons.n_items())
-        .filter_map(|i| mons.item(i).and_then(|o| o.downcast::<gdk::Monitor>().ok()))
-        .find(|m| m.connector().as_deref() == Some(name))
-}
 
 // ------------------------------------------------------------------ snapshot
 
@@ -124,9 +79,76 @@ pub fn parse_snapshot(monitors: &Value, clients: &Value) -> DesktopSnapshot {
     DesktopSnapshot { monitors: mons, fullscreen_outputs: fs }
 }
 
-/// Blocking (call off the GTK thread).
-pub fn query_snapshot() -> Result<DesktopSnapshot, String> {
-    Ok(parse_snapshot(&hypr_json("j/monitors")?, &hypr_json("j/clients")?))
+/// One Hyprland workspace (`j/workspaces`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Workspace {
+    pub id: i64,
+    pub name: String,
+    /// Connector the workspace lives on.
+    pub monitor: String,
+    pub windows: u32,
+}
+
+/// Pure: `j/workspaces` document. Entries without an id or monitor are dropped.
+pub fn parse_workspaces(doc: &Value) -> Vec<Workspace> {
+    let mut out: Vec<Workspace> = doc.as_array().map(Vec::as_slice).unwrap_or(&[]).iter().filter_map(|w| {
+        let id = w["id"].as_i64()?;
+        let monitor = w["monitor"].as_str()?.to_string();
+        Some(Workspace { id, name: w["name"].as_str().unwrap_or("").to_string(), monitor, windows: w["windows"].as_u64().unwrap_or(0) as u32 })
+    }).collect();
+    out.sort_by_key(|w| w.id);
+    out
+}
+
+/// A workspace button of one output's pill.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WsButton {
+    pub id: i64,
+    pub active: bool,
+}
+
+/// What the compositor reports; replaced wholesale by the watcher whenever anything changed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Desk {
+    pub snap: DesktopSnapshot,
+    /// Connector of the focused monitor.
+    pub focused: Option<String>,
+    pub workspaces: Vec<Workspace>,
+    /// A screenshot freeze/selection surface (`hyprpicker`, `selection`) is on screen.
+    pub capture_active: bool,
+}
+
+impl Desk {
+    pub fn is_fullscreen(&self, output: &str) -> bool { self.snap.fullscreen_outputs.contains(output) }
+
+    /// Numbered workspaces of `output` (special workspaces have negative ids) by id; the visible one is `active`
+    /// and is listed even while empty.
+    pub fn workspace_buttons(&self, output: &str) -> Vec<WsButton> {
+        let active = self.snap.monitor(output).map(|m| m.active_workspace);
+        let mut v: Vec<WsButton> = self.workspaces.iter()
+            .filter(|w| w.monitor == output && w.id > 0 && (w.windows > 0 || Some(w.id) == active))
+            .map(|w| WsButton { id: w.id, active: Some(w.id) == active })
+            .collect();
+        if let Some(a) = active.filter(|a| *a > 0 && !v.iter().any(|b| b.id == *a)) {
+            v.push(WsButton { id: a, active: true });
+            v.sort_by_key(|b| b.id);
+        }
+        v
+    }
+}
+
+fn focused_name(snap: &DesktopSnapshot) -> Option<String> {
+    snap.monitors.iter().find(|m| m.focused).map(|m| m.name.clone())
+}
+
+/// Blocking (call off the UI thread). `clients` is returned too so the app tracker can reuse it.
+pub fn query_desk() -> Result<(Desk, Value), String> {
+    let clients = hypr::json("j/clients")?;
+    let snap = parse_snapshot(&hypr::json("j/monitors")?, &clients);
+    let workspaces = parse_workspaces(&hypr::json("j/workspaces")?);
+    // a malformed layer dump keeps the screenshot flag off rather than failing the whole snapshot
+    let capture_active = hypr::json("j/layers").ok().as_ref().and_then(capture_active).unwrap_or(false);
+    Ok((Desk { focused: focused_name(&snap), snap, workspaces, capture_active }, clients))
 }
 
 /// Which output hosts the notch and the side pills. Precedence: a live interaction pin, a connected fixed output,
@@ -140,43 +162,6 @@ pub fn select_output(snap: &DesktopSnapshot, prefs: &NotchSettings, pin: Option<
     if let Some(m) = snap.monitors.iter().find(|m| m.focused) { return Some(m.name.clone()); }
     if let Some(p) = previous.filter(|p| has(p)) { return Some(p.to_string()); }
     snap.monitors.iter().map(|m| &m.name).min().cloned()
-}
-
-// ------------------------------------------------------------------ geometry
-
-/// Room around the expanded card for the open spring.
-pub const HEADROOM: f64 = 1.12;
-const SCREEN_MARGIN: f64 = 16.0;
-
-/// Notch sizes for one monitor: the user's request capped to what the output can show.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Geometry {
-    pub coll_w: f64,
-    pub coll_h: f64,
-    pub exp_w: f64,
-    pub exp_h_max: f64,
-    pub top_margin: i32,
-}
-
-impl Geometry {
-    pub fn compute(l: &crate::config::LayoutSettings, logical: Option<(f64, f64)>) -> Geometry {
-        let (lw, lh) = logical.unwrap_or((1.0e6, 1.0e6));
-        let top = l.top_margin as f64;
-        let avail_w = (lw - SCREEN_MARGIN).max(1.0);
-        let avail_h = (lh - top - SCREEN_MARGIN).max(1.0);
-        Geometry {
-            coll_w: (l.collapsed_width as f64).min(avail_w),
-            coll_h: (l.collapsed_height as f64).min(avail_h),
-            exp_w: (l.expanded_width as f64).min(avail_w / HEADROOM),
-            exp_h_max: avail_h / HEADROOM,
-            top_margin: l.top_margin as i32,
-        }
-    }
-
-    /// Layer-window size for an expanded card of natural height `th`.
-    pub fn host(&self, th: f64) -> (i32, i32) {
-        ((self.exp_w * HEADROOM).floor() as i32, (th.min(self.exp_h_max) * HEADROOM).floor() as i32)
-    }
 }
 
 // ------------------------------------------------------------------ event worker
@@ -205,56 +190,93 @@ fn relevant_event(line: &str) -> bool {
     line.split(">>").next().is_some_and(|name| EVENTS.contains(&name))
 }
 
-/// Publishes `Msg::Desktop` whenever the authoritative snapshot changes. Subscribes to the event socket before the
-/// initial query so no startup event is lost; a failed query keeps the last good snapshot.
-pub fn start_watcher(tx: async_channel::Sender<Msg>) {
-    std::thread::spawn(move || {
-        let mut last: Option<DesktopSnapshot> = None;
-        let mut last_capture: Option<bool> = None;
-        let publish = |last: &mut Option<DesktopSnapshot>| {
-            if let Ok(s) = query_snapshot() {
-                if last.as_ref() != Some(&s) {
-                    *last = Some(s.clone());
-                    let _ = tx.try_send(Msg::Desktop(s));
-                }
-            }
-        };
-        let publish_capture = |last: &mut Option<bool>| {
-            if let Some(c) = hypr_json("j/layers").ok().as_ref().and_then(capture_active) {
-                if *last != Some(c) {
-                    *last = Some(c);
-                    let _ = tx.try_send(Msg::CaptureActive(c));
-                }
-            }
-        };
-        loop {
-            if let Some((_, stream)) = hypr_open(".socket2.sock") {
-                let (etx, erx) = std::sync::mpsc::channel::<String>();
-                std::thread::spawn(move || {
-                    for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                        if relevant_event(&line) && etx.send(line).is_err() { break; }
-                    }
-                });
-                publish_capture(&mut last_capture);
-                publish(&mut last);
-                loop {
-                    match erx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(first) => {
-                            let layer = |l: &str| l.starts_with("openlayer>>") || l.starts_with("closelayer>>");
-                            if layer(&first) { publish_capture(&mut last_capture); }
-                            // legacy + v2 events arrive in bursts: wait for the burst to end, then ask once
-                            while erx.recv_timeout(Duration::from_millis(50)).is_ok() {}
-                            publish_capture(&mut last_capture);
-                            publish(&mut last);
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { publish_capture(&mut last_capture); publish(&mut last) } // scale/DPMS changes emit no usable event
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_secs(2));
+/// Workspaces also change on create/destroy, which the desktop list above does not cover.
+fn watched_event(line: &str) -> bool {
+    relevant_event(line) || crate::app_status::title_event(line)
+        || line.split(">>").next().is_some_and(|n| matches!(n, "createworkspace" | "createworkspacev2" | "destroyworkspace" | "destroyworkspacev2" | "renameworkspace"))
+}
+
+fn layer_event(line: &str) -> bool { line.starts_with("openlayer>>") || line.starts_with("closelayer>>") }
+
+/// Title-only events (`windowtitle`) concern the app status, everything else the whole desktop snapshot.
+fn needs_desk(line: &str) -> bool { relevant_event(line) || !crate::app_status::title_event(line) }
+
+/// Publishes the compositor and app state to the UI thread whenever it changes. Subscribes to the event socket
+/// before the first query so no startup event is lost; a failed query keeps the last good state.
+pub fn start(poster: &Poster) {
+    let poster = poster.clone();
+    std::thread::Builder::new().name("desktop-watch".into()).spawn(move || watch(poster)).expect("spawn desktop-watch");
+}
+
+struct Publisher {
+    poster: Poster,
+    tracker: Option<crate::app_status::Tracker>,
+    last_desk: Option<Desk>,
+    last_buttons: Option<Vec<crate::apps::AppButton>>,
+}
+
+impl Publisher {
+    fn apps(&mut self) {
+        let Some(t) = &self.tracker else { return };
+        let buttons = t.buttons();
+        if self.last_buttons.as_ref() != Some(&buttons) {
+            self.last_buttons = Some(buttons.clone());
+            self.poster.post(move |st, _| st.apps.buttons = buttons);
         }
-    });
+    }
+
+    /// Everything: monitors, workspaces, fullscreen, screenshot layers, client-based app status.
+    fn all(&mut self) {
+        let Ok((desk, clients)) = query_desk() else { return };
+        if let Some(t) = &mut self.tracker { let _ = t.update_clients(clients); }
+        if self.last_desk.as_ref() != Some(&desk) {
+            self.last_desk = Some(desk.clone());
+            self.poster.post(move |st, _| st.desk = desk);
+        }
+        self.apps();
+    }
+
+    /// Window titles/classes only: app status without the monitor queries.
+    fn clients(&mut self) {
+        let Some(t) = &mut self.tracker else { return };
+        if let Ok(clients) = hypr::json("j/clients") { let _ = t.update_clients(clients); }
+        self.apps();
+    }
+
+    fn tick(&mut self) {
+        if let Some(t) = &mut self.tracker { t.refresh(); }
+        self.all();
+    }
+}
+
+fn watch(poster: Poster) {
+    let tracker = crate::config::read_document().map_err(|e| e.to_string()).and_then(|d| crate::app_status::Tracker::new(&d))
+        .map_err(|e| eprintln!("waybar-notch: app buttons disabled: {e}")).ok();
+    let wa = tracker.is_some() && crate::app_status::whatsapp_plugin_enabled();
+    if wa {
+        poster.post(|st, _| st.apps.wa_plugin = true);
+        crate::app_status::watch_whatsapp(poster.clone());
+    }
+    let mut p = Publisher { poster, tracker, last_desk: None, last_buttons: None };
+    p.apps();
+    let events = hypr::subscribe(watched_event);
+    loop {
+        match events.recv_timeout(Duration::from_secs(2)) {
+            Ok(hypr::Ev::Connected) => p.tick(),
+            Ok(hypr::Ev::Line(first)) => {
+                if layer_event(&first) { p.all(); }
+                // legacy + v2 events arrive in bursts: wait for the burst to end, then ask once
+                let mut desk = needs_desk(&first);
+                while let Ok(ev) = events.recv_timeout(Duration::from_millis(50)) {
+                    if let hypr::Ev::Line(l) = ev { desk |= needs_desk(&l); }
+                }
+                if desk { p.all(); } else { p.clients(); }
+            }
+            // scale/DPMS changes emit no usable event; the same tick scans processes for apps without a window
+            Err(RecvTimeoutError::Timeout) => p.tick(),
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -357,37 +379,10 @@ mod tests {
     }
 
     #[test]
-    fn same_connector_scale_change_changes_snapshot_and_geometry() {
-        let l = LayoutSettings { collapsed_width: 210, collapsed_height: 30, expanded_width: 960, top_margin: 0 };
+    fn same_connector_scale_change_changes_snapshot() {
         let a = parse_snapshot(&json!([mon(0, "A", 1920, 1200, 1.6, 0, true, 1, 0)]), &json!([]));
         let b = parse_snapshot(&json!([mon(0, "A", 1920, 1200, 2.0, 0, true, 1, 0)]), &json!([]));
         assert_ne!(a, b);
-        let ga = Geometry::compute(&l, Some((a.monitors[0].logical_width, a.monitors[0].logical_height)));
-        let gb = Geometry::compute(&l, Some((b.monitors[0].logical_width, b.monitors[0].logical_height)));
-        assert_ne!(ga, gb);
-    }
-
-    #[test]
-    fn collapsed_body_sits_below_the_top_gap() {
-        let l = LayoutSettings { collapsed_width: 210, collapsed_height: 24, expanded_width: 520, top_margin: 2 };
-        let g = Geometry::compute(&l, Some((1200.0, 750.0)));
-        assert_eq!((g.top_margin, g.coll_h), (2, 24.0));
-        assert_eq!(g.top_margin as f64 + g.coll_h, 26.0);
-    }
-
-    #[test]
-    fn geometry_never_exceeds_the_output() {
-        let l = LayoutSettings { collapsed_width: 420, collapsed_height: 48, expanded_width: 960, top_margin: 24 };
-        let g = Geometry::compute(&l, Some((600.0, 400.0)));
-        assert_eq!(g.coll_w, 420.0);
-        assert!(g.exp_w * HEADROOM <= 600.0 - 16.0 + 1e-9);
-        let (hw, hh) = g.host(10_000.0);
-        assert!(hw as f64 <= 584.0 && hh as f64 <= 400.0 - 24.0 - 16.0);
-        let tiny = Geometry::compute(&l, Some((300.0, 100.0)));
-        assert!(tiny.coll_w <= 284.0 && tiny.coll_h <= 60.0);
-        // roomy output: the requested size is kept
-        let big = Geometry::compute(&l, Some((3000.0, 2000.0)));
-        assert_eq!((big.exp_w, big.coll_w), (960.0, 420.0));
     }
 
     #[test]
@@ -415,5 +410,40 @@ mod tests {
         assert!(relevant_event("fullscreen>>1"));
         assert!(!relevant_event("windowtitle>>abc"));
         assert!(!relevant_event("fullscreenfoo>>x"));
+        // the watcher also wakes for app windows and workspace lifecycle
+        assert!(watched_event("windowtitlev2>>0x1,x"));
+        assert!(watched_event("createworkspacev2>>3,3"));
+        assert!(watched_event("destroyworkspace>>3"));
+        assert!(!watched_event("activelayout>>kb,us"));
+    }
+
+    fn ws(id: i64, monitor: &str, windows: u64) -> Value {
+        json!({"id": id, "name": id.to_string(), "monitor": monitor, "windows": windows})
+    }
+
+    #[test]
+    fn workspace_buttons_follow_the_output_and_mark_the_visible_one() {
+        let snap = parse_snapshot(
+            &json!([mon(0, "A", 1920, 1200, 1.0, 0, true, 3, 0), mon(1, "B", 1920, 1080, 1.0, 0, false, 9, 0)]),
+            &json!([]),
+        );
+        let workspaces = parse_workspaces(&json!([
+            ws(9, "B", 0), ws(2, "A", 1), ws(1, "A", 0), ws(3, "A", 0), ws(-98, "A", 1), ws(7, "B", 2),
+            {"id": "x"}, {"id": 4}
+        ]));
+        assert_eq!(workspaces.iter().map(|w| w.id).collect::<Vec<_>>(), [-98, 1, 2, 3, 7, 9], "sorted, malformed dropped");
+        let desk = Desk { snap, workspaces, ..Default::default() };
+        let a = desk.workspace_buttons("A");
+        // empty workspace 1 hidden; special workspace hidden; the active (empty) 3 shown
+        assert_eq!(a, [WsButton { id: 2, active: false }, WsButton { id: 3, active: true }]);
+        assert_eq!(desk.workspace_buttons("B"), [WsButton { id: 7, active: false }, WsButton { id: 9, active: true }]);
+        assert!(desk.workspace_buttons("C").is_empty());
+    }
+
+    #[test]
+    fn active_workspace_missing_from_the_list_is_still_shown() {
+        let snap = parse_snapshot(&json!([mon(0, "A", 1920, 1200, 1.0, 0, true, 2, 0)]), &json!([]));
+        let desk = Desk { snap, workspaces: parse_workspaces(&json!([ws(5, "A", 1)])), ..Default::default() };
+        assert_eq!(desk.workspace_buttons("A"), [WsButton { id: 2, active: true }, WsButton { id: 5, active: false }]);
     }
 }

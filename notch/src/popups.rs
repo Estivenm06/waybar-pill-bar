@@ -1,963 +1,1363 @@
-//! Shared Audio / Display / Battery controls embedded in the notch's utility page, plus the bar-click FIFO reader
-//! (`waybar-popupctl`). Wi-Fi and Bluetooth have their own notch pages.
-use crate::desktop::hypr_req;
-use crate::{runtime_dir, sh_out, spawn_vec, Msg};
-use gtk::{glib, prelude::*};
-use gtk4 as gtk;
-use serde_json::{json, Value};
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::rc::Rc;
-use async_channel::Sender;
-use std::time::{Duration, Instant};
+//! Control bodies of the notch's `wifi`, `bt`, `audio`, `battery` and `display` pages (hosted by `BodyPage`) and the
+//! control fifo. Every control surface lives inside the notch; nothing here opens a surface of its own.
 
-const ICON_VOL: &str = "\u{f057e}";
-const ICON_MUTE: &str = "\u{f075f}";
-const VOL_MAX: f64 = 150.0;   // volume sliders go past 100% (software boost); brightness stays 0-100
-const SCALES: [&str; 4] = ["1", "1.25", "1.6", "2"];
-const TEXT_STOPS: [i64; 7] = [9, 10, 11, 12, 14, 16, 20];
-/// Reusable control-style rules; `$R` is replaced by the root selector that hosts the content.
-const POPUP_CONTENT_CSS: &str = "\
-$R .popup-title { font-size: @14@; font-weight: 700; color: {{fg-hi}}; margin-bottom: @6@; }
-$R .popup-item { font-size: @12@; color: {{fg}}; }
-$R .popup-subtext { font-size: @11@; color: alpha({{fg}}, 0.62); }
-$R button { background: alpha({{fg}}, 0.09); border: none; border-radius: @11@; box-shadow: none;
-  color: {{fg}}; font-size: @11@; font-weight: 600; padding: @5@ @12@; min-height: 0; min-width: 0;
-  transition: background 150ms ease, color 150ms ease; }
-$R button:hover { background: alpha({{fg}}, 0.18); color: {{fg-hi}}; }
-$R button.active { background: alpha({{accent}}, 0.30); color: {{accent-hi}}; font-weight: 700; }
-$R button.btn-danger { background: alpha({{alert}}, 0.18); color: {{alert-hi}}; }
-$R button.btn-danger:hover { background: alpha({{alert}}, 0.34); color: {{fg-hi}}; }
-$R button.icon-btn { padding: @4@ @8@; min-width: @24@; font-size: @14@; border-radius: @12@; }
-$R button.icon-btn.muted { color: alpha({{fg}}, 0.4); }
-$R entry, $R text { background: alpha({{fg}}, 0.08); color: {{fg-hi}}; border-radius: @10@; font-size: @11@; padding: @3@ @8@; }
-$R .vol-scale trough { background: alpha({{fg}}, 0.14); border-radius: @3@; min-height: @6@; }
-$R .vol-scale highlight { background-image: linear-gradient(to right, {{accent-lo}}, {{accent-top}}); border-radius: @3@; min-height: @6@; }
-$R .vol-scale slider { background: {{fg-hi}}; border-radius: 50%; min-height: @12@; min-width: @12@; margin: -@3@ 0; box-shadow: 0 0 0 @3@ alpha({{accent}}, 0.25), 0 2px 6px rgba(0,0,0,.7); }
-$R .tile { background: alpha({{fg}}, 0.06); border-radius: @11@; padding: @4@ @10@; }
-$R .pct-big { font-size: @12@; font-weight: 700; color: {{fg-hi}}; }
-$R .tile-icon { font-size: @14@; color: {{accent-hi}}; min-width: @22@; }
-$R .tile button.icon-btn { padding: @2@ @6@; min-width: @22@; font-size: @13@; border-radius: @9@; }
-$R .battery-hero { padding: @10@ @12@; border-radius: @14@; }
-$R .battery-pct { font-size: @28@; font-weight: 800; color: {{fg-hi}}; }
-$R .battery-level trough { background: alpha({{fg}}, 0.14); border-radius: @4@; min-height: @8@; }
-$R .battery-level progress { background-image: linear-gradient(to right, {{accent-lo}}, {{accent-top}}); border-radius: @4@; min-height: @8@; }
-$R .battery-metric { padding: @8@ @10@; border-radius: @12@; }
-$R .battery-value { font-size: @13@; font-weight: 700; color: {{fg-hi}}; }
-$R flowboxchild { padding: 0; background: none; }
-$R separator { background: alpha({{fg}}, 0.10); min-height: 1px; margin: @6@ 0; }
-";
+use crate::layout::{Rect, Scroll, Size, pt, rect};
+use crate::net;
+use crate::page::Page;
+use crate::power::{BatteryState, PowerSnapshot};
+use crate::render::{Canvas, HAlign, TextStyle, TextSys, VAlign, r_all, with_a};
+use crate::state::{NavTo, State};
+use crate::ui::{ButtonKind, FieldResult, Hits, TextField, Palette, button, scrollbar, slider, toggle as switch};
+use crate::wayland::{Button, Ctx, Cursor, DrawCtx, Event, Poster};
+use serde_json::Value;
 
-/// Substitute `@N@` px tokens (scaled by `s`) and the `$R` root selector. Output is not yet theme-painted.
-fn content_rules(root: &str, s: f64) -> String {
-    let src = POPUP_CONTENT_CSS.replace("$R", root);
-    scale_tokens(&src, s)
+const MAX_BODY_H: f32 = 420.0;
+
+#[derive(Default)]
+pub struct PopupState {
+    /// Latest `audio::gather_volume()` document (outputs + streams), refreshed while a volume body is visible.
+    pub audio: Option<Value>,
+    /// A poll is in flight.
+    pub audio_busy: bool,
+    /// Mixer commands (stream volume/mute, output switch) still running on workers.
+    pub audio_cmds: u32,
+    /// Newest refresh already applied; older results arriving later are dropped.
+    pub audio_seq: u64,
+    pub audio_error: Option<String>,
+    /// Power-profile modes offered by power-profiles-daemon; `None` when unavailable or not read yet.
+    pub profiles: Option<crate::power::Profiles>,
+    pub profile_busy: bool,
+    pub profile_error: Option<String>,
+    /// `{"mons":[{name,w,h,scale,focused,enabled,brightness}],"text":n}` for the Displays page.
+    pub display: Option<Value>,
 }
 
-fn scale_tokens(src: &str, s: f64) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut parts = src.split('@');
-    out.push_str(parts.next().unwrap_or(""));
-    while let Some(n) = parts.next() {
-        let px: f64 = n.parse().expect("popup css token must be a number");
-        out.push_str(&format!("{:.2}px", px * s));
-        out.push_str(parts.next().unwrap_or(""));
-    }
-    out
-}
-
-/// Control rules for the notch's utility page (scale 1), unpainted; appended to the notch stylesheet so font prefs apply.
-pub fn embedded_css() -> String { content_rules(".utility-page .control-content", 1.0) }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Presentation { Hidden, Embedded }
-
-// ------------------------------------------------------------------ small widget helpers
-/// Wrapping label that never widens its parent.
-fn wlbl(t: &str, cls: &str) -> gtk::Label {
-    let l = lbl(t, cls);
-    l.set_wrap(true);
-    l.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    l.set_width_chars(1);
-    l.set_hexpand(true);
-    l
-}
-
-fn lbl(t: &str, cls: &str) -> gtk::Label {
-    let l = gtk::Label::new(Some(t));
-    l.set_xalign(0.0);
-    l.add_css_class(cls);
-    l
-}
-
-fn btn(t: &str, cls: &[&str]) -> gtk::Button {
-    let b = gtk::Button::with_label(t);
-    for c in cls { b.add_css_class(c); }
-    b
-}
-
-fn hbox(sp: i32) -> gtk::Box { gtk::Box::new(gtk::Orientation::Horizontal, sp) }
-
-fn sep() -> gtk::Separator { gtk::Separator::new(gtk::Orientation::Horizontal) }
-
-fn strv(a: &[&str]) -> Vec<String> { a.iter().map(|s| s.to_string()).collect() }
-
-// ------------------------------------------------------------------ the shared utility controls
-pub struct Popups {
-    content: gtk::Box,
-    kind: RefCell<String>,
-    presentation: Cell<Presentation>,
-    embed_host: RefCell<Option<gtk::Box>>,
-    render_pending: Cell<bool>,
-    dragging: Cell<bool>,
-    data: RefCell<HashMap<String, Value>>,
-    lock_until: Cell<Option<Instant>>,
-    poll_id: RefCell<Option<glib::SourceId>>,
-    pending: RefCell<HashMap<String, Vec<String>>>,
-    pend_id: RefCell<Option<glib::SourceId>>,
-    tx: Sender<Msg>,
-}
-
-impl Popups {
-    pub fn new(tx: Sender<Msg>) -> Rc<Self> {
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        content.add_css_class("control-content");
-        let p = Rc::new(Popups {
-            content, kind: RefCell::new(String::new()), presentation: Cell::new(Presentation::Hidden),
-            embed_host: RefCell::new(None), render_pending: Cell::new(false), dragging: Cell::new(false),
-            data: RefCell::new(HashMap::new()), lock_until: Cell::new(None), poll_id: RefCell::new(None),
-            pending: RefCell::new(HashMap::new()), pend_id: RefCell::new(None), tx,
-        });
-        // Tracks a slider drag without claiming the sequence, so data refreshes never rebuild a widget under the pointer.
-        let drag = gtk::GestureDrag::new();
-        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let pc = p.clone();
-        drag.connect_drag_begin(move |_, _, _| pc.dragging.set(true));
-        let pc = p.clone();
-        drag.connect_drag_end(move |_, _, _| pc.dragging.set(false));
-        let pc = p.clone();
-        drag.connect_cancel(move |_, _| pc.dragging.set(false));
-        p.content.add_controller(drag);
-        p
-    }
-
-    // ---- FIFO (`waybar-popupctl kind <nanos>`)
-    pub fn start_fifo(tx: Sender<Msg>) {
-        let path = format!("{}/waybar-popupd.fifo", runtime_dir());
-        let _ = std::fs::remove_file(&path);
-        let _ = Command::new("mkfifo").args(["-m", "600", &path]).status();
-        std::thread::spawn(move || {
-            // read+write keeps the FIFO open when a writer disconnects (no EOF spin)
-            let f = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
-                Ok(f) => f,
-                Err(_) => return,
-            };
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                if let Some(k) = line.split_whitespace().next() {
-                    let _ = tx.try_send(Msg::PopupReq(k.to_string()));
-                }
-            }
-        });
-    }
-
-    /// Show the real volume/display/battery controls inside `host` (the notch's utility page).
-    pub fn embed(self: &Rc<Self>, kind: &str, host: &gtk::Box) {
-        if !matches!(kind, "volume" | "display" | "battery") { return; }
-        if self.presentation.get() == Presentation::Embedded && *self.kind.borrow() == kind
-            && self.embed_host.borrow().as_ref() == Some(host) { return; }
-        self.close();
-        if let Some(p) = self.content.parent().and_then(|p| p.downcast::<gtk::Box>().ok()) { p.remove(&self.content); }
-        host.append(&self.content);
-        *self.embed_host.borrow_mut() = Some(host.clone());
-        *self.kind.borrow_mut() = kind.to_string();
-        self.lock_until.set(None);
-        self.render_pending.set(false);
-        self.presentation.set(Presentation::Embedded);
-        self.render();
-        self.refresh(kind);
-        self.start_poll();
-    }
-
-    pub fn close_embedded(self: &Rc<Self>) { self.close(); }
-
-    /// A slider drag is in progress inside the shared content.
-    pub fn is_interacting(&self) -> bool { self.dragging.get() }
-
-    /// Deactivate the view: stop polling and drag/render state. Late data may still update the cache but never repaints.
-    pub fn close(self: &Rc<Self>) {
-        self.presentation.set(Presentation::Hidden);
-        self.dragging.set(false);
-        self.render_pending.set(false);
-        *self.embed_host.borrow_mut() = None;
-        if let Some(id) = self.poll_id.borrow_mut().take() { id.remove(); }
-    }
-
-    fn render(self: &Rc<Self>) {
-        while let Some(c) = self.content.first_child() { self.content.remove(&c); }
-        let kind = self.kind.borrow().clone();
-        let data = self.data.borrow().get(&kind).cloned();
-        let Some(d) = data else {
-            self.content.append(&lbl("Loading…", "popup-subtext"));
-            let _ = self.tx.try_send(Msg::Relayout);
-            return;
-        };
-        match kind.as_str() {
-            "volume" => self.render_volume(&d),
-            "display" => self.render_display(&d),
-            "battery" => self.render_battery(&d),
-            _ => {}
-        }
-        let _ = self.tx.try_send(Msg::Relayout);
-    }
-
-    /// Refresh cadence of the active view.
-    fn poll_interval(&self) -> Option<Duration> {
-        match (self.presentation.get(), self.kind.borrow().as_str()) {
-            (Presentation::Hidden, _) => None,
-            (_, "volume") => Some(Duration::from_millis(800)),
-            (_, "display") => Some(Duration::from_secs(2)),
-            (_, "battery") => Some(Duration::from_secs(5)),
-            _ => None,
-        }
-    }
-
-    fn start_poll(self: &Rc<Self>) {
-        if let Some(id) = self.poll_id.borrow_mut().take() { id.remove(); }
-        let Some(every) = self.poll_interval() else { return };
-        let p = self.clone();
-        *self.poll_id.borrow_mut() = Some(glib::timeout_add_local(every, move || {
-            if p.poll_interval() == Some(every) {
-                let k = p.kind.borrow().clone();
-                p.refresh(&k);
-                glib::ControlFlow::Continue
-            } else {
-                p.poll_id.borrow_mut().take();
-                glib::ControlFlow::Break
-            }
-        }));
-    }
-
-    // ---- data
-    pub fn refresh(&self, kind: &str) {
-        let (tx, kind) = (self.tx.clone(), kind.to_string());
-        std::thread::spawn(move || {
-            let v = match kind.as_str() {
-                "volume" => gather_volume(),
-                "display" => gather_display(),
-                "battery" => gather_battery(),
-                _ => return,
-            };
-            let _ = tx.try_send(Msg::PopupData(kind, v));
-        });
-    }
-
-    pub fn on_data(self: &Rc<Self>, kind: String, v: Value) {
-        let changed = self.data.borrow().get(&kind) != Some(&v);
-        self.data.borrow_mut().insert(kind.clone(), v);
-        let locked = self.lock_until.get().map(|t| Instant::now() < t).unwrap_or(false);
-        let active = self.presentation.get() != Presentation::Hidden && *self.kind.borrow() == kind;
-        if active && changed { self.render_pending.set(true); }
-        if active && !locked && !self.dragging.get() && self.render_pending.get() {
-            self.render();
-            self.render_pending.set(false);
-        }
-    }
-
-    pub fn warm_up(&self) {
-        for k in ["volume", "battery", "display"] { self.refresh(k); }
-    }
-
-    // ---- debounced command runner for sliders
-    fn queue_cmd(self: &Rc<Self>, key: String, cmd: Vec<String>) {
-        self.lock_until.set(Some(Instant::now() + Duration::from_millis(1500)));
-        self.pending.borrow_mut().insert(key, cmd);
-        if self.pend_id.borrow().is_none() {
-            let p = self.clone();
-            *self.pend_id.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_millis(40), move || {
-                p.pend_id.borrow_mut().take();
-                for (_, c) in p.pending.borrow_mut().drain() { spawn_vec(&c); }
-            }));
-        }
-    }
-
-    fn act(self: &Rc<Self>, b: &gtk::Button, cmd: Vec<String>) {
-        let p = self.clone();
-        b.connect_clicked(move |_| {
-            let (tx, kind, cmd) = (p.tx.clone(), p.kind.borrow().clone(), cmd.clone());
-            std::thread::spawn(move || {
-                if let Some((prog, args)) = cmd.split_first() {
-                    let _ = Command::new(prog).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit()).status();
-                }
-                let _ = tx.try_send(Msg::PopupRefresh(kind));
-            });
-        });
-    }
-
-    /// Slider tile. Embedded: two rows (mute/icon, name, percentage over a full-width slider); detached: one compact row.
-    /// `vol == None` shows `—` with a disabled slider; `muted == None` omits the mute button.
-    fn vol_row(self: &Rc<Self>, title: &str, vol: Option<f64>, muted: Option<bool>, dim: bool, key: String,
-               mk: Rc<dyn Fn(i64) -> Vec<String>>, mute_cmd: Option<Vec<String>>, icon: &str, max: f64) -> gtk::Box {
-        let tile = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        tile.add_css_class("tile");
-        let head = hbox(8);
-        let glyph = |muted: bool, v: Option<f64>| match (muted, v) {
-            (true, _) => ICON_MUTE,
-            (_, Some(v)) if v < 34.0 => "\u{f057f}",
-            (_, Some(v)) if v < 67.0 => "\u{f0580}",
-            _ => ICON_VOL,
-        };
-        if let (Some(m), Some(cmd)) = (muted, mute_cmd) {
-            let b = btn(glyph(m, vol), &["icon-btn"]);
-            if m { b.add_css_class("muted"); }
-            b.connect_clicked(move |_| spawn_vec(&cmd));
-            head.append(&b);
-        } else {
-            head.append(&lbl(icon, "tile-icon"));
-        }
-        let name = lbl(title, "popup-item");
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        name.set_xalign(0.0);
-        name.set_tooltip_text(Some(title));
-        name.set_width_chars(1);
-        name.set_hexpand(true);
-        head.append(&name);
-        let pct = lbl(&vol.map_or("\u{2014}".to_string(), |v| format!("{}%", v as i64)), "pct-big");
-        pct.set_width_chars(4);
-        pct.set_xalign(1.0);
-        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, max, 1.0);
-        scale.add_css_class("vol-scale");
-        scale.set_draw_value(false);
-        scale.set_hexpand(true);
-        scale.set_valign(gtk::Align::Center);
-        scale.set_size_request(0, -1);
-        if let Some(v) = vol {
-            scale.set_value(v);
-            let (p, pl) = (self.clone(), pct.clone());
-            scale.connect_value_changed(move |s| {
-                let v = s.value() as i64;
-                pl.set_text(&format!("{v}%"));
-                p.queue_cmd(key.clone(), mk(v));
-            });
-        } else {
-            scale.set_sensitive(false);
-        }
-        head.append(&pct);
-        tile.append(&head);
-        tile.append(&scale);
-        if dim { tile.add_css_class("dim"); }
-        tile
-    }
-
-    fn render_volume(self: &Rc<Self>, d: &Value) {
-        let c = &self.content;
-        if !d["available"].as_bool().unwrap_or(false) {
-            c.append(&wlbl("Audio unavailable", "popup-subtext"));
-            return;
-        }
-        let outputs = d["outputs"].as_array().cloned().unwrap_or_default();
-        let m = &d["master"];
-        if let Some(mname) = m["name"].as_str() {
-            let mname = mname.to_string();
-            let target = mname.clone();
-            let master = self.vol_row("Master", m["vol"].as_f64(), m["mute"].as_bool(),
-                false, "master".into(), Rc::new(move |v| strv(&["pactl", "set-sink-volume", &target, &format!("{v}%")])),
-                Some(strv(&["pactl", "set-sink-mute", &mname, "toggle"])), ICON_VOL, VOL_MAX);
-            master.set_tooltip_text(m["desc"].as_str());
-            c.append(&master);
-        } else if !outputs.is_empty() {
-            c.append(&wlbl("No default output selected", "popup-subtext"));
-        }
-        c.append(&sep());
-        c.append(&lbl("Output", "popup-subtext"));
-        if outputs.is_empty() { c.append(&wlbl("No audio outputs available", "popup-subtext")); }
-        for o in outputs {
-            let (name, is_def) = (o["name"].as_str().unwrap_or("").to_string(), o["default"].as_bool().unwrap_or(false));
-            let text = format!("{}  {}", if is_def { "\u{f00c}" } else { "  " }, o["desc"].as_str().unwrap_or(&name));
-            let b = btn(&text, &["popup-item"]);
-            if let Some(l) = b.child().and_downcast::<gtk::Label>() {
-                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                l.set_width_chars(1);
-                l.set_xalign(0.0);
-            }
-            b.set_hexpand(true);
-            b.set_tooltip_text(Some(&text));
-            if is_def { b.add_css_class("ctl-active"); }
-            // make it the default and move already-playing streams over (checked, off the GTK thread)
-            let (p, nm) = (self.clone(), name.clone());
-            b.connect_clicked(move |_| {
-                let (tx, name) = (p.tx.clone(), nm.clone());
-                std::thread::spawn(move || {
-                    if let Err(e) = select_audio_output(&name) { eprintln!("audio output {name}: {e}"); }
-                    let _ = tx.try_send(Msg::PopupRefresh("volume".into()));
-                });
-            });
-            c.append(&b);
-        }
-        c.append(&sep());
-        c.append(&lbl("Applications", "popup-subtext"));
-        let streams = d["streams"].as_array().cloned().unwrap_or_default();
-        if !d["streams_available"].as_bool().unwrap_or(false) {
-            c.append(&wlbl("Application audio unavailable", "popup-subtext"));
-        } else if streams.is_empty() {
-            c.append(&wlbl("No applications playing audio", "popup-subtext"));
-        }
-        for s in streams {
-            let Some(id) = s["id"].as_u64().map(|i| i.to_string()) else { continue };
-            let idc = id.clone();
-            c.append(&self.vol_row(s["name"].as_str().unwrap_or("Unknown"), s["vol"].as_f64(),
-                s["mute"].as_bool(), s["corked"].as_bool().unwrap_or(false), format!("in{id}"),
-                Rc::new(move |v| strv(&["pactl", "set-sink-input-volume", &idc, &format!("{v}%")])),
-                Some(strv(&["pactl", "set-sink-input-mute", &id, "toggle"])), ICON_VOL, VOL_MAX));
-        }
-    }
-
-    fn render_display(self: &Rc<Self>, d: &Value) {
-        let c = &self.content;
-        let mons = d["mons"].as_array().cloned().unwrap_or_default();
-        if mons.is_empty() { c.append(&lbl("No displays available", "popup-subtext")); }
-        let enabled = mons.iter().filter(|m| m["enabled"].as_bool().unwrap_or(false)).count();
-        for m in &mons {
-            let on = m["enabled"].as_bool().unwrap_or(false);
-            let name = m["name"].as_str().unwrap_or("").to_string();
-            let row = hbox(8);
-            let l = lbl(&format!("{name}  {}x{}{}", m["w"], m["h"],
-                if m["focused"].as_bool().unwrap_or(false) { "  \u{b7} focused" } else { "" }), "popup-item");
-            l.set_hexpand(true);
-            row.append(&l);
-            let b = btn(if on { "On" } else { "Off" }, &[]);
-            if on { b.add_css_class("active"); }
-            if on && enabled <= 1 { b.set_sensitive(false); } // never disable the last display
-            let expr = if on { format!("hl.monitor({{ output = \"{name}\", disabled = true }})") } else {
-                format!("hl.monitor({{ output = \"{name}\", disabled = false, mode = \"preferred\", position = \"auto\", scale = \"auto\" }})") };
-            self.act(&b, strv(&["hyprctl", "eval", &expr]));
-            row.append(&b);
-            c.append(&row);
-        }
-        let shown: Vec<&Value> = mons.iter()
-            .filter(|m| m["enabled"].as_bool().unwrap_or(false) && m["brightness"].is_number()).collect();
-        if !shown.is_empty() {
-            c.append(&sep());
-            c.append(&lbl("Brightness", "popup-subtext"));
-        }
-        for m in shown {
-            let name = m["name"].as_str().unwrap_or("").to_string();
-            let n2 = name.clone();
-            c.append(&self.vol_row(&name, m["brightness"].as_f64(), None, false, format!("br{name}"),
-                Rc::new(move |v| strv(&["omarchy-brightness-display", "--no-osd", "--monitor", &n2, &format!("{v}%")])), None, "\u{f00df}", 100.0));
-        }
-        let foc = mons.iter().find(|m| m["focused"].as_bool().unwrap_or(false));
-        let foc_on = foc.map_or(false, |m| m["enabled"].as_bool().unwrap_or(false));
-        c.append(&sep());
-        c.append(&lbl(&format!("Scale{}", foc.map(|m| format!(" ({})", m["name"].as_str().unwrap_or(""))).unwrap_or_default()), "popup-subtext"));
-        let sr = hbox(6);
-        for s in SCALES {
-            let b = btn(&format!("{s}x"), &[]);
-            b.set_hexpand(true);
-            if foc.map(|m| (m["scale"].as_f64().unwrap_or(0.0) - s.parse::<f64>().unwrap_or(0.0)).abs() < 0.01).unwrap_or(false) {
-                b.add_css_class("active");
-            }
-            self.act(&b, strv(&["omarchy-hyprland-monitor-scaling", s]));
-            sr.append(&b);
-        }
-        sr.set_sensitive(foc_on);
-        c.append(&sr);
-        c.append(&lbl("Text size", "popup-subtext"));
-        let tr = hbox(4);
-        let cur = d["text"].as_i64().unwrap_or(12);
-        let near = *TEXT_STOPS.iter().min_by_key(|s| (**s - cur).abs()).unwrap();
-        for s in TEXT_STOPS {
-            let b = btn(&s.to_string(), &[]);
-            b.set_hexpand(true);
-            if s == near { b.add_css_class("active"); }
-            self.act(&b, strv(&["omarchy-display-text-size", &s.to_string()]));
-            tr.append(&b);
-        }
-        c.append(&tr);
-    }
-
-    fn state_text(state: &str) -> &'static str {
-        match state {
-            "charging" => "Charging",
-            "discharging" => "Discharging",
-            "full" => "Fully charged",
-            "not_charging" => "Not charging",
-            _ => "Status unavailable",
-        }
-    }
-
-    /// Summary tile: percentage, state, source, gauge and estimate for one pack.
-    fn battery_hero(b: &Value, ac: Option<bool>) -> gtk::Box {
-        let state = b["state"].as_str().unwrap_or("unknown");
-        let hero = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        hero.add_css_class("tile");
-        hero.add_css_class("battery-hero");
-        let pct = b["percentage"].as_f64();
-        let top = hbox(10);
-        let big = lbl(&pct.map_or("\u{2014}".to_string(), |p| format!("{}%", p.round() as i64)), "battery-pct");
-        big.set_valign(gtk::Align::Center);
-        top.append(&big);
-        let info = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        info.set_valign(gtk::Align::Center);
-        info.set_hexpand(true);
-        info.append(&wlbl(Self::state_text(state), "popup-item"));
-        info.append(&wlbl(Self::source_text(ac, state == "discharging"), "popup-subtext"));
-        top.append(&info);
-        hero.append(&top);
-        let gauge = gtk::ProgressBar::new();
-        gauge.add_css_class("battery-level");
-        gauge.set_fraction(pct.map_or(0.0, |p| (p / 100.0).clamp(0.0, 1.0)));
-        gauge.set_visible(pct.is_some());
-        hero.append(&gauge);
-        let est = match (state, b["time_to_empty_secs"].as_u64(), b["time_to_full_secs"].as_u64()) {
-            ("discharging", Some(s), _) => format!("Estimated time to empty: {}", fmt_duration(s)),
-            ("charging", _, Some(s)) => format!("Estimated time to full: {}", fmt_duration(s)),
-            _ => "Time estimate unavailable".to_string(),
-        };
-        hero.append(&wlbl(&est, "popup-subtext"));
-        hero
-    }
-
-    fn source_text(ac: Option<bool>, discharging: bool) -> &'static str {
-        match ac {
-            Some(true) => "External power connected",
-            Some(false) => "External power disconnected",
-            None if discharging => "On battery",
-            None => "Power source unavailable",
-        }
-    }
-
-    /// Metric tiles and identity for one pack.
-    fn battery_details(c: &gtk::Box, b: &Value) {
-        let state = b["state"].as_str().unwrap_or("unknown");
-        let na = || "Not available".to_string();
-        let f1 = |k: &str, unit: &str| b[k].as_f64().map_or_else(na, |v| format!("{v:.1} {unit}"));
-        let rate_title = match state { "discharging" => "Power draw", "charging" => "Charging rate", _ => "Power rate" };
-        let metrics = [
-            (rate_title, f1("power_w", "W")),
-            ("Energy remaining", f1("energy_now_wh", "Wh")),
-            ("Full capacity", f1("energy_full_wh", "Wh")),
-            ("Design capacity", f1("energy_design_wh", "Wh")),
-            ("Battery health", f1("health_pct", "%")),
-            ("Voltage", f1("voltage_v", "V")),
-            ("Charge cycles", b["cycles"].as_u64().map_or_else(na, |v| v.to_string())),
-        ];
-        let flow = gtk::FlowBox::new();
-        flow.set_selection_mode(gtk::SelectionMode::None);
-        flow.set_homogeneous(true);
-        flow.set_min_children_per_line(1);
-        flow.set_max_children_per_line(2);
-        flow.set_row_spacing(8);
-        flow.set_column_spacing(8);
-        flow.set_focusable(false);
-        for (t, v) in metrics.iter() {
-            let m = gtk::Box::new(gtk::Orientation::Vertical, 1);
-            m.add_css_class("tile");
-            m.add_css_class("battery-metric");
-            m.set_width_request(160);
-            m.append(&wlbl(t, "popup-subtext"));
-            let val = lbl(v, "battery-value");
-            val.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            val.set_width_chars(1);
-            val.set_hexpand(true);
-            val.set_tooltip_text(Some(v));
-            m.append(&val);
-            flow.insert(&m, -1);
-        }
-        c.append(&flow);
-        let ident: Vec<&str> = ["manufacturer", "model", "technology"].iter().filter_map(|k| b[*k].as_str()).collect();
-        if !ident.is_empty() { c.append(&wlbl(&ident.join(" \u{b7} "), "popup-subtext")); }
-    }
-
-    fn render_battery(self: &Rc<Self>, d: &Value) {
-        let c = &self.content;
-        let ac = d["ac_online"].as_bool();
-        let packs: Vec<Value> = d["batteries"].as_array().cloned().unwrap_or_default();
-        if !d["available"].as_bool().unwrap_or(false) {
-            c.append(&wlbl("Power information unavailable", "battery-value"));
-        } else if packs.is_empty() {
-            c.append(&wlbl("No battery detected", "battery-value"));
-            c.append(&wlbl(match ac {
-                Some(true) => "External power connected",
-                Some(false) => "External power disconnected",
-                None => "Power source unavailable",
-            }, "popup-subtext"));
-        } else if packs.len() == 1 {
-            c.append(&Self::battery_hero(&packs[0], ac));
-        } else {
-            let hero = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            hero.add_css_class("tile");
-            hero.add_css_class("battery-hero");
-            let pct = d["percentage"].as_f64();
-            let top = hbox(10);
-            let big = lbl(&pct.map_or("\u{2014}".to_string(), |p| format!("{}%", p.round() as i64)), "battery-pct");
-            big.set_valign(gtk::Align::Center);
-            top.append(&big);
-            let info = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            info.set_valign(gtk::Align::Center);
-            info.set_hexpand(true);
-            info.append(&wlbl(&format!("{} batteries", packs.len()), "popup-item"));
-            info.append(&wlbl(Self::source_text(ac, false), "popup-subtext"));
-            top.append(&info);
-            hero.append(&top);
-            let gauge = gtk::ProgressBar::new();
-            gauge.add_css_class("battery-level");
-            gauge.set_fraction(pct.map_or(0.0, |p| (p / 100.0).clamp(0.0, 1.0)));
-            gauge.set_visible(pct.is_some());
-            hero.append(&gauge);
-            c.append(&hero);
-        }
-
-        c.append(&sep());
-        c.append(&lbl("Power Profile:", "popup-item"));
-        match d["profiles"].as_array() {
-            None => c.append(&wlbl("Power profiles unavailable", "popup-subtext")),
-            Some(list) => {
-                let cur = d["profile"].as_str();
-                let pb = gtk::FlowBox::new();
-                pb.set_selection_mode(gtk::SelectionMode::None);
-                pb.set_homogeneous(true);
-                pb.set_min_children_per_line(1);
-                pb.set_max_children_per_line(3);
-                pb.set_row_spacing(6);
-                pb.set_column_spacing(6);
-                pb.set_focusable(false);
-                for id in list.iter().filter_map(|v| v.as_str()) {
-                    let text = match id {
-                        "performance" => "⚡ Performance",
-                        "balanced" => "⚖ Balanced",
-                        "power-saver" => "\u{f06c} Power Saver",
-                        _ => continue,
-                    };
-                    let b = btn(text, &[]);
-                    if let Some(l) = b.child().and_downcast::<gtk::Label>() {
-                        l.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                        l.set_width_chars(1);
-                    }
-                    b.set_tooltip_text(Some(text));
-                    b.set_hexpand(true);
-                    if Some(id) == cur { b.add_css_class("active"); }
-                    self.act(&b, strv(&["powerprofilesctl", "set", id]));
-                    pb.insert(&b, -1);
-                }
-                c.append(&pb);
-                if cur.is_none() { c.append(&wlbl("Current profile unavailable", "popup-subtext")); }
-            }
-        }
-
-        if !packs.is_empty() {
-            let multi = packs.len() > 1;
-            for b in &packs {
-                c.append(&sep());
-                if multi {
-                    c.append(&wlbl(b["name"].as_str().unwrap_or("Battery"), "popup-item"));
-                    c.append(&Self::battery_hero(b, ac));
-                }
-                Self::battery_details(c, b);
-            }
-            c.append(&wlbl("Live battery power; time is an estimate.", "popup-subtext"));
-        }
-    }
-}
-
-/// `H h M min` from seconds.
-fn fmt_duration(secs: u64) -> String { format!("{} h {} min", secs / 3600, secs % 3600 / 60) }
-
-// ------------------------------------------------------------------ data gatherers (worker threads)
-/// `pactl --format=json <args>` as an array; `Err` on spawn failure, non-zero exit, invalid JSON or non-array output.
-fn pactl_json(args: &[&str]) -> Result<Vec<Value>, ()> {
-    let o = Command::new("pactl").arg("--format=json").args(args).stderr(Stdio::null()).output().map_err(|_| ())?;
-    if !o.status.success() { return Err(()); }
-    serde_json::from_slice::<Value>(&o.stdout).ok().and_then(|v| v.as_array().cloned()).ok_or(())
-}
-
-/// Highest channel volume in percent; `None` when the channels are missing or any is malformed.
-fn max_pct(v: &Value) -> Option<f64> {
-    let mut best: Option<f64> = None;
-    for c in v.as_object()?.values() {
-        let p = c["value_percent"].as_str().and_then(|s| s.trim().trim_end_matches('%').parse::<f64>().ok())
-            .or_else(|| c["value"].as_f64().map(|x| x / 65536.0 * 100.0))
-            .filter(|p| p.is_finite() && *p >= 0.0)?;
-        best = Some(best.map_or(p, |b| b.max(p)));
-    }
-    best
-}
-
-fn nonblank(v: &Value) -> Option<&str> { v.as_str().filter(|s| !s.trim().is_empty()) }
-
-/// Master + output list from the default sink name and `pactl list sinks`. Never substitutes another sink for a missing default.
-fn normalize_audio_outputs(default: Option<&str>, sinks: &[Value]) -> Value {
-    let desc = |s: &Value| nonblank(&s["description"]).or(nonblank(&s["name"])).unwrap_or("").to_string();
-    let default = default.filter(|d| !d.is_empty());
-    let master = default.and_then(|d| sinks.iter().find(|s| nonblank(&s["name"]) == Some(d))).map(|s| json!({
-        "name": s["name"], "desc": desc(s), "vol": max_pct(&s["volume"]), "mute": s["mute"].as_bool(),
-    }));
-    // skip sinks whose every port is unplugged (e.g. HDMI with nothing attached), but keep the current default
-    let outputs: Vec<Value> = sinks.iter().filter_map(|s| {
-        let name = nonblank(&s["name"])?;
-        let is_def = default == Some(name);
-        let ports = s["ports"].as_array().cloned().unwrap_or_default();
-        let plugged = ports.is_empty() || ports.iter().any(|p| p["availability"].as_str() != Some("not available"));
-        (is_def || plugged).then(|| json!({"name": name, "desc": desc(s), "default": is_def, "bt_mac": bluetooth_sink_mac(s), "mute": s["mute"].as_bool()}))
-    }).collect();
-    json!({"master": master, "outputs": outputs})
-}
-
-fn normalize_audio_streams(inputs: &[Value]) -> Vec<Value> {
-    inputs.iter().filter_map(|i| {
-        let id = i["index"].as_u64()?;
-        let p = &i["properties"];
-        let name = ["application.name", "application.process.binary", "media.name"].iter()
-            .find_map(|k| nonblank(&p[*k])).unwrap_or("Unknown");
-        Some(json!({"id": id, "name": name, "vol": max_pct(&i["volume"]), "mute": i["mute"].as_bool(),
-                    "corked": i["corked"].as_bool().unwrap_or(false)}))
-    }).collect()
-}
-
-pub(crate) fn gather_audio_outputs() -> Value {
-    let Ok(sinks) = pactl_json(&["list", "sinks"]) else {
-        return json!({"available": false, "master": null, "outputs": []});
-    };
-    let default = cmd_ok("pactl", &["get-default-sink"]);
-    let mut v = normalize_audio_outputs(default.as_deref(), &sinks);
-    v["available"] = json!(true);
-    v
-}
-
-/// `AA:BB:CC:DD:EE:FF` (any case) → uppercase; exactly six two-digit hex octets, nothing else.
-fn normalize_mac(s: &str) -> Option<String> {
-    let parts: Vec<&str> = s.split(':').collect();
-    (parts.len() == 6 && parts.iter().all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit())))
-        .then(|| s.to_ascii_uppercase())
-}
-
-/// MAC of the Bluetooth device behind a playback sink record. Sources/monitors, non-Bluetooth sinks and malformed
-/// addresses give `None`; aliases and arbitrary name substrings are never matched.
-pub(crate) fn bluetooth_sink_mac(s: &Value) -> Option<String> {
-    let name = nonblank(&s["name"])?;
-    if name.ends_with(".monitor") { return None; }
-    let p = &s["properties"];
-    let by_name = name.starts_with("bluez_output.");
-    if !(by_name || p["device.api"].as_str() == Some("bluez5") || p["device.bus"].as_str() == Some("bluetooth")) { return None; }
-    nonblank(&p["api.bluez5.address"]).and_then(normalize_mac).or_else(|| {
-        let rest = name.strip_prefix("bluez_output.")?;
-        normalize_mac(&rest.split('.').next()?.replace('_', ":"))
+pub fn body_for(kind: &str) -> Option<Box<dyn Body>> {
+    Some(match kind {
+        "wifi" => Box::new(WifiBody::default()),
+        "bluetooth" | "bt" => Box::new(BtBody::default()),
+        "volume" | "audio" => Box::new(VolumeBody::default()),
+        "battery" => Box::new(BatteryBody::default()),
+        "display" => Box::new(DisplayBody::default()),
+        _ => return None,
     })
 }
 
-fn run_pactl(args: &[&str]) -> Result<(), String> {
-    let o = Command::new("pactl").args(args).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
-    if o.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) }
+// ---------------------------------------------------------------- bodies
+
+pub trait Body {
+    fn opened(&mut self, poster: &Poster, st: &State);
+    fn natural_h(&mut self, w: f32, st: &State, ts: &mut TextSys) -> f32;
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, r: Rect);
+    fn event(&mut self, ev: &Event, r: Rect, ctx: &mut Ctx);
+    fn tick(&mut self, _dt: f32, _ctx: &mut Ctx) -> bool { false }
+    fn wants_keyboard(&self) -> bool { false }
+    fn cursor(&self) -> Cursor { Cursor::Default }
 }
 
-/// Indices of sink inputs not already playing on `target_index`.
-fn sink_input_moves(inputs: &[Value], target_index: u64) -> Vec<u64> {
-    inputs.iter().filter_map(|i| {
-        let idx = i["index"].as_u64()?;
-        (i["sink"].as_u64() != Some(target_index)).then_some(idx)
-    }).collect()
+fn header(cv: &mut Canvas, pal: &Palette, r: Rect, title: &str, sub: &str) {
+    cv.text(title, &TextStyle::new(pal.fs(14.0), pal.fg_hi).bold(), pt(r.x, r.y + 2.0), HAlign::Left, VAlign::Top);
+    cv.text_in(sub, &pal.text_dim(11.0), rect(r.x, r.y + 22.0, r.w - 120.0, 16.0), HAlign::Left);
 }
 
-/// Make `name` the default output and move playing streams to it. Verified; never touches volume or mute.
-/// Streams are only moved after the default really changed; a stream that vanished meanwhile is not an error.
-pub(crate) fn select_audio_output(name: &str) -> Result<(), String> {
-    let sinks = pactl_json(&["list", "sinks"]).map_err(|_| "Audio server unavailable".to_string())?;
-    let target = sinks.iter().find(|s| s["name"].as_str() == Some(name))
-        .ok_or_else(|| format!("Audio output {name} is not available"))?;
-    let tidx = target["index"].as_u64().unwrap_or(u64::MAX);
-    run_pactl(&["set-default-sink", name]).map_err(|e| format!("Could not select {name}: {e}"))?;
-    if cmd_ok("pactl", &["get-default-sink"]).as_deref() != Some(name) {
-        return Err(format!("Could not make {name} the default output"));
+fn row_bg(cv: &mut Canvas, pal: &Palette, r: Rect, hovered: bool, active: bool) {
+    let fill = if active { with_a(pal.accent, 0.18) } else if hovered { with_a(pal.fg, 0.11) } else { with_a(pal.fg, 0.06) };
+    cv.fill_rrect(r, r_all(12.0), fill);
+}
+
+fn signal_glyph(_pct: u8) -> &'static str { "\u{f1eb}" }
+
+// ---- Wi-Fi
+#[derive(Default)]
+pub struct WifiBody { hits: Hits, scroll: Scroll, pending: Option<String>, field: TextField }
+
+const ID_TOGGLE: u32 = 1;
+const ID_SCAN: u32 = 2;
+const ID_CONNECT: u32 = 3;
+const ID_CANCEL: u32 = 4;
+const ID_ROW0: u32 = 100;
+
+impl Body for WifiBody {
+    fn opened(&mut self, poster: &Poster, _: &State) { net::refresh_wifi(poster, true); self.field = TextField::new("Password"); self.field.password = true; }
+    fn natural_h(&mut self, _w: f32, st: &State, _: &mut TextSys) -> f32 {
+        let n = st.net.wifi.nets.len().max(1) as f32;
+        let extra = if self.pending.is_some() { 48.0 } else { 0.0 };
+        (46.0 + n * 46.0 + extra).min(MAX_BODY_H)
     }
-    let inputs = pactl_json(&["list", "sink-inputs"]).map_err(|_| "Could not list playing applications".to_string())?;
-    let mut failed = 0;
-    for idx in sink_input_moves(&inputs, tidx) {
-        if run_pactl(&["move-sink-input", &idx.to_string(), name]).is_err() {
-            let alive = pactl_json(&["list", "sink-inputs"]).map(|v| v.iter().any(|i| i["index"].as_u64() == Some(idx))).unwrap_or(true);
-            if alive { failed += 1; }
+    fn wants_keyboard(&self) -> bool { self.pending.is_some() }
+    fn cursor(&self) -> Cursor { self.hits.cursor() }
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, r: Rect) {
+        let st = dc.state;
+        let pal = &st.pal;
+        let snap = &st.net.wifi;
+        self.hits.clear();
+        let (head, sub) = snap.card_text();
+        header(cv, pal, r, "Wi-Fi", &st.net.status_line.clone().unwrap_or(sub));
+        let _ = head;
+        let t = rect(r.right() - 44.0, r.y + 4.0, 44.0, 24.0);
+        self.hits.add(t, ID_TOGGLE);
+        if snap.available { switch(cv, pal, t, if snap.on { 1.0 } else { 0.0 }); }
+        let mut y = r.y + 44.0;
+        if let Some(ssid) = &self.pending {
+            let f = rect(r.x, y, r.w - 120.0, 32.0);
+            self.field.focused = true;
+            self.field.draw(cv, pal, f);
+            let c = rect(f.right() + 6.0, y + 2.0, 60.0, 28.0);
+            let x = rect(c.right() + 4.0, y + 2.0, 46.0, 28.0);
+            let hc = self.hits.add(c, ID_CONNECT);
+            let hx = self.hits.add(x, ID_CANCEL);
+            button(cv, pal, c, "Join", ButtonKind::Accent, hc, false);
+            button(cv, pal, x, "×", ButtonKind::Plain, hx, false);
+            let _ = ssid;
+            y += 44.0;
+        }
+        let list = rect(r.x, y, r.w, (r.bottom() - y).max(0.0));
+        self.scroll.content_h = snap.nets.len() as f32 * 46.0;
+        self.scroll.clamp(list.h);
+        if snap.nets.is_empty() {
+            cv.text_in(if snap.available { "No networks found" } else { "Wi-Fi unavailable" }, &pal.text_dim(12.0), rect(list.x, list.y, list.w, 30.0), HAlign::Center);
+        }
+        cv.with_clip(list, [0.0; 4], |cv| {
+            for (i, n) in snap.nets.iter().enumerate() {
+                let rr = rect(list.x, list.y + i as f32 * 46.0 - self.scroll.offset, list.w, 40.0);
+                if rr.bottom() < list.y || rr.y > list.bottom() { continue; }
+                let hov = self.hits.add_in(rr, list, ID_ROW0 + i as u32);
+                row_bg(cv, pal, rr, hov, n.active);
+                cv.text(signal_glyph(n.signal), &TextStyle::icon(16.0, if n.active { pal.accent_hi } else { pal.fg }), pt(rr.x + 12.0, rr.y + 20.0), HAlign::Left, VAlign::Middle);
+                cv.text_in(&n.ssid, &TextStyle::new(pal.fs(13.0), pal.fg_hi).weight(600), rect(rr.x + 38.0, rr.y, rr.w - 120.0, rr.h), HAlign::Left);
+                let badge = if n.active { "Connected" } else if n.saved { "Saved" } else { "" };
+                cv.text(badge, &TextStyle::new(pal.fs(10.0), pal.accent_hi).bold(), pt(rr.right() - 12.0 - if n.secure { 18.0 } else { 0.0 }, rr.y + 20.0), HAlign::Right, VAlign::Middle);
+                if n.secure { cv.text("\u{f023}", &TextStyle::icon(11.0, pal.dim), pt(rr.right() - 12.0, rr.y + 20.0), HAlign::Right, VAlign::Middle); }
+            }
+        });
+        scrollbar(cv, pal, list, self.scroll.offset, self.scroll.content_h);
+    }
+    fn event(&mut self, ev: &Event, r: Rect, ctx: &mut Ctx) {
+        if let Event::Scroll { dy, .. } = ev { self.scroll.by(*dy, r.h - 44.0); return; }
+        if let Event::Key(k) = ev {
+            if self.pending.is_some() {
+                match self.field.key(k) {
+                    FieldResult::Submit => self.submit(ctx),
+                    FieldResult::Cancel => { self.pending = None; self.field.clear(); }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        let Some(c) = self.hits.event(ev) else { return };
+        if c.button != Button::Left { return; }
+        match c.id {
+            ID_TOGGLE => net::wifi_radio(ctx.poster, !ctx.state.net.wifi.on),
+            ID_SCAN => net::refresh_wifi(ctx.poster, true),
+            ID_CONNECT => self.submit(ctx),
+            ID_CANCEL => { self.pending = None; self.field.clear(); }
+            id if id >= ID_ROW0 => {
+                let Some(n) = ctx.state.net.wifi.nets.get((id - ID_ROW0) as usize).cloned() else { return };
+                if n.active { net::wifi_connect(ctx.poster, &n.ssid, None, false); }
+                else if n.secure && !n.saved { self.pending = Some(n.ssid); self.field.clear(); }
+                else { net::wifi_connect(ctx.poster, &n.ssid, None, true); }
+            }
+            _ => {}
         }
     }
-    if failed == 0 { Ok(()) } else { Err(format!("Could not move {failed} playing application(s) to {name}")) }
 }
 
-/// One-line Home status for the default output.
-pub(crate) fn audio_status() -> String {
-    let v = gather_audio_outputs();
-    if !v["available"].as_bool().unwrap_or(false) { return "Audio unavailable".into(); }
-    let m = &v["master"];
-    if m.is_null() { return "No output".into(); }
-    if m["mute"].as_bool() == Some(true) { return format!("{ICON_MUTE} Muted"); }
-    match m["vol"].as_f64() {
-        Some(p) => format!("{ICON_VOL} {}%", p.round() as i64),
-        None => format!("{ICON_VOL} \u{2014}"),
+impl WifiBody {
+    fn submit(&mut self, ctx: &mut Ctx) {
+        if let Some(ssid) = self.pending.take() {
+            let pw = std::mem::take(&mut self.field.text);
+            self.field.clear();
+            if !pw.is_empty() { net::wifi_connect(ctx.poster, &ssid, Some(pw), true); } else { self.pending = Some(ssid); }
+        }
     }
 }
 
-fn gather_volume() -> Value {
-    let mut v = gather_audio_outputs();
-    let streams = if v["available"].as_bool().unwrap_or(false) { pactl_json(&["list", "sink-inputs"]).ok() } else { None };
-    v["streams_available"] = json!(streams.is_some());
-    v["streams"] = json!(streams.map(|s| normalize_audio_streams(&s)).unwrap_or_default());
+// ---- Bluetooth
+#[derive(Default)]
+pub struct BtBody { hits: Hits, scroll: Scroll }
+
+/// One slice of the Bluetooth list: a section header or a device (index into `BtSnap::devs`, which is sorted
+/// connected, then paired, then the rest).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BtRow { Header(&'static str, usize), Dev(usize) }
+
+impl BtRow {
+    fn h(self) -> f32 { match self { BtRow::Header(..) => 26.0, BtRow::Dev(_) => 52.0 } }
+}
+
+const ID_DISC0: u32 = 600;
+
+fn bt_rows(devs: &[net::BtDev]) -> Vec<BtRow> {
+    let mut rows = Vec::new();
+    for (title, keep) in [("Connected", 0u8), ("Paired", 1), ("Nearby", 2)] {
+        let class = |d: &net::BtDev| if d.connected { 0 } else if d.paired { 1 } else { 2 };
+        let idx: Vec<usize> = (0..devs.len()).filter(|&i| class(&devs[i]) == keep).collect();
+        if idx.is_empty() { continue; }
+        rows.push(BtRow::Header(title, idx.len()));
+        rows.extend(idx.into_iter().map(BtRow::Dev));
+    }
+    rows
+}
+
+impl Body for BtBody {
+    fn opened(&mut self, poster: &Poster, _: &State) { net::refresh_bt(poster); }
+    fn natural_h(&mut self, _w: f32, st: &State, _: &mut TextSys) -> f32 {
+        let rows: f32 = bt_rows(&st.net.bt.devs).iter().map(|r| r.h()).sum();
+        (46.0 + rows.max(52.0)).min(MAX_BODY_H)
+    }
+    fn cursor(&self) -> Cursor { self.hits.cursor() }
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, r: Rect) {
+        let st = dc.state;
+        let pal = &st.pal;
+        let snap = &st.net.bt;
+        self.hits.clear();
+        let (_, sub) = snap.card_text();
+        header(cv, pal, r, "Bluetooth", &st.net.status_line.clone().unwrap_or(sub));
+        let t = rect(r.right() - 44.0, r.y + 4.0, 44.0, 24.0);
+        self.hits.add(t, ID_TOGGLE);
+        if snap.available { switch(cv, pal, t, if snap.on { 1.0 } else { 0.0 }); }
+        let sc = rect(r.right() - 104.0, r.y + 4.0, 52.0, 24.0);
+        let hs = self.hits.add(sc, ID_SCAN);
+        if snap.on { button(cv, pal, sc, if st.net.busy { "…" } else { "Scan" }, ButtonKind::Plain, hs, false); }
+        let list = rect(r.x, r.y + 44.0, r.w, (r.bottom() - r.y - 44.0).max(0.0));
+        let rows = bt_rows(&snap.devs);
+        self.scroll.content_h = rows.iter().map(|r| r.h()).sum();
+        self.scroll.clamp(list.h);
+        if snap.devs.is_empty() {
+            cv.text_in(if !snap.available { "Bluetooth unavailable" } else if !snap.on { "Bluetooth is off" } else { "No devices found" }, &pal.text_dim(12.0), rect(list.x, list.y, list.w, 30.0), HAlign::Center);
+        }
+        cv.with_clip(list, [0.0; 4], |cv| {
+            let mut y = list.y - self.scroll.offset;
+            for row in &rows {
+                let h = row.h();
+                let top = y;
+                y += h;
+                if top + h < list.y || top > list.bottom() { continue; }
+                match *row {
+                    BtRow::Header(t, n) => {
+                        cv.text(&format!("{t} · {n}"), &pal.text_dim(11.0), pt(list.x + 2.0, top + 13.0), HAlign::Left, VAlign::Middle);
+                    }
+                    BtRow::Dev(i) => {
+                        let d = &snap.devs[i];
+                        let rr = rect(list.x, top, list.w, 46.0);
+                        let hov = self.hits.add_in(rr, list, ID_ROW0 + i as u32);
+                        row_bg(cv, pal, rr, hov, d.connected);
+                        if d.connected { cv.fill_rrect(rect(rr.x + 5.0, rr.y + 9.0, 3.0, rr.h - 18.0), r_all(1.5), pal.accent_hi); }
+                        cv.text(d.glyph(), &TextStyle::icon(18.0, if d.connected { pal.accent_hi } else { pal.fg }), pt(rr.x + 22.0, rr.y + 23.0), HAlign::Left, VAlign::Middle);
+                        let right = if d.connected { 96.0 } else { 20.0 };
+                        cv.text_in(&d.name, &TextStyle::new(pal.fs(13.0), pal.fg_hi).weight(600), rect(rr.x + 50.0, rr.y + 5.0, rr.w - 50.0 - right - if d.battery.is_some() && d.connected { 40.0 } else { 0.0 }, 18.0), HAlign::Left);
+                        let meta = d.audio_status(snap.audio_available).unwrap_or_else(|| if d.connected { "Connected".into() } else if d.paired { "Paired · tap to connect".into() } else { "Tap to pair and connect".into() });
+                        cv.text_in(&meta, &pal.text_dim(10.0), rect(rr.x + 50.0, rr.y + 24.0, rr.w - 50.0 - right, 16.0), HAlign::Left);
+                        if d.connected {
+                            let db = rect(rr.right() - 84.0, rr.y + 11.0, 74.0, 24.0);
+                            let hd = self.hits.add_in(db, list, ID_DISC0 + i as u32);
+                            button(cv, pal, db, "Disconnect", ButtonKind::Plain, hd, false);
+                            if let Some(b) = d.battery {
+                                cv.text(&format!("{b}%"), &TextStyle::new(pal.fs(10.0), pal.accent_hi).bold(), pt(db.x - 8.0, rr.y + 23.0), HAlign::Right, VAlign::Middle);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        scrollbar(cv, pal, list, self.scroll.offset, self.scroll.content_h);
+    }
+    fn event(&mut self, ev: &Event, r: Rect, ctx: &mut Ctx) {
+        if let Event::Scroll { dy, .. } = ev { self.scroll.by(*dy, r.h - 44.0); return; }
+        let Some(c) = self.hits.event(ev) else { return };
+        if c.button != Button::Left { return; }
+        match c.id {
+            ID_TOGGLE => net::bt_power(ctx.poster, !ctx.state.net.bt.on),
+            ID_SCAN => net::bt_scan(ctx.poster),
+            id if (ID_DISC0..ID_DISC0 + 400).contains(&id) => {
+                let Some(d) = ctx.state.net.bt.devs.get((id - ID_DISC0) as usize).cloned() else { return };
+                if d.connected { net::bt_connect(ctx.poster, &d.mac, &d.name, false); }
+            }
+            id if (ID_ROW0..ID_DISC0).contains(&id) => {
+                let Some(d) = ctx.state.net.bt.devs.get((id - ID_ROW0) as usize).cloned() else { return };
+                if d.connected && d.audio_action().is_some() && !d.active { net::bt_use_audio(ctx.poster, &d.mac, &d.name); }
+                else if !d.connected { net::bt_connect(ctx.poster, &d.mac, &d.name, true); }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---- Volume
+
+/// One horizontal slice of the scrolling list below the master controls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Row { Header(&'static str), Msg(&'static str), App(usize), Out(usize) }
+
+impl Row {
+    fn h(self) -> f32 {
+        match self { Row::Header(_) => 24.0, Row::Msg(_) => 30.0, Row::App(_) => APP_ROW_H, Row::Out(_) => 44.0 }
+    }
+}
+
+const APP_ROW_H: f32 = 64.0;
+/// Master controls occupy `r.y + 42 .. r.y + 70`; the list starts below them (and below the error line).
+const LIST_TOP: f32 = 84.0;
+const ERROR_H: f32 = 20.0;
+const ID_SLIDER: u32 = 5;
+const ID_MUTE: u32 = 6;
+/// Hit IDs of per-application controls carry the sink-input ID in the low 30 bits; outputs use `ID_ROW0 + index`.
+const TAG_MASK: u32 = 0xC000_0000;
+const TAG_MUTE: u32 = 0x4000_0000;
+const TAG_SLIDER: u32 = 0x8000_0000;
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(800);
+
+fn stream_hit(tag: u32, id: u64) -> u32 { tag | id as u32 }
+fn stream_of(hit: u32) -> Option<(u32, u64)> {
+    let tag = hit & TAG_MASK;
+    (tag == TAG_MUTE || tag == TAG_SLIDER).then_some((tag, (hit & !TAG_MASK) as u64))
+}
+
+/// Rows of the list: Applications (or why there are none), then the separate output-device list.
+fn volume_rows(audio: Option<&Value>) -> Vec<Row> {
+    let Some(a) = audio else { return vec![Row::Msg("Loading…")] };
+    if a["available"].as_bool() != Some(true) { return vec![Row::Msg("Audio unavailable")]; }
+    let mut rows = vec![Row::Header("Applications")];
+    if a["streams_available"].as_bool() != Some(true) {
+        rows.push(Row::Msg("Applications unavailable"));
+    } else {
+        let n = crate::audio::playing_streams(a).count();
+        if n == 0 { rows.push(Row::Msg("No applications playing")); } else { rows.extend((0..n).map(Row::App)); }
+    }
+    let outs = a["outputs"].as_array().map_or(0, Vec::len);
+    if outs > 0 {
+        rows.push(Row::Header("Output devices"));
+        rows.extend((0..outs).map(Row::Out));
+    }
+    rows
+}
+
+fn stream_present(audio: Option<&Value>, id: u64) -> bool {
+    audio.is_some_and(|a| crate::audio::playing_streams(a).any(|s| s["id"].as_u64() == Some(id)))
+}
+
+fn next_audio_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Store a refresh result unless a newer one is already shown. Always ends the in-flight poll.
+fn apply_audio(st: &mut State, seq: u64, v: Value) {
+    st.popup.audio_busy = false;
+    if seq < st.popup.audio_seq { return; }
+    st.popup.audio_seq = seq;
+    st.popup.audio = Some(v);
+}
+
+/// Read the mixer on a worker. `poll` keeps the visible page refreshing every 0.8 s: the follow-up post redraws it
+/// and the next tick polls again (nothing wakes a page that is no longer visible).
+fn refresh_audio(poster: &Poster, clear_error: bool, poll: bool) {
+    let (p, seq) = (poster.clone(), next_audio_seq());
+    std::thread::spawn(move || {
+        let v = crate::audio::gather_volume();
+        p.post(move |st, _| {
+            apply_audio(st, seq, v);
+            if clear_error { st.popup.audio_error = None; }
+        });
+        if poll {
+            std::thread::sleep(POLL_EVERY);
+            p.post(|_, _| {});
+        }
+    });
+}
+
+/// Error to show for a failed mixer command. A failure for a stream that a successful re-list proves gone is stale
+/// UI, not an error; if the re-list failed too, the real error stays.
+fn command_error(result: Result<(), String>, stream: Option<u64>, listing: &Value) -> Option<String> {
+    let e = result.err()?;
+    let relisted = listing["available"].as_bool() == Some(true) && listing["streams_available"].as_bool() == Some(true);
+    let gone = stream.is_some_and(|id| relisted && !listing["streams"].as_array().is_some_and(|s| s.iter().any(|x| x["id"].as_u64() == Some(id))));
+    if gone { None } else { Some(e) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MixerCmd { StreamVolume(u64, u8), StreamMute(u64) }
+
+/// Run a mixer command and re-list afterwards, both on a worker.
+fn run_mixer(ctx: &mut Ctx, work: impl FnOnce() -> Result<(), String> + Send + 'static, stream: Option<u64>) {
+    ctx.state.popup.audio_cmds += 1;
+    let p = ctx.poster.clone();
+    std::thread::spawn(move || {
+        let r = work();
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        let err = command_error(r, stream, &v);
+        p.post(move |st, _| {
+            st.popup.audio_cmds = st.popup.audio_cmds.saturating_sub(1);
+            apply_audio(st, seq, v);
+            st.popup.audio_error = err;
+        });
+    });
+}
+
+fn stream_command(ctx: &mut Ctx, cmd: MixerCmd) {
+    match cmd {
+        MixerCmd::StreamVolume(id, pct) => run_mixer(ctx, move || crate::audio::set_stream_volume(id, pct), Some(id)),
+        MixerCmd::StreamMute(id) => run_mixer(ctx, move || crate::audio::toggle_stream_mute(id), Some(id)),
+    }
+}
+
+/// What the pointer is currently dragging. Stream drags are frozen to the sink-input ID and track rectangle at press.
+#[derive(Clone, Copy, Debug)]
+enum Drag { Master(f32), Stream { id: u64, track: Rect, pct: f32 } }
+
+#[derive(Default)]
+pub struct VolumeBody {
+    hits: Hits,
+    scroll: Scroll,
+    drag: Option<Drag>,
+    last_poll: Option<std::time::Instant>,
+    /// Master controls were drawn enabled in the last frame.
+    master_ok: bool,
+    /// Slider track of every stream row drawn last frame.
+    tracks: Vec<(u64, Rect)>,
+}
+
+impl VolumeBody {
+    fn list_top(st: &State) -> f32 { LIST_TOP + if st.popup.audio_error.is_some() { ERROR_H } else { 0.0 } }
+}
+
+impl Body for VolumeBody {
+    fn opened(&mut self, poster: &Poster, _: &State) {
+        self.drag = None;
+        self.last_poll = Some(std::time::Instant::now());
+        refresh_audio(poster, true, true);
+    }
+    fn tick(&mut self, _dt: f32, ctx: &mut Ctx) -> bool {
+        if let Some(Drag::Stream { id, .. }) = self.drag {
+            if !stream_present(ctx.state.popup.audio.as_ref(), id) { self.drag = None; }
+        }
+        let due = self.last_poll.is_none_or(|t| t.elapsed() >= POLL_EVERY);
+        let p = &mut ctx.state.popup;
+        if due && self.drag.is_none() && p.audio_cmds == 0 && !p.audio_busy {
+            self.last_poll = Some(std::time::Instant::now());
+            p.audio_busy = true;
+            refresh_audio(ctx.poster, false, true);
+        }
+        false
+    }
+    fn natural_h(&mut self, _w: f32, st: &State, _: &mut TextSys) -> f32 {
+        let rows: f32 = volume_rows(st.popup.audio.as_ref()).iter().map(|r| r.h()).sum();
+        (Self::list_top(st) + rows).min(MAX_BODY_H)
+    }
+    fn cursor(&self) -> Cursor { self.hits.cursor() }
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, r: Rect) {
+        let st = dc.state;
+        let pal = &st.pal;
+        self.hits.clear();
+        self.tracks.clear();
+        let audio = st.popup.audio.as_ref();
+        let vol = &st.status.volume;
+        // unknown master values disable the controls instead of reading as 0 %
+        let server_ok = audio.is_none_or(|a| a["available"].as_bool() == Some(true) && a["master"]["vol"].is_number());
+        self.master_ok = vol.available && server_ok;
+        let master_pct = match self.drag { Some(Drag::Master(p)) => Some(p), _ => self.master_ok.then_some(vol.percent as f32) };
+        header(cv, pal, r, "Volume", if self.master_ok && vol.muted { "Muted" } else { "" });
+        let label = master_pct.map_or("—".to_string(), |p| format!("{p:.0}%"));
+        cv.text(&label, &TextStyle::new(pal.fs(14.0), pal.fg_hi).bold(), pt(r.right(), r.y + 2.0), HAlign::Right, VAlign::Top);
+        let pct = master_pct.unwrap_or(0.0);
+        let m = rect(r.x, r.y + 42.0, 30.0, 28.0);
+        let s = rect(r.x + 42.0, r.y + 42.0, r.w - 48.0, 28.0);
+        cv.with_alpha(if self.master_ok { 1.0 } else { 0.4 }, |cv| {
+            let hm = self.master_ok && self.hits.add(m, ID_MUTE);
+            cv.fill_circle(m.center(), 14.0, with_a(pal.fg, if hm { 0.2 } else { 0.1 }));
+            cv.text(if vol.muted || pct == 0.0 { "\u{f6a9}" } else { "\u{f028}" }, &TextStyle::icon(13.0, pal.fg_hi), m.center(), HAlign::Center, VAlign::Middle);
+            if self.master_ok { self.hits.add_cursor(s, ID_SLIDER, Cursor::Pointer); }
+            slider(cv, pal, s, pct / 100.0, if vol.muted { pal.dim } else { pal.accent });
+        });
+        if let Some(e) = &st.popup.audio_error {
+            cv.text_in(e, &TextStyle::new(pal.fs(11.0), pal.red), rect(r.x, r.y + 74.0, r.w, 16.0), HAlign::Left);
+        }
+
+        let top = Self::list_top(st);
+        let list = rect(r.x, r.y + top, r.w, (r.h - top).max(0.0));
+        let rows = volume_rows(audio);
+        self.scroll.content_h = rows.iter().map(|r| r.h()).sum();
+        self.scroll.clamp(list.h);
+        let apps: Vec<&Value> = audio.map(|a| crate::audio::playing_streams(a).collect()).unwrap_or_default();
+        let outs: &[Value] = audio.and_then(|a| a["outputs"].as_array()).map_or(&[], Vec::as_slice);
+        cv.with_clip(list, [0.0; 4], |cv| {
+            let mut y = list.y - self.scroll.offset;
+            for row in &rows {
+                let rr = rect(list.x, y, list.w, row.h() - 6.0);
+                y += row.h();
+                if rr.bottom() < list.y || rr.y > list.bottom() { continue; }
+                match *row {
+                    Row::Header(t) => { cv.text(t, &pal.text_dim(11.0), pt(rr.x + 2.0, rr.y + 12.0), HAlign::Left, VAlign::Middle); }
+                    Row::Msg(t) => { cv.text_in(t, &pal.text_dim(12.0), rect(rr.x, rr.y, rr.w, 24.0), HAlign::Center); }
+                    Row::App(i) => {
+                        let Some(s) = apps.get(i) else { continue };
+                        let Some(id) = s["id"].as_u64() else { continue };
+                        self.draw_app(cv, pal, s, id, rr, list);
+                    }
+                    Row::Out(i) => {
+                        let Some(o) = outs.get(i) else { continue };
+                        let hov = self.hits.add_in(rr, list, ID_ROW0 + i as u32);
+                        let def = o["default"].as_bool().unwrap_or(false);
+                        row_bg(cv, pal, rr, hov, def);
+                        cv.text("\u{f025}", &TextStyle::icon(14.0, if def { pal.accent_hi } else { pal.fg }), pt(rr.x + 12.0, rr.y + 19.0), HAlign::Left, VAlign::Middle);
+                        cv.text_in(o["desc"].as_str().unwrap_or(""), &TextStyle::new(pal.fs(12.0), pal.fg_hi).weight(600), rect(rr.x + 36.0, rr.y, rr.w - 48.0, rr.h), HAlign::Left);
+                    }
+                }
+            }
+        });
+        scrollbar(cv, pal, list, self.scroll.offset, self.scroll.content_h);
+    }
+    fn event(&mut self, ev: &Event, r: Rect, ctx: &mut Ctx) {
+        let top = Self::list_top(ctx.state);
+        let slider_rect = rect(r.x + 42.0, r.y + 42.0, r.w - 48.0, 28.0);
+        let frac = |track: Rect, x: f32| ((x - track.x) / track.w).clamp(0.0, 1.0);
+        match ev {
+            Event::Scroll { dy, pos, .. } if self.master_ok && slider_rect.contains(*pos) => { crate::sysinfo::volume_step(ctx.poster, if *dy < 0.0 { 5 } else { -5 }); return; }
+            Event::Scroll { dy, .. } => { self.scroll.by(*dy, r.h - top); return; }
+            Event::Press(Button::Left, p) if self.master_ok && slider_rect.contains(*p) => { self.drag = Some(Drag::Master(frac(slider_rect, p.x) * 100.0)); }
+            Event::Press(Button::Left, p) => {
+                if let Some((TAG_SLIDER, id)) = self.hits.at(*p).and_then(stream_of) {
+                    if let Some(track) = self.tracks.iter().find(|(i, _)| *i == id).map(|(_, t)| *t) {
+                        self.drag = Some(Drag::Stream { id, track, pct: frac(track, p.x) * 100.0 });
+                    }
+                }
+            }
+            Event::PointerMove(p) => match &mut self.drag {
+                Some(Drag::Master(v)) => *v = frac(slider_rect, p.x) * 100.0,
+                Some(Drag::Stream { track, pct, .. }) => *pct = frac(*track, p.x) * 100.0,
+                None => {}
+            },
+            Event::Release(Button::Left, p) if self.drag.is_some() => {
+                match self.drag.take() {
+                    Some(Drag::Master(_)) => crate::sysinfo::set_volume(ctx.poster, (frac(slider_rect, p.x) * 100.0).round() as u8),
+                    Some(Drag::Stream { id, track, .. }) => {
+                        // a stream that disappeared mid-drag cancels the drag; nothing is retargeted
+                        if stream_present(ctx.state.popup.audio.as_ref(), id) {
+                            stream_command(ctx, MixerCmd::StreamVolume(id, (frac(track, p.x) * 100.0).round() as u8));
+                        }
+                    }
+                    None => {}
+                }
+                self.hits.event(ev);
+                return;
+            }
+            _ => {}
+        }
+        let Some(c) = self.hits.event(ev) else { return };
+        if c.button != Button::Left { return; }
+        if let Some((TAG_MUTE, id)) = stream_of(c.id) {
+            if stream_present(ctx.state.popup.audio.as_ref(), id) { stream_command(ctx, MixerCmd::StreamMute(id)); }
+            return;
+        }
+        match c.id {
+            ID_MUTE if self.master_ok => crate::sysinfo::toggle_mute(ctx.poster),
+            id if (ID_ROW0..TAG_MUTE).contains(&id) => {
+                let name = ctx.state.popup.audio.as_ref().and_then(|a| a["outputs"].get((id - ID_ROW0) as usize)).and_then(|o| o["name"].as_str()).map(str::to_string);
+                if let Some(name) = name {
+                    run_mixer(ctx, move || crate::audio::select_audio_output(&name), None);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl VolumeBody {
+    /// One application row: name, percentage, mute toggle and 0-100 % slider, all addressed by sink-input `id`.
+    fn draw_app(&mut self, cv: &mut Canvas, pal: &Palette, s: &Value, id: u64, rr: Rect, list: Rect) {
+        row_bg(cv, pal, rr, false, false);
+        let vol = s["vol"].as_f64();
+        let muted = s["mute"].as_bool();
+        let dragged = match self.drag { Some(Drag::Stream { id: d, pct, .. }) if d == id => Some(pct), _ => None };
+        let shown = dragged.or(vol.map(|v| v as f32));
+        let name = s["name"].as_str().unwrap_or("Unknown");
+        cv.text_in(name, &TextStyle::new(pal.fs(12.0), pal.fg_hi).weight(600), rect(rr.x + 12.0, rr.y + 4.0, rr.w - 80.0, 20.0), HAlign::Left);
+        // externally set overdrive stays visible in the label
+        let label = shown.map_or("—".to_string(), |p| format!("{:.0}%", p));
+        cv.text(&label, &TextStyle::new(pal.fs(11.0), if muted == Some(true) { pal.dim } else { pal.accent_hi }).bold(), pt(rr.right() - 12.0, rr.y + 14.0), HAlign::Right, VAlign::Middle);
+        let m = rect(rr.x + 10.0, rr.y + 28.0, 26.0, 24.0);
+        let track = rect(rr.x + 46.0, rr.y + 28.0, rr.w - 60.0, 24.0);
+        let off = muted == Some(true);
+        cv.with_alpha(if muted.is_some() { 1.0 } else { 0.4 }, |cv| {
+            let hm = muted.is_some() && self.hits.add_in(m, list, stream_hit(TAG_MUTE, id));
+            cv.fill_circle(m.center(), 12.0, with_a(pal.fg, if hm { 0.2 } else { 0.1 }));
+            cv.text(if off { "\u{f6a9}" } else { "\u{f028}" }, &TextStyle::icon(12.0, pal.fg_hi), m.center(), HAlign::Center, VAlign::Middle);
+        });
+        cv.with_alpha(if shown.is_some() { 1.0 } else { 0.4 }, |cv| {
+            if shown.is_some() {
+                self.hits.add_in(track, list, stream_hit(TAG_SLIDER, id));
+                self.tracks.push((id, track));
+            }
+            slider(cv, pal, track, shown.unwrap_or(0.0).min(100.0) / 100.0, if off { pal.dim } else { pal.accent });
+        });
+    }
+}
+
+// ---- Battery
+#[derive(Default)]
+pub struct BatteryBody {
+    hits: Hits,
+    /// Highlight position in button-index units; eases toward `target` so a mode switch slides.
+    pos: Option<f32>,
+    /// Index the highlight is heading for: the clicked mode at once, then the reported active one.
+    target: Option<usize>,
+}
+
+/// Exponential ease: ~95 % of the way in 170 ms, independent of frame rate.
+fn ease(pos: f32, target: f32, dt: f32) -> f32 {
+    let d = target - pos;
+    if d.abs() < 0.002 { target } else { pos + d * (1.0 - (-dt * 18.0).exp()) }
+}
+
+const ID_PROFILE0: u32 = 100;
+const PROFILE_H: f32 = 70.0;
+
+/// Read the power profiles on a worker and apply them (optionally switching first).
+fn profile_work(poster: &Poster, set: Option<String>) {
+    let p = poster.clone();
+    std::thread::spawn(move || {
+        let err = set.and_then(|n| crate::power::set_profile(&n).err());
+        let now = crate::power::profiles();
+        p.post(move |st, _| {
+            st.popup.profile_busy = false;
+            st.popup.profile_error = err;
+            st.popup.profiles = now;
+        });
+    });
+}
+
+pub fn fmt_duration(secs: u64) -> String { format!("{} h {} min", secs / 3600, secs % 3600 / 60) }
+
+fn state_text(s: BatteryState) -> &'static str {
+    match s { BatteryState::Charging => "Charging", BatteryState::Discharging => "On battery", BatteryState::Full => "Fully charged", BatteryState::NotCharging => "Not charging", BatteryState::Unknown => "Unknown" }
+}
+
+pub fn battery_lines(p: &PowerSnapshot) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    let Some(b) = p.batteries.first() else { return v };
+    v.push(("Status".into(), state_text(b.state).into()));
+    if let Some(a) = p.ac_online { v.push(("Power source".into(), if a { "AC adapter".into() } else { "Battery".into() })); }
+    if let Some(w) = b.power_w { v.push(("Power".into(), format!("{w:.1} W"))); }
+    if let Some(s) = b.time_to_empty_secs.filter(|_| b.state == BatteryState::Discharging) { v.push(("Time left".into(), fmt_duration(s))); }
+    if let Some(s) = b.time_to_full_secs.filter(|_| b.state == BatteryState::Charging) { v.push(("Until full".into(), fmt_duration(s))); }
+    if let (Some(n), Some(f)) = (b.energy_now_wh, b.energy_full_wh) { v.push(("Energy".into(), format!("{n:.1} / {f:.1} Wh"))); }
+    if let Some(h) = b.health_pct { v.push(("Health".into(), format!("{h:.0}%"))); }
+    if let Some(c) = b.cycles { v.push(("Cycles".into(), c.to_string())); }
+    if let Some(t) = &b.technology { v.push(("Technology".into(), t.clone())); }
     v
 }
 
+impl BatteryBody {
+    fn lines_h(st: &State) -> f32 { st.status.power.as_ref().map_or(0, |p| battery_lines(p).len()) as f32 * 24.0 }
+    fn has_battery(st: &State) -> bool { st.status.power.as_ref().is_some_and(|p| p.available && !p.batteries.is_empty()) }
+    fn profile_top(st: &State) -> f32 { if Self::has_battery(st) { 70.0 + Self::lines_h(st) + 8.0 } else { 34.0 } }
+}
+
+impl Body for BatteryBody {
+    fn opened(&mut self, poster: &Poster, _: &State) { profile_work(poster, None); }
+    fn natural_h(&mut self, _w: f32, st: &State, _: &mut TextSys) -> f32 {
+        Self::profile_top(st) + if st.popup.profiles.is_some() { PROFILE_H } else { 0.0 }
+    }
+    fn cursor(&self) -> Cursor { self.hits.cursor() }
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, r: Rect) {
+        let pal = &dc.state.pal;
+        self.hits.clear();
+        let top = Self::profile_top(dc.state);
+        if let Some(p) = dc.state.status.power.as_ref().filter(|_| Self::has_battery(dc.state)) {
+            let pct = p.percentage.unwrap_or(0.0);
+            let charging = crate::power::actively_charging(p);
+            let col = if charging { pal.accent_hi } else if pct <= 15.0 { pal.red } else if pct <= 25.0 { pal.yellow } else { pal.fg_hi };
+            cv.text(&format!("{pct:.0}%"), &TextStyle::new(pal.fs(30.0), col).bold(), pt(r.x, r.y), HAlign::Left, VAlign::Top);
+            cv.text(if charging { "\u{f0e7}" } else { "\u{f240}" }, &TextStyle::icon(24.0, col), pt(r.right(), r.y + 18.0), HAlign::Right, VAlign::Middle);
+            let bar = rect(r.x, r.y + 52.0, r.w, 6.0);
+            cv.fill_rrect(bar, r_all(3.0), pal.active);
+            cv.fill_rrect(rect(bar.x, bar.y, bar.w * (pct as f32 / 100.0).clamp(0.0, 1.0), bar.h), r_all(3.0), col);
+            for (i, (k, v)) in battery_lines(p).iter().enumerate() {
+                let y = r.y + 70.0 + i as f32 * 24.0;
+                cv.text(k, &pal.text_dim(12.0), pt(r.x, y), HAlign::Left, VAlign::Top);
+                cv.text(v, &pal.text(12.0), pt(r.right(), y), HAlign::Right, VAlign::Top);
+            }
+        } else {
+            header(cv, pal, r, "Battery", "No battery detected");
+        }
+        let Some(pr) = dc.state.popup.profiles.as_ref() else { return };
+        let y = r.y + top;
+        cv.text("Power mode", &pal.text_dim(11.0), pt(r.x + 2.0, y + 6.0), HAlign::Left, VAlign::Middle);
+        if let Some(e) = &dc.state.popup.profile_error {
+            cv.text_in(e, &TextStyle::new(pal.fs(11.0), pal.red), rect(r.x + 90.0, y, r.w - 90.0, 14.0), HAlign::Right);
+        }
+        let n = pr.available.len().max(1) as f32;
+        let gap = 8.0;
+        let w = (r.w - gap * (n - 1.0)) / n;
+        let busy = dc.state.popup.profile_busy;
+        let active = pr.available.iter().position(|p| *p == pr.active);
+        let pos = self.pos.or(active.map(|i| i as f32)).unwrap_or(0.0);
+        let btn = |i: f32| rect(r.x + i * (w + gap), y + 18.0, w, 32.0);
+        for (i, _) in pr.available.iter().enumerate() {
+            let b = btn(i as f32);
+            let hov = !busy && self.hits.add(b, ID_PROFILE0 + i as u32);
+            cv.fill_rrect(b, r_all(16.0), if hov { pal.hover } else { pal.surface });
+        }
+        if active.is_some() || self.target.is_some() {
+            let h = btn(pos);
+            cv.fill_rrect(h, r_all(16.0), pal.accent);
+        }
+        let on_text = if pal.is_light { crate::render::rgb(255, 255, 255) } else { pal.bg };
+        for (i, name) in pr.available.iter().enumerate() {
+            // text turns to the on-accent colour while the highlight is under it
+            let under = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
+            let col = crate::render::mix(pal.fg, on_text, under);
+            cv.text_in(&crate::power::profile_label(name), &TextStyle::new(pal.fs(12.0), col).weight(600), btn(i as f32), HAlign::Center);
+        }
+    }
+    fn tick(&mut self, dt: f32, ctx: &mut Ctx) -> bool {
+        let pr = ctx.state.popup.profiles.as_ref();
+        let reported = pr.and_then(|p| p.available.iter().position(|a| *a == p.active));
+        // an error or a settled switch drops the optimistic target back to what the system reports
+        if !ctx.state.popup.profile_busy { self.target = reported; }
+        let Some(t) = self.target.map(|t| t as f32) else { return false };
+        let cur = self.pos.unwrap_or(t);
+        let next = ease(cur, t, dt);
+        self.pos = Some(next);
+        next != t
+    }
+    fn event(&mut self, ev: &Event, _: Rect, ctx: &mut Ctx) {
+        let Some(c) = self.hits.event(ev) else { return };
+        if c.button != Button::Left || ctx.state.popup.profile_busy { return; }
+        let Some(i) = c.id.checked_sub(ID_PROFILE0) else { return };
+        let Some(name) = ctx.state.popup.profiles.as_ref().and_then(|p| p.available.get(i as usize)).cloned() else { return };
+        ctx.state.popup.profile_busy = true;
+        self.target = Some(i as usize);
+        profile_work(ctx.poster, Some(name));
+    }
+}
+
+// ---------------------------------------------------------------- notch sub-pages
+
+/// Hosts a popup body as a notch page (`wifi`, `bt`, `audio`, `battery`) with a header back button.
+pub struct BodyPage { body: Box<dyn Body>, hits: Hits }
+
+impl BodyPage {
+    pub fn new(kind: &str) -> Option<BodyPage> { body_for(kind).map(|body| BodyPage { body, hits: Hits::default() }) }
+}
+
+impl Page for BodyPage {
+    fn natural(&mut self, avail: Size, st: &State, ts: &mut TextSys) -> Size {
+        Size { w: avail.w, h: self.body.natural_h(avail.w, st, ts) + 40.0 }
+    }
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, area: Rect) {
+        let pal = &dc.state.pal;
+        self.hits.clear();
+        let back = rect(area.x, area.y, 60.0, 26.0);
+        let hb = self.hits.add(back, 1);
+        button(cv, pal, back, "\u{f053} Back", ButtonKind::Plain, hb, false);
+        self.body.draw(cv, dc, rect(area.x, area.y + 40.0, area.w, area.h - 40.0));
+    }
+    fn event(&mut self, ev: &Event, area: Rect, ctx: &mut Ctx) {
+        if let Some(c) = self.hits.event(ev) { if c.id == 1 { ctx.state.nav = Some(NavTo::Page("controls")); return; } }
+        self.body.event(ev, rect(area.x, area.y + 40.0, area.w, area.h - 40.0), ctx);
+    }
+    fn tick(&mut self, dt: f32, ctx: &mut Ctx) -> bool { self.body.tick(dt, ctx) }
+    fn shown(&mut self, ctx: &mut Ctx) { self.body.opened(ctx.poster, ctx.state); }
+    fn wants_keyboard(&self) -> bool { self.body.wants_keyboard() }
+    fn cursor(&self) -> Cursor { let c = self.hits.cursor(); if c != Cursor::Default { c } else { self.body.cursor() } }
+}
+
+// ---------------------------------------------------------------- control fifo
+
+/// Notch pages a fifo request may open (`page <id>`).
+const FIFO_PAGES: [&str; 13] = ["home", "media", "calendar", "clipboard", "ai", "controls", "weather", "settings", "wifi", "bt", "audio", "battery", "display"];
+
+/// Page a fifo line asks for: `volume|audio`, `bluetooth|bt`, `wifi`, `battery`, `calendar`, `settings`, `display`
+/// or `page <id>`. Anything else is ignored.
+fn fifo_page(kind: &str, arg: &str) -> Option<&'static str> {
+    let id = match kind {
+        "volume" | "audio" => "audio",
+        "bluetooth" | "bt" => "bt",
+        "wifi" | "battery" | "calendar" | "settings" | "display" => kind,
+        "page" => arg,
+        _ => return None,
+    };
+    FIFO_PAGES.into_iter().find(|p| *p == id)
+}
+
+/// `waybar-popupctl <kind>` (volume|wifi|bluetooth|battery|calendar|settings|display open the matching notch page;
+/// osd-volume|osd-brightness; `page <id>` for any notch page; reload-theme) writes `"<kind> <nanos>"` lines to
+/// `$XDG_RUNTIME_DIR/waybar-popupd.fifo`.
+pub fn start_fifo(poster: &Poster) {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
+    let path = std::path::Path::new(&rt).join("waybar-popupd.fifo");
+    if let Ok(m) = std::fs::symlink_metadata(&path) { if m.file_type().is_fifo() { let _ = std::fs::remove_file(&path); } else { return; } }
+    if nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).is_err() { return; }
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let poster = poster.clone();
+    std::thread::spawn(move || loop {
+        // opening read+write keeps the fifo alive between writers
+        let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&path) else { return };
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
+            let mut words = line.split_whitespace();
+            let kind = words.next().unwrap_or("").to_string();
+            let arg = words.next().unwrap_or("").to_string();
+            let p = poster.clone();
+            match kind.as_str() {
+                "osd-volume" => crate::osd::request(&p, "volume"),
+                "osd-brightness" => crate::osd::request(&p, "brightness"),
+                "reload-theme" => poster.post(|st, _| {
+                    crate::theme::reload();
+                    let (s, _) = crate::config::load_settings();
+                    st.settings = s;
+                    st.refresh_palette();
+                }),
+                k => {
+                    if let Some(id) = fifo_page(k, &arg) { poster.post(move |st, _| { st.nav = Some(NavTo::Page(id)); }); }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Point;
+    use crate::audio::stub::Pactl;
+    use crate::net::{WifiNet, WifiSnap};
+    use crate::state::Volume;
+    use crate::testkit::{Pump, Rig};
+    use serde_json::json;
+    use tiny_skia::Pixmap;
+
+    #[test]
+    fn profile_highlight_slides_monotonically_and_settles() {
+        let (mut p, mut last) = (0.0f32, 0.0f32);
+        let mut frames = 0;
+        while p != 2.0 && frames < 120 { p = ease(p, 2.0, 0.016); assert!(p >= last && p <= 2.0); last = p; frames += 1; }
+        assert_eq!(p, 2.0);
+        assert!(frames > 4 && frames < 60, "slide takes a visible but short time: {frames} frames");
+    }
+
+    #[test]
+    fn bluetooth_rows_group_connected_paired_and_nearby() {
+        let d = |connected, paired| net::BtDev { connected, paired, ..Default::default() };
+        let devs = [d(true, true), d(true, false), d(false, true), d(false, false), d(false, false)];
+        assert_eq!(bt_rows(&devs), [BtRow::Header("Connected", 2), BtRow::Dev(0), BtRow::Dev(1), BtRow::Header("Paired", 1), BtRow::Dev(2), BtRow::Header("Nearby", 2), BtRow::Dev(3), BtRow::Dev(4)]);
+        assert!(bt_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn duration_format() { assert_eq!(fmt_duration(3 * 3600 + 25 * 60 + 9), "3 h 25 min"); }
+
+    #[test]
+    fn fifo_aliases_select_the_same_notch_pages_as_the_pill() {
+        assert_eq!(fifo_page("volume", ""), Some("audio"));
+        assert_eq!(fifo_page("audio", ""), Some("audio"));
+        assert_eq!(fifo_page("bluetooth", ""), Some("bt"));
+        assert_eq!(fifo_page("bt", ""), Some("bt"));
+        for k in ["wifi", "battery", "calendar", "settings", "display"] { assert_eq!(fifo_page(k, ""), Some(k)); }
+        assert_eq!(fifo_page("page", "weather"), Some("weather"));
+        assert_eq!(fifo_page("page", "audio"), Some("audio"));
+        assert_eq!(fifo_page("page", "bogus"), None);
+        assert_eq!(fifo_page("bogus", "audio"), None);
+        assert_eq!(fifo_page("", ""), None);
+        // every page the fifo can request exists in the notch
+        let built: Vec<&str> = crate::pages::build().iter().map(|(id, _)| *id).collect();
+        for id in ["wifi", "bt", "audio", "battery", "display", "calendar", "settings"] { assert!(built.contains(&id), "{id}"); }
+    }
+
+    #[test]
+    fn body_kinds_cover_every_control_page() {
+        for k in ["wifi", "bluetooth", "bt", "volume", "audio", "battery", "display"] { assert!(body_for(k).is_some(), "{k}"); }
+        assert!(body_for("bogus").is_none());
+    }
+
+    #[test]
+    fn wifi_body_renders_networks_in_a_notch_page() {
+        let mut rig = Rig::new();
+        rig.st.net.wifi = WifiSnap { on: true, available: true, nets: vec![
+            WifiNet { ssid: "Home".into(), signal: 80, secure: true, active: true, saved: true },
+            WifiNet { ssid: "Cafe".into(), signal: 40, secure: true, active: false, saved: false },
+        ] };
+        let mut page = BodyPage::new("wifi").unwrap();
+        let mut pm = Pixmap::new(480, 240).unwrap();
+        let mut cmds = Vec::new();
+        {
+            let mut cv = Canvas::new(&mut pm, &mut rig.text, 1.0);
+            let mut dc = DrawCtx { state: &rig.st, cmds: &mut cmds, poster: &rig.poster, id: 1, output: None };
+            page.draw(&mut cv, &mut dc, rect(0.0, 0.0, 480.0, 240.0));
+        }
+        crate::testkit::save_over_backdrop(&pm, 10, "/tmp/popup_wifi.png");
+        assert!(pm.pixels().iter().any(|p| p.alpha() > 0));
+    }
+
+    // ---- volume body: per-application controls
+
+    const AREA_W: f32 = 320.0;
+
+    struct Scene { rig: Rig, pump: Pump, body: VolumeBody, area: Rect, _pactl: Pactl }
+
+    impl Scene {
+        fn new(inputs: &[(u64, &str, u32, bool, bool)]) -> Scene {
+            let pactl = Pactl::install();
+            pactl.set_inputs(inputs);
+            let (mut rig, pump) = Rig::pumped();
+            rig.st.status.volume = Volume { available: true, percent: 50, muted: false };
+            Scene { rig, pump, body: VolumeBody::default(), area: rect(0.0, 0.0, AREA_W, MAX_BODY_H), _pactl: pactl }
+        }
+        fn pactl(&self) -> &Pactl { &self._pactl }
+        fn with_ctx<R>(&mut self, f: impl FnOnce(&mut VolumeBody, &mut Ctx) -> R) -> R {
+            let mut cmds = Vec::new();
+            let Scene { rig, body, .. } = self;
+            let mut ctx = Ctx { state: &mut rig.st, cmds: &mut cmds, text: &mut rig.text, poster: &rig.poster, id: 1, output: None };
+            f(body, &mut ctx)
+        }
+        fn pump_until(&mut self, what: &str, cond: impl Fn(&State) -> bool) { self.pump.until(&mut self.rig.st, what, cond); }
+        /// Open the page and wait for its first listing.
+        fn show(&mut self) {
+            self.with_ctx(|b, c| b.opened(c.poster, c.state));
+            self.pump_until("the first listing", |st| st.popup.audio.is_some());
+            self.draw();
+        }
+        fn draw(&mut self) -> Pixmap {
+            let mut pm = Pixmap::new(AREA_W as u32, MAX_BODY_H as u32).unwrap();
+            let mut cmds = Vec::new();
+            let Scene { rig, body, area, .. } = self;
+            let mut cv = Canvas::new(&mut pm, &mut rig.text, 1.0);
+            let mut dc = DrawCtx { state: &rig.st, cmds: &mut cmds, poster: &rig.poster, id: 1, output: None };
+            body.draw(&mut cv, &mut dc, *area);
+            pm
+        }
+        fn event(&mut self, ev: Event) {
+            let area = self.area;
+            self.with_ctx(|b, c| b.event(&ev, area, c));
+        }
+        fn click(&mut self, p: Point) {
+            for ev in [Event::PointerMove(p), Event::Press(Button::Left, p), Event::Release(Button::Left, p)] { self.event(ev); }
+        }
+        /// A point whose topmost hit region is `id`.
+        fn find(&self, id: u32) -> Option<Point> {
+            let mut y = 0.0;
+            while y < MAX_BODY_H {
+                let mut x = 0.0;
+                while x < AREA_W {
+                    if self.body.hits.at(pt(x, y)) == Some(id) { return Some(pt(x, y)); }
+                    x += 3.0;
+                }
+                y += 3.0;
+            }
+            None
+        }
+        fn mute_btn(&self, id: u64) -> Option<Point> { self.find(stream_hit(TAG_MUTE, id)) }
+        fn track(&self, id: u64) -> Rect { self.body.tracks.iter().find(|(i, _)| *i == id).unwrap().1 }
+        fn at_frac(&self, id: u64, f: f32) -> Point { let t = self.track(id); pt(t.x + t.w * f, t.center().y) }
+        /// Wait for every mixer command to finish and its re-listing to be applied.
+        fn settle(&mut self) {
+            self.pump_until("mixer commands", |st| st.popup.audio_cmds == 0);
+            self.draw();
+        }
+        fn ids(&self) -> Vec<u64> { self.body.tracks.iter().map(|(i, _)| *i).collect() }
+    }
+
+    #[test]
+    fn uncorked_streams_are_listed_muted_ones_stay_and_corked_ones_do_not() {
+        let mut s = Scene::new(&[(7, "Player", 40, true, false), (8, "Paused", 40, false, true), (9, "Browser", 70, false, false)]);
+        s.show();
+        assert_eq!(s.ids(), [7, 9]);
+        assert!(s.mute_btn(7).is_some() && s.mute_btn(9).is_some(), "muted streams keep a mute button to unmute");
+        assert!(s.mute_btn(8).is_none(), "corked streams are not offered");
+        assert_eq!(volume_rows(s.rig.st.popup.audio.as_ref()),
+            [Row::Header("Applications"), Row::App(0), Row::App(1), Row::Header("Output devices"), Row::Out(0)]);
+    }
+
+    #[test]
+    fn changing_one_stream_leaves_the_master_and_other_streams_alone() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false), (8, "Browser", 60, false, false)]);
+        s.show();
+        let p = s.at_frac(7, 0.25);
+        s.click(p);
+        s.settle();
+        let m = s.mute_btn(8).unwrap();
+        s.click(m);
+        s.settle();
+        assert_eq!(s.pactl().mutations(), ["set-sink-input-volume 7 25%", "set-sink-input-mute 8 toggle"]);
+        assert!(s.rig.st.popup.audio_error.is_none());
+    }
+
+    #[test]
+    fn stream_volume_is_capped_at_100_percent_but_overdrive_is_still_shown() {
+        let mut s = Scene::new(&[(7, "Loud", 120, false, false)]);
+        s.show();
+        let t = s.track(7);
+        s.event(Event::PointerMove(pt(t.x + 3.0, t.center().y)));
+        s.event(Event::Press(Button::Left, pt(t.x + 3.0, t.center().y)));
+        s.event(Event::PointerMove(pt(t.right() + 80.0, t.center().y)));
+        s.event(Event::Release(Button::Left, pt(t.right() + 80.0, t.center().y)));
+        s.settle();
+        assert_eq!(s.pactl().mutations(), ["set-sink-input-volume 7 100%"]);
+        // the mixer's own report of an overdriven stream is shown as is, never clamped
+        let doc = s.rig.st.popup.audio.clone().unwrap();
+        assert_eq!(crate::audio::playing_streams(&doc).next().unwrap()["vol"], 120.0);
+    }
+
+    #[test]
+    fn a_drag_stays_on_the_stream_and_track_it_started_on() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false), (9, "Browser", 70, false, false)]);
+        s.show();
+        let start = s.at_frac(7, 0.2);
+        let frozen = s.track(7);
+        s.event(Event::PointerMove(start));
+        s.event(Event::Press(Button::Left, start));
+        // the rows reorder under the pointer: 9 now sits first
+        s.pactl().set_inputs(&[(9, "Browser", 70, false, false), (7, "Player", 40, false, false)]);
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        apply_audio(&mut s.rig.st, seq, v);
+        s.draw();
+        assert_ne!(s.track(7), frozen, "the row really moved");
+        let release = pt(frozen.x + frozen.w * 0.8, frozen.center().y);
+        s.event(Event::PointerMove(release));
+        s.event(Event::Release(Button::Left, release));
+        s.settle();
+        assert_eq!(s.pactl().mutations(), ["set-sink-input-volume 7 80%"], "ID 7 at the frozen rectangle, never ID 9");
+    }
+
+    #[test]
+    fn a_stream_that_disappears_mid_drag_cancels_the_drag() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false), (9, "Browser", 70, false, false)]);
+        s.show();
+        let start = s.at_frac(7, 0.2);
+        s.event(Event::PointerMove(start));
+        s.event(Event::Press(Button::Left, start));
+        assert!(matches!(s.body.drag, Some(Drag::Stream { id: 7, .. })));
+        s.pactl().set_inputs(&[(9, "Browser", 70, false, false)]);
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        apply_audio(&mut s.rig.st, seq, v);
+        s.with_ctx(|b, c| b.tick(0.016, c));
+        assert!(s.body.drag.is_none());
+        s.draw();
+        let p = s.at_frac(9, 0.5);
+        s.event(Event::PointerMove(p));
+        s.event(Event::Release(Button::Left, p));
+        assert_eq!(s.rig.st.popup.audio_cmds, 0);
+        assert!(s.pactl().mutations().is_empty(), "nothing is retargeted to another stream");
+    }
+
+    #[test]
+    fn a_failing_command_shows_its_error_unless_the_stream_just_vanished() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false)]);
+        s.show();
+        s.pactl().set("fail-set", "Failure: No such entity\n");
+        let m = s.mute_btn(7).unwrap();
+        s.click(m);
+        s.settle();
+        let e = s.rig.st.popup.audio_error.clone().expect("the real error is shown");
+        assert!(e.contains("No such entity"), "{e}");
+        assert!(VolumeBody::list_top(&s.rig.st) > LIST_TOP, "the error line takes room in the page");
+        drop(s);
+
+        // the stream ends before the click lands: the stale row goes away silently
+        let mut s = Scene::new(&[(7, "Player", 40, false, false)]);
+        s.show();
+        s.pactl().set_inputs(&[]);
+        s.pactl().set("fail-set", "Failure: No such entity\n");
+        let m = s.mute_btn(7).unwrap();
+        s.click(m);
+        s.settle();
+        assert!(s.rig.st.popup.audio_error.is_none());
+        assert!(s.ids().is_empty());
+
+        // if the re-listing fails too, the real error stays
+        drop(s);
+        let mut s = Scene::new(&[(7, "Player", 40, false, false)]);
+        s.show();
+        s.pactl().set("no-inputs", "");
+        s.pactl().set("fail-set", "Failure: No such entity\n");
+        let m = s.mute_btn(7).unwrap();
+        s.click(m);
+        s.settle();
+        assert!(s.rig.st.popup.audio_error.as_deref().is_some_and(|e| e.contains("No such entity")));
+        assert!(s.ids().is_empty(), "the stale list is cleared, not kept");
+    }
+
+    #[test]
+    fn command_error_logic() {
+        let listed = json!({"available": true, "streams_available": true, "streams": [{"id": 7}]});
+        assert_eq!(command_error(Ok(()), Some(7), &listed), None);
+        assert_eq!(command_error(Err("x".into()), Some(7), &listed).as_deref(), Some("x"));
+        assert_eq!(command_error(Err("x".into()), Some(8), &listed), None, "stream 8 is gone");
+        assert_eq!(command_error(Err("x".into()), None, &listed).as_deref(), Some("x"), "output switches always report");
+        let broken = json!({"available": true, "streams_available": false, "streams": []});
+        assert_eq!(command_error(Err("x".into()), Some(8), &broken).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn unavailable_states_are_distinct_and_disable_the_controls() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false)]);
+        s.show();
+        assert!(s.body.master_ok && !s.body.tracks.is_empty());
+        // sink-input enumeration fails: master stays usable, the applications section says so
+        s.pactl().set("no-inputs", "");
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        apply_audio(&mut s.rig.st, seq, v);
+        s.draw();
+        assert_eq!(volume_rows(s.rig.st.popup.audio.as_ref())[..2], [Row::Header("Applications"), Row::Msg("Applications unavailable")]);
+        assert!(s.body.tracks.is_empty() && s.body.master_ok);
+        // the audio server itself is gone: everything is cleared and disabled
+        s.pactl().set("no-server", "");
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        apply_audio(&mut s.rig.st, seq, v);
+        s.draw();
+        assert_eq!(volume_rows(s.rig.st.popup.audio.as_ref()), [Row::Msg("Audio unavailable")]);
+        assert!(!s.body.master_ok && s.body.tracks.is_empty());
+        assert!(s.find(ID_SLIDER).is_none() && s.find(ID_MUTE).is_none(), "no master controls without a server");
+        // empty list
+        s.pactl().clear("no-server");
+        s.pactl().clear("no-inputs");
+        s.pactl().set_inputs(&[]);
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        apply_audio(&mut s.rig.st, seq, v);
+        assert_eq!(volume_rows(s.rig.st.popup.audio.as_ref())[..2], [Row::Header("Applications"), Row::Msg("No applications playing")]);
+        assert_eq!(volume_rows(None), [Row::Msg("Loading…")]);
+    }
+
+    #[test]
+    fn missing_master_or_stream_values_disable_controls_instead_of_reading_as_zero() {
+        let mut s = Scene::new(&[]);
+        s.pactl().set("sink-inputs.json", r#"[{"index": 4, "properties": {"application.name": "Odd"}, "volume": {}}]"#);
+        s.show();
+        assert!(s.body.tracks.is_empty(), "unknown volume: no slider to drag");
+        assert!(s.mute_btn(4).is_none(), "unknown mute state: no toggle");
+        s.pactl().set("sinks.json", r#"[{"index":1,"name":"sink0","description":"Speakers","ports":[],"volume":{}}]"#);
+        let (seq, v) = (next_audio_seq(), crate::audio::gather_volume());
+        apply_audio(&mut s.rig.st, seq, v);
+        s.draw();
+        assert!(s.find(ID_SLIDER).is_none() && s.find(ID_MUTE).is_none(), "unknown master volume: nothing to drag");
+    }
+
+    #[test]
+    fn switching_the_output_device_does_not_touch_any_volume() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false)]);
+        s.show();
+        let row = s.find(ID_ROW0).expect("the output row exists");
+        s.click(row);
+        s.settle();
+        assert_eq!(s.pactl().mutations(), ["set-default-sink sink0"]);
+    }
+
+    #[test]
+    fn polling_pauses_while_a_drag_or_command_is_active_and_never_overlaps() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false)]);
+        s.show();
+        let lists = |s: &Scene| s.pactl().log().iter().filter(|l| l.ends_with("list sinks")).count();
+        let base = lists(&s);
+        let start = s.at_frac(7, 0.3);
+        s.event(Event::PointerMove(start));
+        s.event(Event::Press(Button::Left, start));
+        s.with_ctx(|b, c| { b.last_poll = None; b.tick(0.016, c); });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(lists(&s), base, "no poll while dragging");
+        s.body.drag = None;
+        s.rig.st.popup.audio_cmds = 1;
+        s.with_ctx(|b, c| { b.last_poll = None; b.tick(0.016, c); });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(lists(&s), base, "no poll while a command runs");
+        s.rig.st.popup.audio_cmds = 0;
+        s.rig.st.popup.audio_busy = true;
+        s.with_ctx(|b, c| { b.last_poll = None; b.tick(0.016, c); });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(lists(&s), base, "no second poll while one is in flight");
+        s.rig.st.popup.audio_busy = false;
+        s.with_ctx(|b, c| { b.last_poll = None; b.tick(0.016, c); });
+        s.pump_until("the poll result", |st| !st.popup.audio_busy);
+        assert_eq!(lists(&s), base + 1);
+    }
+
+    #[test]
+    fn many_streams_scroll_inside_one_clipped_list() {
+        let inputs: Vec<(u64, String)> = (100..140).map(|i| (i, format!("App {i}"))).collect();
+        let refs: Vec<(u64, &str, u32, bool, bool)> = inputs.iter().map(|(i, n)| (*i, n.as_str(), 30, false, false)).collect();
+        let mut s = Scene::new(&refs);
+        s.show();
+        let nat = s.with_ctx(|b, c| b.natural_h(AREA_W, c.state, c.text));
+        assert_eq!(nat, MAX_BODY_H, "the body is bounded");
+        assert!(s.body.scroll.content_h > MAX_BODY_H * 3.0);
+        assert!(s.mute_btn(139).is_none(), "rows below the viewport are not hittable");
+        let first = s.ids().first().copied().unwrap();
+        for _ in 0..80 {
+            let p = pt(AREA_W / 2.0, 200.0);
+            s.event(Event::Scroll { dx: 0.0, dy: 60.0, steps: 1, pos: p });
+        }
+        s.draw();
+        assert!(s.body.scroll.offset > 0.0);
+        assert!(!s.ids().contains(&first) && s.ids().contains(&139), "{:?}", s.ids());
+        let m = s.mute_btn(139).expect("the last stream is reachable after scrolling");
+        s.click(m);
+        s.settle();
+        assert_eq!(s.pactl().mutations(), ["set-sink-input-mute 139 toggle"]);
+    }
+
+    #[test]
+    fn rendering_draws_every_state_without_overflowing_the_page() {
+        let mut s = Scene::new(&[(7, "Player", 40, false, false), (9, "Browser", 120, true, false)]);
+        s.show();
+        s.rig.st.popup.audio_error = Some("Application mute failed: boom".into());
+        let pm = s.draw();
+        crate::testkit::save_over_backdrop(&pm, 10, "/tmp/popup_volume_apps.png");
+        assert!(pm.pixels().iter().any(|p| p.alpha() > 0));
+        let nat = s.with_ctx(|b, c| b.natural_h(AREA_W, c.state, c.text));
+        assert!(nat < MAX_BODY_H);
+    }
+}
+
+// ---- Displays
+const SCALES: [&str; 4] = ["1", "1.25", "1.6", "2"];
+const TEXT_STOPS: [i64; 7] = [9, 10, 11, 12, 14, 16, 20];
+
 fn gather_display() -> Value {
-    let mons: Vec<Value> = hypr_req("j/monitors all").and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    let mons: Vec<Value> = crate::hypr::req("j/monitors all").and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.as_array().cloned()).unwrap_or_default().iter().map(|m| {
         let enabled = !m["disabled"].as_bool().unwrap_or(false);
         let name = m["name"].as_str().unwrap_or("");
-        let brightness = if enabled {
-            sh_out("omarchy-brightness-display", &["--no-osd", "--monitor", name]).parse::<i64>().ok()
-        } else { None };
-        json!({"name": name, "w": m["width"], "h": m["height"], "scale": m["scale"],
-               "focused": m["focused"].as_bool().unwrap_or(false), "enabled": enabled, "brightness": brightness})
+        let brightness = if enabled { net::sh_out("omarchy-brightness-display", &["--no-osd", "--monitor", name]).parse::<i64>().ok() } else { None };
+        serde_json::json!({"name": name, "w": m["width"], "h": m["height"], "scale": m["scale"], "focused": m["focused"].as_bool().unwrap_or(false), "enabled": enabled, "brightness": brightness})
     }).collect();
     let home = std::env::var("HOME").unwrap_or_default();
     let text = std::fs::read_to_string(format!("{home}/.config/omarchy/shell.toml")).ok()
         .and_then(|t| t.lines().find(|l| l.contains("base-size")).map(String::from))
         .and_then(|l| l.split('=').nth(1).map(|v| v.trim().to_string()))
         .and_then(|v| v.parse::<i64>().ok()).unwrap_or(12);
-    json!({"mons": mons, "text": text})
+    serde_json::json!({"mons": mons, "text": text})
 }
 
-/// Run a command and return trimmed stdout only when it spawned and exited successfully.
-fn cmd_ok(cmd: &str, args: &[&str]) -> Option<String> {
-    let o = Command::new(cmd).args(args).stderr(Stdio::null()).output().ok()?;
-    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+fn refresh_display(poster: &Poster) {
+    let p = poster.clone();
+    std::thread::spawn(move || { let v = gather_display(); p.post(move |st, _| st.popup.display = Some(v)); });
 }
 
-/// Profile IDs advertised by `powerprofilesctl list` (top-level `id:` headings, optionally starred), in canonical order.
-fn supported_profiles(output: &str) -> Vec<String> {
-    let mut found = [false; 3];
-    for line in output.lines() {
-        let t = line.trim();
-        match t.strip_prefix('*').unwrap_or(t).trim() {
-            "performance:" => found[0] = true,
-            "balanced:" => found[1] = true,
-            "power-saver:" => found[2] = true,
+fn run_then_refresh(poster: &Poster, prog: String, args: Vec<String>) {
+    let p = poster.clone();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new(&prog).args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let v = gather_display();
+        p.post(move |st, _| st.popup.display = Some(v));
+    });
+}
+
+#[derive(Default)]
+pub struct DisplayBody { hits: Hits, scroll: Scroll, drag: Option<(usize, f32)>, sliders: Vec<(Rect, String)> }
+
+#[derive(Clone)]
+enum DAct { Toggle(String, bool), Scale(&'static str), Text(i64) }
+
+impl Body for DisplayBody {
+    fn opened(&mut self, poster: &Poster, _: &State) { refresh_display(poster); }
+    fn natural_h(&mut self, _w: f32, st: &State, _: &mut TextSys) -> f32 {
+        let n = st.popup.display.as_ref().and_then(|d| d["mons"].as_array()).map_or(0, Vec::len) as f32;
+        (60.0 + n * 34.0 + n * 34.0 + 110.0).min(MAX_BODY_H)
+    }
+    fn cursor(&self) -> Cursor { self.hits.cursor() }
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx, r: Rect) {
+        let st = dc.state;
+        let pal = &st.pal;
+        self.hits.clear();
+        self.sliders.clear();
+        let Some(d) = st.popup.display.as_ref() else { header(cv, pal, r, "Displays", "Loading…"); return };
+        let mons = d["mons"].as_array().cloned().unwrap_or_default();
+        header(cv, pal, r, "Displays", if mons.is_empty() { "No displays available" } else { "" });
+        let enabled = mons.iter().filter(|m| m["enabled"].as_bool().unwrap_or(false)).count();
+        let mut y = r.y + 40.0 - self.scroll.offset;
+        let top = r.y + 36.0;
+        let view = rect(r.x, top, r.w, r.h - 36.0);
+        let mut total = 0.0;
+        cv.with_clip(view, [0.0; 4], |cv| {
+            for (i, m) in mons.iter().enumerate() {
+                let on = m["enabled"].as_bool().unwrap_or(false);
+                let name = m["name"].as_str().unwrap_or("").to_string();
+                cv.text_in(&format!("{name}  {}x{}{}", m["w"], m["h"], if m["focused"].as_bool().unwrap_or(false) { "  · focused" } else { "" }), &pal.text(12.0), rect(r.x, y, r.w - 60.0, 28.0), HAlign::Left);
+                let b = rect(r.right() - 48.0, y + 2.0, 48.0, 24.0);
+                let id = 300 + i as u32;
+                let hov = self.hits.add_in(b, view, id);
+                let can = !(on && enabled <= 1);
+                cv.with_alpha(if can { 1.0 } else { 0.4 }, |cv| button(cv, pal, b, if on { "On" } else { "Off" }, if on { ButtonKind::Accent } else { ButtonKind::Plain }, hov && can, false));
+                y += 34.0; total += 34.0;
+            }
+            for (i, m) in mons.iter().filter(|m| m["enabled"].as_bool().unwrap_or(false) && m["brightness"].is_number()).enumerate() {
+                if i == 0 { cv.text("Brightness", &pal.text_dim(11.0), pt(r.x, y + 8.0), HAlign::Left, VAlign::Middle); y += 22.0; total += 22.0; }
+                let name = m["name"].as_str().unwrap_or("");
+                let pct = self.drag.filter(|(k, _)| *k == i).map(|(_, v)| v).unwrap_or(m["brightness"].as_f64().unwrap_or(0.0) as f32);
+                cv.text_in(name, &pal.text(11.0), rect(r.x, y, 90.0, 28.0), HAlign::Left);
+                let s = rect(r.x + 96.0, y, r.w - 100.0, 28.0);
+                self.hits.add_in(s, view, 400 + i as u32);
+                self.sliders.push((s, name.to_string()));
+                slider(cv, pal, s, pct / 100.0, pal.accent);
+                y += 32.0; total += 32.0;
+            }
+            cv.text("Scale (focused)", &pal.text_dim(11.0), pt(r.x, y + 8.0), HAlign::Left, VAlign::Middle);
+            y += 22.0; total += 22.0;
+            let foc_scale = mons.iter().find(|m| m["focused"].as_bool().unwrap_or(false)).and_then(|m| m["scale"].as_f64()).unwrap_or(0.0);
+            let bw = (r.w - 3.0 * 6.0) / 4.0;
+            for (i, sc) in SCALES.iter().enumerate() {
+                let b = rect(r.x + i as f32 * (bw + 6.0), y, bw, 26.0);
+                let hov = self.hits.add_in(b, view, 500 + i as u32);
+                let on = (foc_scale - sc.parse::<f64>().unwrap_or(0.0)).abs() < 0.01;
+                button(cv, pal, b, &format!("{sc}x"), if on { ButtonKind::Accent } else { ButtonKind::Plain }, hov, false);
+            }
+            y += 34.0; total += 34.0;
+            cv.text("Text size", &pal.text_dim(11.0), pt(r.x, y + 8.0), HAlign::Left, VAlign::Middle);
+            y += 22.0; total += 22.0;
+            let cur = d["text"].as_i64().unwrap_or(12);
+            let near = *TEXT_STOPS.iter().min_by_key(|s| (**s - cur).abs()).unwrap();
+            let bw = (r.w - 6.0 * 6.0) / 7.0;
+            for (i, t) in TEXT_STOPS.iter().enumerate() {
+                let b = rect(r.x + i as f32 * (bw + 6.0), y, bw, 26.0);
+                let hov = self.hits.add_in(b, view, 600 + i as u32);
+                button(cv, pal, b, &t.to_string(), if *t == near { ButtonKind::Accent } else { ButtonKind::Plain }, hov, false);
+            }
+            total += 34.0;
+        });
+        self.scroll.content_h = total + 40.0;
+        self.scroll.clamp(view.h);
+    }
+    fn event(&mut self, ev: &Event, r: Rect, ctx: &mut Ctx) {
+        if let Event::Scroll { dy, .. } = ev { self.scroll.by(*dy, r.h - 36.0); return; }
+        let frac = |s: &Rect, x: f32| ((x - s.x) / s.w).clamp(0.0, 1.0) * 100.0;
+        match ev {
+            Event::Press(Button::Left, p) => {
+                if let Some(i) = self.sliders.iter().position(|(s, _)| s.contains(*p)) { self.drag = Some((i, frac(&self.sliders[i].0, p.x))); }
+            }
+            Event::PointerMove(p) => { if let Some((i, _)) = self.drag { self.drag = Some((i, frac(&self.sliders[i].0, p.x))); } }
+            Event::Release(Button::Left, p) => {
+                if let Some((i, _)) = self.drag.take() {
+                    let v = frac(&self.sliders[i].0, p.x).round() as i64;
+                    let name = self.sliders[i].1.clone();
+                    run_then_refresh(ctx.poster, "omarchy-brightness-display".into(), vec!["--no-osd".into(), "--monitor".into(), name, format!("{v}%")]);
+                    self.hits.event(ev);
+                    return;
+                }
+            }
             _ => {}
         }
-    }
-    ["performance", "balanced", "power-saver"].iter().zip(found).filter(|(_, f)| *f).map(|(id, _)| id.to_string()).collect()
-}
-
-fn gather_battery() -> Value {
-    let profiles = cmd_ok("powerprofilesctl", &["list"]).map(|o| supported_profiles(&o)).filter(|p| !p.is_empty());
-    let profile = profiles.as_ref().and_then(|ps| cmd_ok("powerprofilesctl", &["get"]).filter(|c| ps.contains(c)));
-    let p = crate::power::snapshot();
-    let batteries: Vec<Value> = p.batteries.iter().map(|b| json!({
-        "name": b.name, "state": b.state.as_str(), "percentage": b.percentage,
-        "power_w": b.power_w, "energy_now_wh": b.energy_now_wh, "energy_full_wh": b.energy_full_wh,
-        "energy_design_wh": b.energy_design_wh, "health_pct": b.health_pct, "voltage_v": b.voltage_v,
-        "cycles": b.cycles, "technology": b.technology, "manufacturer": b.manufacturer, "model": b.model,
-        "time_to_empty_secs": b.time_to_empty_secs, "time_to_full_secs": b.time_to_full_secs,
-    })).collect();
-    json!({"available": p.available, "ac_online": p.ac_online, "percentage": p.percentage,
-           "batteries": batteries, "profile": profile, "profiles": profiles})
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn power_profiles_supported_choices() {
-        let out = "  performance-ignored: no\n* balanced:\n    CpuDriver:  amd_pstate\n    PlatformDriver: placeholder\n\n  power-saver:\n    Driver: x\n";
-        assert_eq!(supported_profiles(out), ["balanced", "power-saver"]);
-        assert!(supported_profiles("garbage").is_empty());
-    }
-
-    fn sink(name: &str, desc: &str, vol: Value, ports: Value) -> Value {
-        json!({"name": name, "description": desc, "mute": false, "volume": vol, "ports": ports})
-    }
-    fn ch(p: &str) -> Value { json!({"front-left": {"value_percent": p}, "front-right": {"value_percent": "10%"}}) }
-
-    #[test]
-    fn audio_outputs_select_default_not_first() {
-        let sinks = [sink("a", "A", ch("30%"), json!([])), sink("b", "B", ch("0%"), json!([]))];
-        let v = normalize_audio_outputs(Some("b"), &sinks);
-        assert_eq!(v["master"]["name"], "b");
-        assert_eq!(v["master"]["vol"], 10.0);
-        let v = normalize_audio_outputs(None, &sinks);
-        assert!(v["master"].is_null());
-        assert_eq!(v["outputs"].as_array().unwrap().len(), 2);
-        assert!(normalize_audio_outputs(Some("gone"), &sinks)["master"].is_null());
-    }
-
-    #[test]
-    fn audio_outputs_filter_unplugged_but_keep_default() {
-        let off = json!([{"availability": "not available"}]);
-        let sinks = [sink("hdmi", "", ch("0%"), off.clone()), sink("usb", "", ch("0%"), json!([])), sink("hdmi2", "H2", ch("0%"), off)];
-        let v = normalize_audio_outputs(Some("hdmi2"), &sinks);
-        let names: Vec<&str> = v["outputs"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["usb", "hdmi2"]);
-        assert_eq!(v["outputs"][0]["desc"], "usb"); // blank description falls back to the name
-        assert_eq!(v["outputs"][1]["default"], true);
-    }
-
-    #[test]
-    fn audio_volume_preserves_zero_overdrive_and_missing() {
-        assert_eq!(max_pct(&json!({"l": {"value_percent": "0%"}})), Some(0.0));
-        assert_eq!(max_pct(&json!({"l": {"value_percent": "120%"}, "r": {"value": 32768}})), Some(120.0));
-        assert_eq!(max_pct(&json!({"l": {"value": 32768}})), Some(50.0));
-        assert_eq!(max_pct(&json!({"l": {"value_percent": "x"}})), None);
-        assert_eq!(max_pct(&json!({})), None);
-        assert_eq!(max_pct(&Value::Null), None);
-        let s = json!({"name": "n", "volume": {}});
-        let v = normalize_audio_outputs(Some("n"), &[s]);
-        assert!(v["master"]["vol"].is_null() && v["master"]["mute"].is_null());
-    }
-
-    #[test]
-    fn audio_streams_keep_names_and_drop_invalid_ids() {
-        let inputs = [
-            json!({"index": 3, "properties": {"application.name": "écho"}, "volume": {"l": {"value_percent": "40%"}}}),
-            json!({"index": 4, "properties": {"application.name": "", "application.process.binary": "音楽"}}),
-            json!({"index": "x", "properties": {}}),
-            json!({"properties": {}}),
-        ];
-        let s = normalize_audio_streams(&inputs);
-        assert_eq!(s.len(), 2);
-        assert_eq!((s[0]["name"].as_str(), s[0]["vol"].as_f64()), (Some("écho"), Some(40.0)));
-        assert_eq!(s[1]["name"], "音楽");
-        assert!(s[1]["vol"].is_null() && s[1]["mute"].is_null());
-        let outs = normalize_audio_outputs(Some("a"), &[sink("", "x", ch("1%"), json!([]))]);
-        assert!(outs["outputs"].as_array().unwrap().is_empty() && outs["master"].is_null());
-    }
-
-    fn bt_sink(name: &str, props: Value) -> Value { json!({"name": name, "properties": props}) }
-
-    #[test]
-    fn bluetooth_sink_mac_is_exact() {
-        let p = |a: &str| bt_sink("alsa_output.x", json!({"device.api": "bluez5", "api.bluez5.address": a}));
-        assert_eq!(bluetooth_sink_mac(&p("aa:bb:cc:dd:ee:ff")).as_deref(), Some("AA:BB:CC:DD:EE:FF"));
-        assert_eq!(bluetooth_sink_mac(&bt_sink("bluez_output.AA_BB_CC_DD_EE_0F.1", json!({}))).as_deref(), Some("AA:BB:CC:DD:EE:0F"));
-        // invalid property falls back to the name
-        let bad = bt_sink("bluez_output.11_22_33_44_55_66.1", json!({"api.bluez5.address": "zz"}));
-        assert_eq!(bluetooth_sink_mac(&bad).as_deref(), Some("11:22:33:44:55:66"));
-        assert_eq!(bluetooth_sink_mac(&bt_sink("bluez_output.AA_BB_CC.1", json!({}))), None);
-        assert_eq!(bluetooth_sink_mac(&bt_sink("bluez_output.AA_BB_CC_DD_EE_FF.1.monitor", json!({}))), None);
-        assert_eq!(bluetooth_sink_mac(&bt_sink("alsa_output.pci", json!({"api.bluez5.address": "AA:BB:CC:DD:EE:FF"}))), None);
-        assert_eq!(bluetooth_sink_mac(&bt_sink("alsa_output.AA_BB_CC_DD_EE_FF", json!({"device.bus": "pci"}))), None);
-        assert_eq!(bluetooth_sink_mac(&p("AA:BB:CC:DD:EE")), None);
-    }
-
-    #[test]
-    fn outputs_carry_exact_mac_and_mute_and_identical_aliases_stay_distinct() {
-        let mk = |n: &str| json!({"name": n, "description": "Buds", "mute": true, "properties": {}});
-        let sinks = [mk("bluez_output.AA_AA_AA_AA_AA_AA.1"), mk("bluez_output.BB_BB_BB_BB_BB_BB.1"), mk("alsa")];
-        let v = normalize_audio_outputs(Some("bluez_output.BB_BB_BB_BB_BB_BB.1"), &sinks);
-        assert_eq!(v["outputs"][0]["bt_mac"], "AA:AA:AA:AA:AA:AA");
-        assert_eq!(v["outputs"][1]["bt_mac"], "BB:BB:BB:BB:BB:BB");
-        assert!(v["outputs"][2]["bt_mac"].is_null());
-        assert_eq!(v["outputs"][1]["default"], true);
-        assert_eq!(v["outputs"][0]["mute"], true);
-    }
-
-    #[test]
-    fn only_inputs_on_other_sinks_are_moved() {
-        let inputs = [json!({"index": 3, "sink": 7}), json!({"index": 4, "sink": 1}), json!({"sink": 1})];
-        assert_eq!(sink_input_moves(&inputs, 7), vec![4]);
+        let Some(c) = self.hits.event(ev) else { return };
+        if c.button != Button::Left { return; }
+        let Some(d) = ctx.state.popup.display.clone() else { return };
+        let mons = d["mons"].as_array().cloned().unwrap_or_default();
+        let act = match c.id {
+            300..=399 => mons.get((c.id - 300) as usize).map(|m| DAct::Toggle(m["name"].as_str().unwrap_or("").to_string(), m["enabled"].as_bool().unwrap_or(false))),
+            500..=599 => SCALES.get((c.id - 500) as usize).map(|s| DAct::Scale(s)),
+            600..=699 => TEXT_STOPS.get((c.id - 600) as usize).map(|t| DAct::Text(*t)),
+            _ => None,
+        };
+        match act {
+            Some(DAct::Toggle(name, on)) => {
+                let expr = if on { format!("hl.monitor({{ output = \"{name}\", disabled = true }})") } else {
+                    format!("hl.monitor({{ output = \"{name}\", disabled = false, mode = \"preferred\", position = \"auto\", scale = \"auto\" }})") };
+                run_then_refresh(ctx.poster, "hyprctl".into(), vec!["eval".into(), expr]);
+            }
+            Some(DAct::Scale(s)) => run_then_refresh(ctx.poster, "omarchy-hyprland-monitor-scaling".into(), vec![s.to_string()]),
+            Some(DAct::Text(t)) => run_then_refresh(ctx.poster, "omarchy-display-text-size".into(), vec![t.to_string()]),
+            None => {}
+        }
     }
 }

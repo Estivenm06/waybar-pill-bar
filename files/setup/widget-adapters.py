@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """Pill Bar's narrow patch of the installed WhatsApp plugin so its existing, complete panel can live inside the notch.
 
-  widget-adapters.py paths   print the absolute files `apply` would write (nothing when WhatsApp is absent)
-  widget-adapters.py apply   write them (recomputed and validated first; nothing is written on any error)
+  widget-adapters.py stage DIR   write the proposed files into the private staging directory DIR and print a JSON
+                                 list of {"path": destination, "source": staged file, "mode": "644"}; nothing outside
+                                 DIR is touched. `[]` when WhatsApp is absent or disabled. An enabled source this
+                                 patch does not support stages nothing, reports why on stderr and still exits 0.
 
 Panel.qml gets named, paired managed blocks (`// >>> waybar-pill-bar anchor NAME BEGIN` ... `END`) at structural anchors
 of the stock 1.1.0 file, plus a small, count-checked rewrite of the stock design tokens outside those blocks.
 WaybarPillAnchor.qml is a new sibling file (the content-host adapter). Credentials, the manifest, BarWidget.qml and the
 daemon are never touched. Reinstalling replaces only managed blocks; unmanaged edits survive."""
-import importlib.machinery
-import importlib.util
-import json
-import os
-import re
-import secrets
-import stat
 import sys
+
+sys.dont_write_bytecode = True  # nothing this helper loads may leave bytecode in a watched plugin directory
+
+import hashlib  # noqa: E402
+import importlib.machinery  # noqa: E402
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import stat  # noqa: E402
 
 PLUGIN_ID = "io.github.ricky.whatsapp"
 ANCHOR_FILE = "WaybarPillAnchor.qml"
@@ -30,6 +35,10 @@ _loader.exec_module(_helper)
 
 class AdapterError(Exception):
     pass
+
+
+class SourceUnsupported(AdapterError):
+    """The installed WhatsApp source is not the one this patch understands (or its adapter is not ours to replace)."""
 
 
 # ---------------------------------------------------------------------------------------------------- managed blocks
@@ -468,8 +477,26 @@ def check_adapter_ownership(path, record):
     check_recorded_unchanged(path, record)
 
 
+def retained_adapter_bytes(record, plugin):
+    """Validate every retained destination before treating changed bytes as unsupported source."""
+    paths = {os.path.join(plugin, name) for name in ("Panel.qml", "BarWidget.qml", ANCHOR_FILE)}
+    if not record or not set(record).issubset(paths):
+        return None
+    for path in paths:
+        preflight_destination(path)
+    current = {}
+    for path in record:
+        if os.path.lexists(path):
+            current[path] = sha256_of(path)
+    if any(current.get(path) != entry["installed_sha256"] for path, entry in record.items()):
+        raise AdapterError("a retained WhatsApp adapter file was modified since the last setup; not overwriting it "
+                           "(`waybar-pill-plugin recover` restores the stock files)")
+    return current
+
+
 def planned_whatsapp_adapter(config=None):
-    """target absolute path -> proposed content; {} when the WhatsApp plugin is not installed."""
+    """target absolute path -> proposed content; {} when the WhatsApp plugin is not installed. An untrusted install
+    record or directory is an AdapterError; a source this patch cannot handle is its SourceUnsupported subclass."""
     root = config_root(config)
     record = install_record()  # a malformed or untrusted record blocks everything before any file is read
     plugin = os.path.join(root, "omarchy", "plugins", PLUGIN_ID)
@@ -480,53 +507,39 @@ def planned_whatsapp_adapter(config=None):
     if pfd is None:
         return {}
     os.close(pfd)
+    retained = retained_adapter_bytes(record, plugin)
     panel_path = os.path.join(plugin, "Panel.qml")
     anchor_path = os.path.join(plugin, ANCHOR_FILE)
     panel = read_regular(panel_path)
     if panel is None:
-        raise AdapterError("%s is missing" % panel_path)
+        raise SourceUnsupported("%s is missing" % panel_path)
     read_regular(anchor_path)  # also rejects symlinks and non-regular files
     source = read_source(os.path.join(HERE, "..", "qml", ANCHOR_FILE))
     check_adapter_ownership(anchor_path, record)
     check_recorded_unchanged(panel_path, record)
-    return {panel_path: patch_panel(panel, panel_path), anchor_path: source}
-
-
-def write_atomic(path, content):
-    """Publish through an exclusive private temporary; an existing owned file keeps its exact permission bits, a new
-    adapter is 0644. The permissions are set on the descriptor before the file becomes visible."""
     try:
-        dfd = _helper.open_directory_chain(os.path.dirname(path), own_from=_helper.trust_root(path))
-        if dfd is None:
-            raise AdapterError("%s has no parent directory" % path)
-        try:
-            mode = 0o644
-            try:
-                st = os.stat(os.path.basename(path), dir_fd=dfd, follow_symlinks=False)
-                _helper.check_leaf(st, path)
-                mode = stat.S_IMODE(st.st_mode)
-            except FileNotFoundError:
-                pass
-            name = os.path.basename(path)
-            tmp = ".pill-adapter-%s" % secrets.token_hex(8)
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fchmod(f.fileno(), mode)
-                    os.fsync(f.fileno())
-                os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-            except BaseException:
-                try:
-                    os.unlink(tmp, dir_fd=dfd)
-                except OSError:
-                    pass
-                raise
-        finally:
-            os.close(dfd)
-    except _helper.PluginError as e:
-        raise AdapterError(str(e))
+        patched = patch_panel(panel, panel_path)
+    except AdapterError as e:
+        raise SourceUnsupported(str(e))
+    plan = {panel_path: patched, anchor_path: source}
+    if retained is not None and any(retained.get(path) != hashlib.sha256(content.encode("utf-8")).hexdigest()
+                                    for path, content in plan.items()):
+        raise SourceUnsupported("retained WhatsApp adapter is incompatible with this version; "
+                                "explicitly recover the previous installation before re-enabling")
+    return plan
+
+
+def whatsapp_disabled():
+    """Whether Omarchy's shell.json lists the WhatsApp plugin as disabled. A missing or unreadable file means enabled."""
+    text = read_regular(os.path.join(config_root(), "omarchy", "shell.json"))
+    if text is None:
+        return False
+    try:
+        cfg = json.loads(text)
+    except ValueError:
+        return False
+    disabled = cfg.get("disabledPlugins", []) if isinstance(cfg, dict) else []
+    return isinstance(disabled, list) and PLUGIN_ID in disabled
 
 
 def preflight_destination(path):
@@ -537,23 +550,66 @@ def preflight_destination(path):
         raise AdapterError(str(e))
 
 
+def staging_directory(path):
+    """The absolute private directory `path` (created 0700 when missing), owned by the effective user."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise AdapterError("%s is not an absolute normalized path" % path)
+    try:
+        fd = _helper.open_directory_chain(path, own_from=_helper.trust_root(path), create=True)
+    except _helper.PluginError as e:
+        raise AdapterError(str(e))
+    if fd is None:
+        raise AdapterError("%s does not exist" % path)
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+            raise AdapterError("%s must not be accessible to other accounts" % path)
+    finally:
+        os.close(fd)
+    return path
+
+
+def stage(directory):
+    """Write the proposed adapter files below `directory` and return the JSON-ready entry list."""
+    directory = staging_directory(directory)
+    if whatsapp_disabled():
+        return []
+    try:
+        plan = planned_whatsapp_adapter()
+    except SourceUnsupported as e:
+        print("widget-adapters: the WhatsApp panel is not embedded in the notch: %s" % e, file=sys.stderr)
+        return []
+    entries = []
+    for i, (dest, content) in enumerate(plan.items()):
+        preflight_destination(dest)
+        mode = 0o644
+        if os.path.lexists(dest):
+            mode = stat.S_IMODE(os.stat(dest).st_mode)
+        source = os.path.join(directory, "%02d-%s" % (i, os.path.basename(dest)))
+        dfd = _helper.open_directory_chain(directory, own_from=_helper.trust_root(directory))
+        if dfd is None:
+            raise AdapterError("%s disappeared" % directory)
+        try:
+            fd = os.open(os.path.basename(source), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        entries.append({"path": dest, "source": source, "mode": "%o" % mode})
+    return entries
+
+
 def main(argv):
-    if len(argv) != 1 or argv[0] not in ("paths", "apply"):
+    if len(argv) != 2 or argv[0] != "stage":
         print(__doc__, file=sys.stderr)
         return 2
     try:
-        plan = planned_whatsapp_adapter()
-        if argv[0] == "paths":
-            for p in plan:
-                print(p)
-        else:
-            for p in plan:
-                preflight_destination(p)
-            for p, content in plan.items():
-                write_atomic(p, content)
+        entries = stage(argv[1])
     except (AdapterError, OSError) as e:
         print("widget-adapters: %s" % e, file=sys.stderr)
         return 1
+    print(json.dumps(entries))
     return 0
 
 

@@ -1,32 +1,47 @@
 #!/usr/bin/env python3
 """Lifecycle and control for the Waybar Pill Bar Omarchy service plugin.
 
-Usage: waybar-pill-plugin mode | start | serve | active | reload | toggle | stop | recover | runtime-dir | record-generated PATH...
+Usage: waybar-pill-plugin mode | start --checkout PATH | serve --checkout PATH | active | reload | toggle | stop |
+                          recover | runtime-dir | record-generated PATH...
 
-Only `serve` ever launches the product, and only after the plugin's QML service has opened the lease socket. The lease
-socket's EOF (plugin disabled, removed, or the shell exiting) ends the session and restores what the session changed."""
-import errno
-import fcntl
-import hashlib
-import json
-import os
-import re
-import secrets
-import select
-import signal
-import socket
-import stat
-import subprocess
+The plugin's QML service runs `start --checkout PATH`. It stages this helper and the state helper into an immutable,
+content-hashed generation under the data directory and launches the detached `serve` backend from there, so a session
+can finish restoring files even when Omarchy deletes the checkout right after disabling the plugin. `serve` accepts
+the QML service's lease, provisions the checkout (install.sh --provision) while the native desktop stays untouched,
+and only then takes over notifications, OSD and the bar. The lease socket's EOF (plugin disabled, removed, or the
+shell exiting) ends the session and restores the managed files, then the native desktop."""
 import sys
-import tempfile
-import time
 
+sys.dont_write_bytecode = True  # nothing this helper loads may leave bytecode in a watched plugin directory
+
+import errno  # noqa: E402
+import fcntl  # noqa: E402
+import hashlib  # noqa: E402
+import importlib.machinery  # noqa: E402
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import secrets  # noqa: E402
+import select  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import time  # noqa: E402
+
+PLUGIN_ID = "waybar.pill-bar"
 CONFLICTS = ("omarchy.notifications", "omarchy.osd")
 NOTIFY_NAME = "org.freedesktop.Notifications"
 LEASE_WAIT = 5.0
 READY_WAIT = 15.0
+LIFECYCLE_WAIT = 120.0
+PROVISION_WAIT = 1800.0
 SESSION_SOCKETS = ("notifications.sock", "notch-content.sock")
 STOP_WAIT = 5.0
+MAX_TREE_DEPTH = 32
+MAX_TREE_ENTRIES = 20000
 
 
 class PluginError(Exception):
@@ -82,13 +97,34 @@ SCRIPT_NAMES = ("google-setup.py", "waybar-pill-plugin", "waybar-plugin-widgets"
                 "waybar-brightness-key", "waybar-popupctl", "waybar-app.sh", "waybar-bgapp.sh", "media-follow.py",
                 "media-eq.py", "media-art.py")
 WHATSAPP_PLUGIN = "io.github.ricky.whatsapp"
-WHATSAPP_FILES = ("Panel.qml", "WaybarPillAnchor.qml")
+WHATSAPP_FILES = ("Panel.qml", "BarWidget.qml", "WaybarPillAnchor.qml")
 JOURNAL_PHASES = ("preparing", "active", "restoring")
 
 
 def config_home():
     base = os.environ.get("XDG_CONFIG_HOME", "")
     return os.path.normpath(base) if base and os.path.isabs(base) else os.path.join(home(), ".config")
+
+
+def adapter_paths():
+    root = os.path.join(config_home(), "omarchy", "plugins", WHATSAPP_PLUGIN)
+    return frozenset(os.path.join(root, name) for name in WHATSAPP_FILES)
+
+
+def plugin_enabled(checkout):
+    """Only a trusted enabled manifest entry and an existing checkout allow retaining inert adapter sources."""
+    if not checkout:
+        return False
+    try:
+        manifest = json.loads(read_checkout_file(checkout, "manifest.json"))
+        if not isinstance(manifest, dict) or manifest.get("id") != PLUGIN_ID:
+            return False
+        cfg = trusted_state_json(os.path.join(config_home(), "omarchy", "shell.json"))
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("plugins"), list):
+            return False
+        return any(isinstance(p, dict) and p.get("id") == PLUGIN_ID for p in cfg["plugins"])
+    except (PluginError, OSError, ValueError):
+        return False
 
 
 def installation_paths():
@@ -320,7 +356,7 @@ def validate_record(m):
     allowed = installation_paths()
     seen = set()
     for e in files:
-        if not isinstance(e, dict) or set(e) != {"path", "existed", "installed_sha256"}:
+        if not isinstance(e, dict) or not {"path", "existed", "installed_sha256"} <= set(e) <= {"path", "existed", "installed_sha256", "retained_sha256"}:
             raise PluginError("%s has a malformed file entry" % where)
         p, existed, sha = e["path"], e["existed"], e["installed_sha256"]
         if not isinstance(p, str) or not os.path.isabs(p) or os.path.normpath(p) != p:
@@ -330,7 +366,8 @@ def validate_record(m):
         if p in seen:
             raise PluginError("%s lists a path twice" % where)
         seen.add(p)
-        if type(existed) is not bool or not isinstance(sha, str) or not SHA_RE.match(sha):
+        if type(existed) is not bool or not isinstance(sha, str) or not SHA_RE.match(sha) \
+                or ("retained_sha256" in e and not (isinstance(e["retained_sha256"], str) and SHA_RE.match(e["retained_sha256"]))):
             raise PluginError("%s has a malformed file entry" % where)
     return m
 
@@ -357,7 +394,7 @@ def validate_journal(j):
 def mode():
     """Installation diagnostic: 'plugin' for a valid install record, an error otherwise."""
     if read_marker() is None:
-        raise PluginError("plugin setup has not been run: run ./install.sh in the plugin checkout, then re-enable")
+        raise PluginError("the plugin is not provisioned: setup runs when waybar.pill-bar is enabled")
     return "plugin"
 
 
@@ -381,7 +418,7 @@ def record_generated_files(paths):
     """Bless product-regenerated outputs. Only paths already in the install record are accepted."""
     m = read_marker()
     if m is None:
-        raise PluginError("plugin setup has not been run")
+        raise PluginError("the plugin is not provisioned")
     entries = {e["path"]: e for e in m["files"]}
     real = [os.path.abspath(p) for p in paths]
     for p in real:
@@ -389,7 +426,51 @@ def record_generated_files(paths):
             raise PluginError("%s is not part of the plugin install record" % p)
     for p in real:
         entries[p]["installed_sha256"] = sha256_of(p)
+        refresh_after_image(m, p)
     write_state_json(marker_path(), m)
+
+
+def refresh_after_image(m, path):
+    """Keep a blessed regeneration of `path` as its after-image, so restoring a Lua file still recognizes the product
+    block it wrote. Records from before after-images existed carry none; nothing is created for them."""
+    dst = os.path.join(m["backup_dir"], ".installed") + path
+    ddfd = open_directory_chain(os.path.dirname(dst), own_from=home())
+    if ddfd is None:
+        return
+    try:
+        try:
+            check_leaf(os.stat(os.path.basename(dst), dir_fd=ddfd, follow_symlinks=False), dst)
+        except FileNotFoundError:
+            return
+        sdfd = open_directory_chain(os.path.dirname(path), own_from=trust_root(path))
+        if sdfd is None:
+            raise FileNotFoundError(path)
+        try:
+            sfd = open_leaf(sdfd, os.path.basename(path), path)
+        finally:
+            os.close(sdfd)
+        with os.fdopen(sfd, "rb") as f:
+            data = f.read(MAX_STATE_BYTES * 8 + 1)
+            mode = stat.S_IMODE(os.fstat(f.fileno()).st_mode)
+        if len(data) > MAX_STATE_BYTES * 8:
+            raise PluginError("%s is too large" % path)
+        tmp = ".tmp.%s" % secrets.token_hex(8)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=ddfd)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+                os.fchmod(f.fileno(), mode)
+            os.replace(tmp, os.path.basename(dst), src_dir_fd=ddfd, dst_dir_fd=ddfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=ddfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(ddfd)
 
 
 def runtime_dir(create=True):
@@ -420,7 +501,8 @@ def request(op, timeout=5.0):
     s.settimeout(timeout)
     try:
         s.connect(sock_path())
-    except (FileNotFoundError, ConnectionRefusedError):
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout):
+        s.close()
         return None
     with s:
         try:
@@ -429,10 +511,10 @@ def request(op, timeout=5.0):
             while not buf.endswith(b"\n"):
                 chunk = s.recv(4096)
                 if not chunk:
-                    break
+                    return None
                 buf += chunk
-        except (ConnectionResetError, BrokenPipeError):
-            return None  # the backend closed the socket while shutting down: no session to talk to
+        except (ConnectionResetError, BrokenPipeError, socket.timeout):
+            return None  # the backend closed the socket (or stopped answering) while shutting down: no session to talk to
     try:
         return json.loads(buf.decode())
     except ValueError:
@@ -446,9 +528,13 @@ def run(cmd, **kw):
 class Session:
     """One lease's worth of ownership. `runner` is the only way it touches the desktop, so tests can observe it."""
 
-    def __init__(self, runner=run, popen=subprocess.Popen):
+    def __init__(self, runner=run, popen=subprocess.Popen, state=None, checkout=None):
         self.runner = runner
         self.popen = popen
+        self.state = state  # the in-memory durable state helper that restores the managed files; None: no files
+        self.checkout = checkout  # None (explicit recover): adapters are never retained
+        self.idle = None  # callable(timeout) that services the control socket while this session waits
+        self.before_restore = None  # callable run right before the files are restored (closes the control listener)
         self.children = []  # [(name, Popen)] in start order
         self.active = False
         self.cleaned = False
@@ -527,15 +613,15 @@ class Session:
     # ---- transaction
     def preflight(self):
         if read_marker() is None:
-            raise PluginError("plugin setup has not been run: run ./install.sh in the plugin checkout, then re-enable")
+            raise PluginError("the plugin is not provisioned: setup runs when waybar.pill-bar is enabled")
         b = os.path.join(home(), ".local", "bin", "waybar-notch")
         helper = os.path.join(home(), ".config", "waybar", "scripts", "waybar-popupctl")
-        for p in (b, helper, os.path.join(home(), ".config", "waybar", "config.jsonc")):
+        for p in (b, helper):
             if not os.path.exists(p):
-                raise PluginError("%s is missing: run ./install.sh" % p)
+                raise PluginError("%s is missing: provisioning did not install it" % p)
         drop = os.path.join(home(), ".config", "systemd", "user", "waybar.service.d", "50-waybar-notch.conf")
         if os.path.exists(drop) or self.sh("systemctl", "--user", "is-enabled", "waybar-notch.service").returncode == 0:
-            raise PluginError("Legacy standalone files detected; remove the old standalone installation with its original uninstaller before running ./install.sh.")
+            raise PluginError("Legacy standalone files detected; remove the old standalone installation with its original uninstaller, then enable the plugin again.")
         self.load_shell()
         if self.sh("omarchy", "plugin", "list", "--json").returncode != 0:
             raise PluginError("Omarchy plugin IPC is not working")
@@ -544,7 +630,7 @@ class Session:
         if self.sh("systemctl", "--user", "is-active", "--quiet", "waybar.service").returncode != 0:
             return False
         r = self.sh("systemctl", "--user", "show", "waybar.service", "-p", "ExecStart", "--value")
-        if "--waybar-supervisor" in r.stdout or "path=" not in r.stdout or "/waybar " not in r.stdout.replace(" ;", " "):
+        if "waybar-notch" in r.stdout or "path=" not in r.stdout or "/waybar " not in r.stdout.replace(" ;", " "):
             raise PluginError("waybar.service is not a plain Waybar; refusing to stop it")
         return True
 
@@ -590,11 +676,10 @@ class Session:
             baseline = set(self.hypr_errors())
             exe = os.path.join(home(), ".local", "bin", "waybar-notch")
             env = {k: v for k, v in os.environ.items() if k not in ("GDK_SCALE", "GDK_DPI_SCALE")}
-            for name, args in (("supervisor", [exe, "--waybar-supervisor"]),
-                               ("notch", [exe, "--notification-relay", str(shell_pid)])):
+            for name, args in (("notch", [exe, "--notification-relay", str(shell_pid)]),):
                 self.children.append((name, self.popen(args, env=env, start_new_session=True,
                                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
-            self.wait_until(lambda: self.ready(baseline), READY_WAIT, "the notch and Waybar did not become ready")
+            self.wait_until(lambda: self.ready(baseline), READY_WAIT, "the notch and pills did not become ready")
             connect_relay()
             self.check_children()
             owner = self.notify_owner_pid()
@@ -619,7 +704,10 @@ class Session:
                 return
             if time.monotonic() > end:
                 raise PluginError(msg)
-            time.sleep(0.1)
+            if self.idle is not None:
+                self.idle(0.1)
+            else:
+                time.sleep(0.1)
 
     def check_children(self):
         for name, p in self.children:
@@ -633,8 +721,6 @@ class Session:
                 return False
         except OSError:
             return False
-        if not os.path.exists(os.path.join(rt, "waybar-notch", "bar-control.sock")):
-            return False
         for path in self.sockets:
             try:
                 if not stat.S_ISSOCK(os.lstat(path).st_mode):
@@ -642,16 +728,17 @@ class Session:
             except OSError:
                 return False
         r = self.sh("hyprctl", "layers", "-j")
-        if '"waybar"' not in r.stdout.replace(" ", ""):
+        if '"waybar-notch"' not in r.stdout.replace(" ", ""):
             return False
         fresh = [e for e in self.hypr_errors() if e not in baseline]
         if fresh:
             raise PluginError("Hyprland reported new config errors: " + "; ".join(fresh))
         return True
 
-    def signal_supervisor(self, sig):
+    def signal_notch(self, sig):
+        """SIGUSR1 toggles the bar's visibility, SIGUSR2 reloads theme/settings."""
         for name, p in self.children:
-            if name == "supervisor" and p.poll() is None:
+            if name == "notch" and p.poll() is None:
                 os.kill(p.pid, sig)
                 return True
         return False
@@ -662,26 +749,8 @@ class Session:
             return
         self.cleaned = True
         self.active = False
-        byname = dict(self.children)
-        for name in ("notch", "supervisor"):
-            p = byname.get(name)
-            if p is not None and p.poll() is None:
-                try:
-                    os.kill(p.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                if name == "notch":
-                    self.reap(p, 2.0)
-        sup = byname.get("supervisor")
-        if sup is not None:
-            self.reap(sup, STOP_WAIT)
         for _, p in self.children:
-            if p.poll() is None:
-                try:
-                    os.killpg(p.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                self.reap(p, 1.0)
+            terminate_group(p)
         self.children = []
         for path in self.sockets:
             try:
@@ -690,7 +759,9 @@ class Session:
             except OSError:
                 pass
         self.sockets = []
-        restore(self)
+        if self.before_restore is not None:
+            self.before_restore()
+        restore_everything(self)
 
     def reap(self, p, limit):
         try:
@@ -698,13 +769,57 @@ class Session:
         except subprocess.TimeoutExpired:
             pass
 
+    def restore_files(self):
+        """Put the managed files back through the in-memory state helper, then reload Hyprland. True when nothing is
+        left to restore."""
+        if self.state is None:
+            return True
+        try:
+            if read_marker() is None:
+                return True
+            if plugin_enabled(self.checkout):
+                rc = self.state.uninstall(False, retain_adapter=True)
+            else:
+                rc = self.state.uninstall(False)
+        except (PluginError, OSError) as e:
+            print("waybar-pill-plugin: cannot restore the managed files: %s" % e, file=sys.stderr)
+            return False
+        if rc != 0:
+            return False
+        try:
+            self.sh("hyprctl", "reload")
+            errors = self.hypr_errors()
+        except OSError:
+            return True
+        if errors:
+            print("waybar-pill-plugin: Hyprland reports config errors after restoring the files: " + "; ".join(errors), file=sys.stderr)
+        return True
+
+
+def recover_hint():
+    return "python3 %s recover" % os.path.abspath(__file__)
+
+
+def restore_everything(session):
+    """Files first (so a native Waybar never restarts against managed ones), then the journaled native desktop. True
+    when both are complete."""
+    journal = trusted_state_json(journal_path())
+    if journal is not None:
+        validate_journal(journal)
+    files_ok = session.restore_files()
+    desktop_ok = restore(session)
+    if not files_ok:
+        print("waybar-pill-plugin: the managed files could not be restored; resolve the conflicts listed above, then run: %s"
+              % recover_hint(), file=sys.stderr)
+    return files_ok and desktop_ok
+
 
 def restore(session=None):
-    """Undo a journaled session. The journal is kept if anything could not be restored."""
+    """Undo a journaled session. The journal is kept if anything could not be restored. True when nothing is left."""
     s = session or Session()
     j = trusted_state_json(journal_path())
     if j is None:
-        return
+        return True
     validate_journal(j)
     j["phase"] = "restoring"
     s.save_journal(j)
@@ -720,13 +835,266 @@ def restore(session=None):
             if r.returncode != 0:
                 failed.append("bar: " + r.stderr.strip())
         if j.get("waybar_was_active"):
-            s.sh("systemctl", "--user", "start", "waybar.service")
+            r = s.sh("systemctl", "--user", "start", "waybar.service")
+            if r.returncode != 0:
+                failed.append("native Waybar: " + r.stderr.strip())
     except Exception as e:
         failed.append("native bar: %s" % e)
     if failed:
-        print("waybar-pill-plugin: restoration incomplete (%s); run: waybar-pill-plugin recover" % "; ".join(failed), file=sys.stderr)
-        return
+        print("waybar-pill-plugin: restoration incomplete (%s); run: %s" % ("; ".join(failed), recover_hint()), file=sys.stderr)
+        return False
     remove_state(journal_path())
+    return True
+
+
+# ---- plugin checkout and durable lifecycle generations
+
+MAX_SOURCE_BYTES = 4 << 20
+LOG_LIMIT = 1 << 20
+CHECKOUT_FILES = ("install.sh", "files/scripts/waybar-pill-plugin", "files/setup/plugin-state.py")
+# (directory, file name, checkout path, mode) of an immutable lifecycle generation. The layout mirrors the checkout's
+# files/{scripts,setup}, so the state helper finds the bridge the same way in both places.
+GENERATION_FILES = (("scripts", "waybar-pill-plugin", "files/scripts/waybar-pill-plugin", 0o500),
+                    ("setup", "plugin-state.py", "files/setup/plugin-state.py", 0o400))
+
+
+def data_dir():
+    base = os.environ.get("XDG_DATA_HOME", "")
+    base = os.path.normpath(base) if base and os.path.isabs(base) else os.path.join(home(), ".local", "share")
+    return os.path.join(base, "waybar-notch")
+
+
+def lifecycle_dir():
+    return os.path.join(data_dir(), "lifecycle")
+
+
+def provision_log_path():
+    return os.path.join(state_dir(), "provision.log")
+
+
+def read_checkout_file(checkout, rel):
+    """Bytes of an owned regular file below the checkout, reached through directory descriptors that never follow a link."""
+    parts = rel.split("/")
+    dpath = os.path.join(checkout, *parts[:-1]) if len(parts) > 1 else checkout
+    dfd = open_directory_chain(dpath, own_from=trust_root(checkout))
+    if dfd is None:
+        raise PluginError("%s is missing from the plugin checkout %s" % (rel, checkout))
+    try:
+        try:
+            fd = open_leaf(dfd, parts[-1], os.path.join(checkout, rel), state=True)
+        except FileNotFoundError:
+            raise PluginError("%s is missing from the plugin checkout %s" % (rel, checkout))
+    finally:
+        os.close(dfd)
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(MAX_SOURCE_BYTES + 1)
+    if len(data) > MAX_SOURCE_BYTES:
+        raise PluginError("%s is too large" % rel)
+    return data
+
+
+def validate_checkout(checkout):
+    """{checkout path: bytes} of the lifecycle sources of a checkout that really is this plugin: an absolute normalized
+    path, a manifest whose id is waybar.pill-bar, and owned regular files (never links) for every source."""
+    if not isinstance(checkout, str) or not os.path.isabs(checkout) or os.path.normpath(checkout) != checkout or "\0" in checkout:
+        raise PluginError("%s is not an absolute normalized checkout path" % checkout)
+    try:
+        manifest = json.loads(read_checkout_file(checkout, "manifest.json").decode("utf-8"),
+                              object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+    except (ValueError, UnicodeDecodeError):
+        raise PluginError("%s/manifest.json is malformed" % checkout)
+    if not isinstance(manifest, dict) or manifest.get("id") != PLUGIN_ID:
+        raise PluginError("%s is not the %s plugin" % (checkout, PLUGIN_ID))
+    for rel in ("files/scripts", "files/setup", "files/hooks", "files/hypr", "files/qml", "notch/src"):
+        path = os.path.join(checkout, rel)
+        parent = open_directory_chain(os.path.dirname(path), own_from=trust_root(checkout))
+        if parent is None:
+            continue
+        try:
+            try:
+                validate_tree(parent, os.path.basename(path), path)
+            except FileNotFoundError:
+                pass  # minimal test checkouts need only their install script and lifecycle helpers
+        finally:
+            os.close(parent)
+    return {rel: read_checkout_file(checkout, rel) for rel in CHECKOUT_FILES}
+
+
+def _generation_matches(rfd, gen, files):
+    """True when GENERATION exists with exactly these bytes, False when it does not exist; anything else is an error."""
+    try:
+        gfd = os.open(gen, _DIR_FLAGS, dir_fd=rfd)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise PluginError("lifecycle generation %s is not trusted (%s)" % (gen, e.strerror or type(e).__name__))
+    try:
+        _verify_dir(gfd, gen, True)
+        if stat.S_IMODE(os.fstat(gfd).st_mode) != 0o700 or set(os.listdir(gfd)) != {"scripts", "setup"}:
+            raise PluginError("lifecycle generation %s has unsafe contents or permissions" % gen)
+        for sub, name, rel, _ in GENERATION_FILES:
+            where = "%s/%s/%s" % (gen, sub, name)
+            try:
+                sfd = os.open(sub, _DIR_FLAGS, dir_fd=gfd)
+            except OSError:
+                raise PluginError("lifecycle generation %s is incomplete" % gen)
+            try:
+                _verify_dir(sfd, where, True)
+                if stat.S_IMODE(os.fstat(sfd).st_mode) != 0o700 or os.listdir(sfd) != [name]:
+                    raise PluginError("lifecycle generation %s has unsafe contents or permissions" % gen)
+                try:
+                    fd = open_leaf(sfd, name, where)
+                except FileNotFoundError:
+                    raise PluginError("lifecycle generation %s is incomplete" % gen)
+                with os.fdopen(fd, "rb") as f:
+                    data = f.read(MAX_SOURCE_BYTES + 1)
+            finally:
+                os.close(sfd)
+            if data != files[rel]:
+                raise PluginError("lifecycle generation %s was modified; remove it and retry" % gen)
+    finally:
+        os.close(gfd)
+    return True
+
+
+def _write_generation(rfd, tmp, files):
+    os.mkdir(tmp, 0o700, dir_fd=rfd)
+    tfd = os.open(tmp, _DIR_FLAGS, dir_fd=rfd)
+    try:
+        for sub, name, rel, mode in GENERATION_FILES:
+            os.mkdir(sub, 0o700, dir_fd=tfd)
+            sfd = os.open(sub, _DIR_FLAGS, dir_fd=tfd)
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=sfd)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(files[rel])
+                    f.flush()
+                    os.fsync(f.fileno())
+                    os.fchmod(f.fileno(), mode)
+                os.fsync(sfd)
+            finally:
+                os.close(sfd)
+        os.fsync(tfd)
+    finally:
+        os.close(tfd)
+
+
+def stage_generation(files):
+    """Path of the immutable lifecycle generation that holds exactly these helper bytes. It is published by one atomic
+    rename of a fully written private directory and verified (never rewritten) when it already exists."""
+    h = hashlib.sha256()
+    for _, name, rel, _ in GENERATION_FILES:
+        h.update(name.encode() + b"\0" + len(files[rel]).to_bytes(8, "big") + files[rel])
+    gen = h.hexdigest()[:32]
+    root = lifecycle_dir()
+    rfd = open_directory_chain(root, own_from=data_dir(), create=True)
+    try:
+        if _generation_matches(rfd, gen, files):
+            return os.path.join(root, gen)
+        tmp = ".stage.%s" % secrets.token_hex(8)
+        try:
+            _write_generation(rfd, tmp, files)
+            try:
+                os.rename(tmp, gen, src_dir_fd=rfd, dst_dir_fd=rfd)
+                os.fsync(rfd)
+            except OSError as e:
+                if e.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise
+                if not _generation_matches(rfd, gen, files):  # another launcher published it first
+                    raise PluginError("lifecycle generation %s exists with other content" % gen)
+        finally:
+            try:
+                remove_tree(rfd, tmp, tmp)
+            except OSError:
+                pass  # renamed away (the normal case) or never created
+    finally:
+        os.close(rfd)
+    return os.path.join(root, gen)
+
+
+def validate_tree(parent_fd, name, label, depth=0, counter=None):
+    """Read-only walk of a product-owned directory through descriptors: only owned regular files and directories."""
+    counter = counter if counter is not None else [0]
+    if depth > MAX_TREE_DEPTH:
+        raise PluginError("%s is nested too deeply" % label)
+    fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        _verify_dir(fd, label, True)
+        for entry in os.listdir(fd):
+            counter[0] += 1
+            if counter[0] > MAX_TREE_ENTRIES:
+                raise PluginError("%s holds too many entries" % label)
+            st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+            sub = label + "/" + entry
+            if stat.S_ISDIR(st.st_mode):
+                validate_tree(fd, entry, sub, depth + 1, counter)
+            else:
+                check_leaf(st, sub, state=True)
+    finally:
+        os.close(fd)
+
+
+def remove_tree(parent_fd, name, label, depth=0):
+    """Delete a product-owned directory tree through descriptors. Links, special files and foreign owners are never
+    followed or removed: they stop the removal with PluginError."""
+    if depth > MAX_TREE_DEPTH:
+        raise PluginError("%s is nested too deeply" % label)
+    fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise PluginError("%s is not owned by you" % label)
+        os.fchmod(fd, 0o700)
+        for entry in os.listdir(fd):
+            st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+            sub = label + "/" + entry
+            if stat.S_ISDIR(st.st_mode):
+                remove_tree(fd, entry, sub, depth + 1)
+            elif stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+                os.unlink(entry, dir_fd=fd)
+            else:
+                raise PluginError("%s is not an owned regular file or directory" % sub)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def open_provision_log(rotate=False):
+    """Append-mode descriptor of the private provisioning log (state directory 0700, log 0600). `rotate` empties a log
+    that has grown past 1 MiB."""
+    d = state_dir()
+    dfd = open_directory_chain(d, own_from=d, create=True)
+    try:
+        os.fchmod(dfd, 0o700)
+        try:
+            fd = os.open("provision.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+        except OSError as e:
+            raise PluginError("cannot open the provisioning log: %s" % (e.strerror or type(e).__name__))
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        check_leaf(st, provision_log_path())
+        if st.st_nlink != 1:
+            raise PluginError("%s has unsafe links" % provision_log_path())
+        os.fchmod(fd, 0o600)
+        if rotate and st.st_size > LOG_LIMIT:
+            os.ftruncate(fd, 0)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def load_state_module():
+    """The state helper that sits beside this script (files/setup in a checkout or a lifecycle generation), imported
+    into this process so restoring files never depends on the checkout still existing."""
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "setup", "plugin-state.py"))
+    if not os.path.isfile(path):
+        raise PluginError("the state helper %s is missing; run this from the plugin checkout or a lifecycle generation" % path)
+    loader = importlib.machinery.SourceFileLoader("waybar_plugin_state", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
 
 
 # ---- server
@@ -751,8 +1119,9 @@ def peer_credentials(conn):
     return struct.unpack("3i", cred)
 
 
-def relay_handshake(conn, session, limit=READY_WAIT):
-    """Ask the shell's plugin to attach its notification server to the notch, then wait for its acknowledgement."""
+def relay_handshake(conn, session, limit=READY_WAIT, service=None):
+    """Ask the shell's plugin to attach its notification server to the notch, then wait for its acknowledgement.
+    `service` (optional) answers control requests between reads."""
     try:
         conn.sendall((json.dumps({"ok": True, "active": False, "stage": "connect-relay"}) + "\n").encode())
     except OSError:
@@ -761,6 +1130,8 @@ def relay_handshake(conn, session, limit=READY_WAIT):
     buf = b""
     while b"\n" not in buf:
         session.check_children()
+        if service is not None:
+            service()
         left = end - time.monotonic()
         if left <= 0:
             raise PluginError("the shell did not attach the notification relay in time")
@@ -801,21 +1172,180 @@ def reply(conn, ok, active, error=None):
         pass
 
 
-def serve(runner=run, popen=subprocess.Popen):
+class Cancelled(PluginError):
+    """The lease ended or a stop was requested while the session was being established."""
+
+
+class Control:
+    """The control socket and the lease of one backend. `pump` is the only place either is serviced, so every wait
+    (provisioning, readiness) keeps answering short probes and notices the lease closing."""
+
+    def __init__(self, srv, session, stop):
+        self.srv, self.session, self.stop = srv, session, stop
+        self.lease = None
+
+    def close(self):
+        for s in (self.lease, self.srv):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self.lease = self.srv = None
+
+    def close_listener(self):
+        """Stop accepting requests; the lease (if any) stays open so a failure can still be reported on it."""
+        if self.srv is not None:
+            try:
+                self.srv.close()
+            except OSError:
+                pass
+
+    def pump(self, timeout=0.2, allow_lease=False, watch_lease=True):
+        """Service the sockets for up to `timeout`. Returns (connection, pid) for a new lease request when
+        `allow_lease`; raises Cancelled when the lease closed or a stop was requested."""
+        if self.stop:
+            raise Cancelled("the backend was asked to stop")
+        socks = [self.srv]
+        if watch_lease and self.lease is not None:
+            socks.append(self.lease)
+        r, _, _ = select.select(socks, [], [], timeout)
+        if watch_lease and self.lease is not None and self.lease in r:
+            if not self.lease.recv(1, socket.MSG_PEEK):
+                raise Cancelled("the lease closed")  # EOF: plugin disabled/unloaded or shell gone
+            self.lease.recv(4096)
+        if self.srv in r:
+            return self.accept(allow_lease)
+        return None
+
+    def accept(self, allow_lease):
+        conn, _ = self.srv.accept()
+        s = self.session
+        try:
+            pid, uid, _ = peer_credentials(conn)
+            if uid != os.getuid():
+                conn.close()
+                return None
+            op = read_line(conn, 2.0).get("op")
+        except (OSError, ValueError, KeyError, AttributeError):
+            conn.close()
+            return None
+        if op == "lease":
+            if self.lease is not None or not allow_lease:
+                reply(conn, False, s.active, "a lease is already held")
+                conn.close()
+                return None
+            return conn, pid
+        if op == "active":
+            reply(conn, True, s.active)
+        elif op in ("reload", "toggle"):
+            if s.active and s.signal_notch(signal.SIGUSR2 if op == "reload" else signal.SIGUSR1):
+                reply(conn, True, True)
+            else:
+                reply(conn, False, s.active, "plugin is not active")
+        elif op == "stop":
+            reply(conn, True, False)
+            self.stop.append(1)
+        else:
+            reply(conn, False, s.active, "unknown operation")
+        conn.close()
+        return None
+
+
+def terminate_group(proc, grace=STOP_WAIT):
+    """Stop a tracked child's own process group (SIGTERM, then SIGKILL) and reap it. Never touches another group."""
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(wait)
+            if sig == signal.SIGKILL:
+                break
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        proc.wait(5.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def provision(checkout, ctl, wait=PROVISION_WAIT):
+    """Run `install.sh --provision` for this checkout in its own process group while the native desktop stays untouched.
+    The lease and control socket keep being serviced; a closed lease, a stop or a signal cancels it and kills only
+    this group. Raises PluginError unless it exits 0."""
+    validate_checkout(checkout)  # the checkout may have been deleted since `start`
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", WAYBAR_PILL_SESSION="1")
+    logfd = open_provision_log()
+    try:
+        os.write(logfd, ("== provisioning %s ==\n" % time.strftime("%Y-%m-%d %H:%M:%S")).encode())
+        proc = subprocess.Popen(["bash", os.path.join(checkout, "install.sh"), "--provision"], cwd=checkout, env=env,
+                                stdin=subprocess.DEVNULL, stdout=logfd, stderr=subprocess.STDOUT, start_new_session=True)
+    finally:
+        os.close(logfd)
+    end = time.monotonic() + wait
+    try:
+        while proc.poll() is None:
+            ctl.pump(0.2)
+            if time.monotonic() > end:
+                raise PluginError("provisioning did not finish within %d seconds; see %s" % (wait, provision_log_path()))
+        if proc.returncode != 0:
+            raise PluginError("provisioning failed (exit status %d); see %s" % (proc.returncode, provision_log_path()))
+    finally:
+        terminate_group(proc)
+
+
+def establish(ctl, conn, pid, session, provisioner):
+    """Provision (when asked), then take the desktop over for the lease peer `pid`."""
+    if provisioner is not None:
+        try:
+            conn.sendall((json.dumps({"ok": True, "active": False, "stage": "provisioning"}) + "\n").encode())
+        except OSError:
+            raise Cancelled("the lease closed")
+        provisioner(ctl)
+    session.idle = ctl.pump
+    try:
+        session.activate(pid, lambda: relay_handshake(conn, session, service=lambda: ctl.pump(0.0, watch_lease=False)))
+    finally:
+        session.idle = None
+    reply(conn, True, True)
+
+
+def serve(runner=run, popen=subprocess.Popen, checkout=None, state=None, provisioner=None):
+    """The detached backend. With a `checkout` it provisions that checkout once the QML service holds the lease; the
+    `state` helper (default: the one beside this script) is imported before any lease is accepted."""
     lock = lock_runtime()
     if lock is None:
         return 0  # another backend owns this runtime; never a second product pair
     path = sock_path()
     session = Session(runner, popen)
+    session.checkout = checkout
     srv = None
+    ctl = None
     stop = []
+
+    def shutdown_listener():
+        if ctl is not None:
+            ctl.close_listener()
+        elif srv is not None:
+            srv.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    session.before_restore = shutdown_listener
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.append(1))
     except ValueError:
         pass  # not the main thread (embedded use); the caller owns signals
     try:
-        restore(session)
+        session.state = state if state is not None else load_state_module()
+        if not restore_everything(session):  # every enable first finishes a stale or manual setup
+            session.cleaned = True  # nothing of this session exists yet; do not retry on the way out
+            raise PluginError("a previous setup could not be fully restored; nothing was started")
         if os.path.lexists(path):
             if not stat.S_ISSOCK(os.lstat(path).st_mode):
                 raise PluginError("%s is not a socket" % path)
@@ -827,123 +1357,110 @@ def serve(runner=run, popen=subprocess.Popen):
         finally:
             os.umask(old)
         srv.listen(4)
-        lease = None
+        ctl = Control(srv, session, stop)
+        if provisioner is None and checkout is not None:
+            provisioner = lambda c: provision(checkout, c)
         deadline = time.monotonic() + LEASE_WAIT
         while not stop:
-            if lease is None and time.monotonic() > deadline:
+            if ctl.lease is None and time.monotonic() > deadline:
                 return 0
-            socks = [srv] + ([lease] if lease else [])
-            r, _, _ = select.select(socks, [], [], 0.2)
+            try:
+                got = ctl.pump(0.2, allow_lease=ctl.lease is None)
+            except Cancelled:
+                break  # lease EOF (plugin disabled/removed, shell gone) or a stop request
             if session.children and not stop:
                 try:
                     session.check_children()
                 except PluginError as e:
                     print("waybar-pill-plugin: " + str(e), file=sys.stderr)
                     break
-            if lease in r:
-                if not lease.recv(1, socket.MSG_PEEK):
-                    break  # EOF: plugin disabled/unloaded or shell gone
-                lease.recv(4096)
-            if srv in r:
-                conn, _ = srv.accept()
+            if got:
+                conn, pid = got
+                ctl.lease = conn
                 try:
-                    pid, uid, _ = peer_credentials(conn)
-                    if uid != os.getuid():
-                        conn.close()
-                        continue
-                    op = read_line(conn).get("op")
-                    if op == "lease":
-                        if lease is not None:
-                            reply(conn, False, session.active, "a lease is already held")
-                            conn.close()
-                            continue
-                        try:
-                            session.activate(pid, lambda: relay_handshake(conn, session))
-                        except PluginError as e:
-                            print("waybar-pill-plugin: " + str(e), file=sys.stderr)
-                            reply(conn, False, False, str(e))
-                            conn.close()
-                            break
-                        lease = conn
-                        reply(conn, True, True)
-                    elif op == "active":
-                        reply(conn, True, session.active)
-                        conn.close()
-                    elif op in ("reload", "toggle"):
-                        if session.active and session.signal_supervisor(signal.SIGUSR2 if op == "reload" else signal.SIGUSR1):
-                            reply(conn, True, True)
-                        else:
-                            reply(conn, False, session.active, "plugin is not active")
-                        conn.close()
-                    elif op == "stop":
-                        reply(conn, True, False)
-                        conn.close()
-                        break
-                    else:
-                        reply(conn, False, session.active, "unknown operation")
-                        conn.close()
-                except (OSError, ValueError, KeyError, AttributeError):
-                    conn.close()
+                    establish(ctl, conn, pid, session, provisioner)
+                except Cancelled:
+                    break
+                except PluginError as e:
+                    print("waybar-pill-plugin: " + str(e), file=sys.stderr)
+                    reply(conn, False, False, str(e))
+                    break
         return 0
     except PluginError as e:
         print("waybar-pill-plugin: " + str(e), file=sys.stderr)
         return 1
     finally:
-        session.cleanup()
-        if srv is not None:
-            srv.close()
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        os.close(lock)
+        # Stop answering first: a launcher that probes now must see a backend that is going away, not a live one.
+        shutdown_listener()
+        if ctl is not None:
+            ctl.close()
+        try:
+            session.cleanup()  # children, sockets, managed files, Hyprland, then the native desktop
+        finally:
+            os.close(lock)
 
 
-def start():
-    """Launcher for the QML service: verify setup, then ensure one detached backend is running."""
-    read = read_marker()
-    if read is None:
-        print("waybar-pill-plugin: plugin setup has not been run: run ./install.sh in the plugin checkout, then re-enable", file=sys.stderr)
-        return 1
+def live_backend(timeout=1.0):
+    """Whether a backend currently answers on the control socket; a socket that accepts but never replies, or that is
+    being torn down, is not a live backend."""
+    try:
+        r = request("active", timeout)
+    except PluginError:
+        return False
+    return isinstance(r, dict) and r.get("ok") is True
+
+
+def spawn_backend(gen, checkout):
+    fd = open_provision_log(rotate=True)
+    try:
+        return subprocess.Popen([sys.executable, os.path.join(gen, "scripts", "waybar-pill-plugin"), "serve", "--checkout", checkout],
+                                cwd="/", start_new_session=True, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+                                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    finally:
+        os.close(fd)
+
+
+def start(checkout, wait=LIFECYCLE_WAIT):
+    """Launcher for the QML service: validate the checkout, stage the immutable generation, and make sure exactly one
+    backend is live. A tearing-down backend is waited for (its runtime lock), never reported as ready; concurrent
+    launchers converge on the same live backend."""
+    files = validate_checkout(checkout)
+    gen = stage_generation(files)
     runtime_dir()
-    if request("active", 1.0) is not None:
-        return 0
-    if lock_probe_held():
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if os.path.exists(sock_path()):
-                return 0
-            time.sleep(0.05)
-        return 0
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        if os.path.exists(sock_path()):
+    deadline = time.monotonic() + wait
+    child = None
+    while True:
+        if live_backend():
             return 0
-        time.sleep(0.05)
-    print("waybar-pill-plugin: the backend did not start", file=sys.stderr)
-    return 1
-
-
-def lock_probe_held():
-    fd = lock_runtime()
-    if fd is None:
-        return True
-    os.close(fd)
-    return False
+        if child is not None:
+            rc = child.poll()
+            if rc is not None:
+                if rc != 0:
+                    print("waybar-pill-plugin: the backend exited with status %d; see %s" % (rc, provision_log_path()), file=sys.stderr)
+                    return 1
+                child = None  # it lost the runtime lock to another launcher's backend
+        if child is None:
+            fd = lock_runtime()
+            if fd is not None:
+                os.close(fd)
+                child = spawn_backend(gen, checkout)
+        if time.monotonic() > deadline:
+            print("waybar-pill-plugin: no backend became ready within %d seconds (a previous session may still be shutting "
+                  "down); see %s" % (wait, provision_log_path()), file=sys.stderr)
+            return 1
+        time.sleep(0.1)
 
 
 def recover():
+    """Restore a stale session's files, then its native desktop, under the runtime lock."""
     fd = lock_runtime()
     if fd is None:
         print("waybar-pill-plugin: a live backend owns the session; disable the plugin instead", file=sys.stderr)
-        return 1
+        return 75
     try:
-        restore()
+        return 0 if restore_everything(Session(state=load_state_module())) else 1
     finally:
         os.close(fd)
-    return 0
 
 
 def control(op):
@@ -964,6 +1481,9 @@ def main(argv):
     if c == "mode" and len(argv) == 1:
         print(mode())
         return 0
+    if c == "validate-checkout" and len(argv) == 2:
+        validate_checkout(argv[1])
+        return 0
     if c == "active" and len(argv) == 1:
         if read_marker() is None:
             return 1
@@ -978,10 +1498,10 @@ def main(argv):
         return subprocess.run(["omarchy", "toggle", "bar"]).returncode
     if c in ("reload", "stop") and len(argv) == 1:
         return control(c)
-    if c == "start" and len(argv) == 1:
-        return start()
-    if c == "serve" and len(argv) == 1:
-        return serve()
+    if c == "start" and len(argv) == 3 and argv[1] == "--checkout":
+        return start(argv[2])
+    if c == "serve" and len(argv) == 3 and argv[1] == "--checkout":
+        return serve(checkout=argv[2])
     if c == "recover" and len(argv) == 1:
         return recover()
     if c == "runtime-dir" and len(argv) == 1:

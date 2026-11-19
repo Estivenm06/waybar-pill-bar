@@ -1,15 +1,11 @@
-//! AI usage tab, live: Claude Code tokens (session logs), Gemini / Antigravity prompts (history),
+//! AI usage data, live: Claude Code tokens (session logs), Gemini / Antigravity prompts (history),
 //! OMP tokens (session logs) and Copilot CLI tokens (sqlite db). `Tracker` tails the logs incrementally, so every poll reads only new data.
 use chrono::{DateTime, Local, NaiveDate, Utc};
-use gtk::{cairo, prelude::*};
-use gtk4 as gtk;
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 
 /// A provider counts as "live" when its newest record is younger than this.
 const LIVE_SECS: i64 = 90;
@@ -363,246 +359,72 @@ impl Tracker {
     }
 }
 
-pub struct AiUi {
-    c_big: gtk::Label,
-    c_info: gtk::Label,
-    c_detail: gtk::Label,
-    c_days: Rc<RefCell<Vec<f64>>>,
-    c_spark: gtk::DrawingArea,
-    c_dot: gtk::Label,
-    c_row: gtk::Box,
-    g_big: gtk::Label,
-    g_info: gtk::Label,
-    g_days: Rc<RefCell<Vec<f64>>>,
-    g_spark: gtk::DrawingArea,
-    g_dot: gtk::Label,
-    g_row: gtk::Box,
-    o_big: gtk::Label,
-    o_info: gtk::Label,
-    o_detail: gtk::Label,
-    o_days: Rc<RefCell<Vec<f64>>>,
-    o_spark: gtk::DrawingArea,
-    o_dot: gtk::Label,
-    o_row: gtk::Box,
-    p_big: gtk::Label,
-    p_info: gtk::Label,
-    p_detail: gtk::Label,
-    p_days: Rc<RefCell<Vec<f64>>>,
-    p_spark: gtk::DrawingArea,
-    p_dot: gtk::Label,
-    p_row: gtk::Box,
-    empty: gtk::Label,
+/// One provider tile of the AI page, ready to draw: the pure-text half of the legacy `AiUi::update`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub title: &'static str,
+    /// Brand colour of the dot and sparkline.
+    pub rgb: (f32, f32, f32),
+    pub live: bool,
+    /// Headline number ("12.3K").
+    pub big: String,
+    /// Caption under the headline ("tokens today").
+    pub sub: &'static str,
+    pub info: String,
+    pub detail: Option<String>,
+    /// Last 7 days (oldest first) scaled to 0..=1 by the provider's own peak.
+    pub spark: [f32; 7],
 }
 
-fn spark(days: Rc<RefCell<Vec<f64>>>, rgb: (f64, f64, f64)) -> gtk::DrawingArea {
-    let a = gtk::DrawingArea::new();
-    a.set_content_height(32);
-    a.set_hexpand(true);
-    a.set_vexpand(true);
-    a.set_valign(gtk::Align::Fill);
-    a.set_draw_func(move |_, cr: &cairo::Context, w, h| {
-        if w <= 0 || h <= 0 { return; }
-        let (w, h) = (w as f64, h as f64);
-        let d = days.borrow();
-        let n = d.len().max(1) as f64;
-        let gap = 4.0_f64.min(w / (n * 2.0));
-        let bw = (w - gap * (n - 1.0)) / n;
-        if bw <= 0.0 { return; }
-        for (i, v) in d.iter().enumerate() {
-            let bh = (v * h).max(2.0).min(h);
-            let r = 3.0_f64.min(bw / 2.0).min(bh / 2.0);
-            let (x, y, bottom) = (i as f64 * (bw + gap), h - bh, h);
-            let last = i + 1 == d.len();
-            cr.set_source_rgba(rgb.0, rgb.1, rgb.2, if last { 1.0 } else { 0.45 });
-            cr.new_sub_path();
-            cr.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
-            cr.arc(x + bw - r, y + r, r, 1.5 * std::f64::consts::PI, 2.0 * std::f64::consts::PI);
-            cr.line_to(x + bw, bottom);
-            cr.line_to(x, bottom);
-            cr.close_path();
-            let _ = cr.fill();
-        }
-    });
-    a
-}
+pub const EMPTY_TEXT: &str = "No AI tool logs found. Reads ~/.claude/projects, ~/.gemini/antigravity-cli/history.jsonl, ~/.omp/agent/sessions, ~/.copilot/session-store.db.";
 
-fn wrap_label(l: &gtk::Label) {
-    l.set_xalign(0.0);
-    l.set_hexpand(true);
-    l.set_single_line_mode(false);
-    l.set_wrap(true);
-    l.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    l.set_max_width_chars(1);
-}
-
-fn tile_row(dot: &gtk::Label, title: &str, big_lbl: &gtk::Label, sub_lbl: &gtk::Label, info_lbl: &gtk::Label, detail_lbl: Option<&gtk::Label>, spark: &gtk::DrawingArea) -> gtk::Box {
-    let t = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    t.add_css_class("ai-tile");
-    t.set_hexpand(true);
-    t.set_vexpand(true);
-    t.set_valign(gtk::Align::Fill);
-
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let h = gtk::Label::new(Some(title));
-    h.add_css_class("cap");
-    h.set_xalign(0.0);
-    h.set_hexpand(true);
-    h.set_max_width_chars(1);
-    h.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    head.append(dot);
-    head.append(&h);
-    big_lbl.add_css_class("ai-big");
-    head.append(big_lbl);
-    sub_lbl.add_css_class("sub");
-    sub_lbl.set_xalign(0.0);
-    t.append(&head);
-    t.append(sub_lbl);
-
-    info_lbl.add_css_class("ai-val");
-    wrap_label(info_lbl);
-    t.append(info_lbl);
-    if let Some(d) = detail_lbl {
-        d.add_css_class("sub");
-        d.add_css_class("ai-detail");
-        wrap_label(d);
-        t.append(d);
-    }
-    t.append(spark);
-    t
-}
-
-fn dot(css: &str) -> gtk::Label {
-    let d = gtk::Label::new(Some("\u{f111}"));
-    d.add_css_class(css);
-    d
-}
-
-pub fn build() -> (gtk::Box, AiUi) {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    page.add_css_class("ai-page");
-    page.set_homogeneous(true);
-    page.set_hexpand(true);
-    page.set_vexpand(true);
-    page.set_valign(gtk::Align::Fill);
-    page.set_margin_start(4);
-    page.set_margin_end(4);
-    page.set_margin_top(4);
-    page.set_margin_bottom(4);
-
-    let c_big = gtk::Label::new(Some("–"));
-    let c_sub = gtk::Label::new(Some("tokens today"));
-    let c_info = gtk::Label::new(None);
-    let c_days = Rc::new(RefCell::new(vec![0.0; 7]));
-    let c_spark = spark(c_days.clone(), (0.851, 0.467, 0.341));
-    let c_detail = gtk::Label::new(None);
-    let c_dot = dot("dot-claude");
-    let c_row = tile_row(&c_dot, "Claude", &c_big, &c_sub, &c_info, Some(&c_detail), &c_spark);
-
-    let g_big = gtk::Label::new(Some("–"));
-    let g_sub = gtk::Label::new(Some("prompts today"));
-    let g_info = gtk::Label::new(None);
-    let g_days = Rc::new(RefCell::new(vec![0.0; 7]));
-    let g_spark = spark(g_days.clone(), (0.541, 0.706, 0.973));
-    let g_dot = dot("dot-gemini");
-    let g_row = tile_row(&g_dot, "Gemini", &g_big, &g_sub, &g_info, None, &g_spark);
-
-    let o_big = gtk::Label::new(Some("–"));
-    let o_sub = gtk::Label::new(Some("tokens today"));
-    let o_info = gtk::Label::new(None);
-    let o_days = Rc::new(RefCell::new(vec![0.0; 7]));
-    let o_spark = spark(o_days.clone(), (0.451, 0.824, 0.541));
-    let o_detail = gtk::Label::new(None);
-    let o_dot = dot("dot-omp");
-    let o_row = tile_row(&o_dot, "OMP", &o_big, &o_sub, &o_info, Some(&o_detail), &o_spark);
-
-    let p_big = gtk::Label::new(Some("–"));
-    let p_sub = gtk::Label::new(Some("tokens today"));
-    let p_info = gtk::Label::new(None);
-    let p_days = Rc::new(RefCell::new(vec![0.0; 7]));
-    let p_spark = spark(p_days.clone(), (0.639, 0.443, 0.969));
-    let p_detail = gtk::Label::new(None);
-    let p_dot = dot("dot-copilot");
-    let p_row = tile_row(&p_dot, "Copilot", &p_big, &p_sub, &p_info, Some(&p_detail), &p_spark);
-
-    let empty = gtk::Label::new(Some("No AI tool logs found. Reads ~/.claude/projects, ~/.gemini/antigravity-cli/history.jsonl, ~/.omp/agent/sessions, ~/.copilot/session-store.db."));
-    empty.add_css_class("sub");
-    empty.set_wrap(true);
-    empty.set_max_width_chars(1);
-    empty.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    empty.set_xalign(0.0);
-    empty.set_hexpand(true);
-    empty.set_vexpand(true);
-    empty.set_valign(gtk::Align::Center);
-    empty.set_visible(false);
-
-    page.append(&c_row);
-    page.append(&g_row);
-    page.append(&o_row);
-    page.append(&p_row);
-    page.append(&empty);
-
-    (page, AiUi {
-        c_big, c_info, c_detail, c_days, c_spark, c_dot, c_row,
-        g_big, g_info, g_days, g_spark, g_dot, g_row,
-        o_big, o_info, o_detail, o_days, o_spark, o_dot, o_row,
-        p_big, p_info, p_detail, p_days, p_spark, p_dot, p_row,
-        empty,
-    })
-}
-
-fn shares(m: &[(String, u64)]) -> String {
+pub fn shares(m: &[(String, u64)]) -> String {
     let total: u64 = m.iter().map(|x| x.1).sum();
     if total == 0 { return String::new(); }
     m.iter().take(3).map(|(n, t)| format!("{n} {}%", t * 100 / total)).collect::<Vec<_>>().join(" · ")
 }
 
-fn set_live(dot: &gtk::Label, live: bool) {
-    if live { dot.add_css_class("live") } else { dot.remove_css_class("live") }
+fn norm(days: &[u64; 7]) -> [f32; 7] {
+    let peak = days.iter().copied().max().unwrap_or(1).max(1) as f32;
+    days.map(|d| d as f32 / peak)
 }
 
-fn set_txt(l: &gtk::Label, t: &str) {
-    l.set_text(t);
-    l.set_tooltip_text(Some(t));
-}
-
-impl AiUi {
-    pub fn update(&self, u: &Usage) {
-        self.c_row.set_visible(u.has_claude);
-        self.g_row.set_visible(u.has_gemini);
-        self.o_row.set_visible(u.has_omp);
-        self.empty.set_visible(!(u.has_claude || u.has_gemini || u.has_omp || u.has_copilot));
-        set_live(&self.c_dot, u.c_live);
-        set_live(&self.g_dot, u.g_live);
-        set_live(&self.o_dot, u.o_live);
-
-        self.c_big.set_text(&compact(u.ctoday));
-        set_txt(&self.c_info, &format!("5h: {}  ·  Today: {} ({} msgs)  ·  7d: {} (avg {}/d)", compact(u.c5h), compact(u.ctoday), u.cmsgs, compact(u.c7d), compact(u.c7d / 7)));
-        set_txt(&self.c_detail, &format!("7d  In {} · Out {} · Cache w {} / r {}  |  {}", compact(u.cbreak[0]), compact(u.cbreak[1]), compact(u.cbreak[2]), compact(u.cbreak[3]), shares(&u.cmodels)));
-        let peak = u.cdays.iter().copied().max().unwrap_or(1).max(1) as f64;
-        *self.c_days.borrow_mut() = u.cdays.iter().map(|d| *d as f64 / peak).collect();
-        self.c_spark.queue_draw();
-
-        self.g_big.set_text(&u.gtoday.to_string());
-        set_txt(&self.g_info, &format!("Today: {}  ·  7d: {} (avg {}/d)  ·  All: {}", u.gtoday, u.g7d, u.g7d / 7, u.gtotal));
-        let gp = u.gdays.iter().copied().max().unwrap_or(1).max(1) as f64;
-        *self.g_days.borrow_mut() = u.gdays.iter().map(|d| *d as f64 / gp).collect();
-        self.g_spark.queue_draw();
-
-        self.o_big.set_text(&compact(u.otoday));
-        set_txt(&self.o_info, &format!("Today: {}  ·  7d: {} (avg {}/d)", compact(u.otoday), compact(u.o7d), compact(u.o7d / 7)));
-        set_txt(&self.o_detail, &format!("7d  In {} · Out {} · Cache w {} / r {} · ${:.2}  |  {}", compact(u.obreak[0]), compact(u.obreak[1]), compact(u.obreak[2]), compact(u.obreak[3]), u.ocost7d, shares(&u.omodels)));
-        let op = u.odays.iter().copied().max().unwrap_or(1).max(1) as f64;
-        *self.o_days.borrow_mut() = u.odays.iter().map(|d| *d as f64 / op).collect();
-        self.o_spark.queue_draw();
-
-        self.p_row.set_visible(u.has_copilot);
-        set_live(&self.p_dot, u.p_live);
-        self.p_big.set_text(&compact(u.ptoday));
-        set_txt(&self.p_info, &format!("Today: {}  ·  7d: {} (avg {}/d)", compact(u.ptoday), compact(u.p7d), compact(u.p7d / 7)));
-        set_txt(&self.p_detail, &format!("7d  In {} · Out {} · Cache w {} / r {}  |  {}", compact(u.pbreak[0]), compact(u.pbreak[1]), compact(u.pbreak[2]), compact(u.pbreak[3]), shares(&u.pmodels)));
-        let pp = u.pdays.iter().copied().max().unwrap_or(1).max(1) as f64;
-        *self.p_days.borrow_mut() = u.pdays.iter().map(|d| *d as f64 / pp).collect();
-        self.p_spark.queue_draw();
+impl Usage {
+    /// Tiles for the providers that were found, in page order (Claude, Gemini, OMP, Copilot).
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        if self.has_claude {
+            rows.push(Row {
+                title: "Claude", rgb: (0.851, 0.467, 0.341), live: self.c_live, big: compact(self.ctoday), sub: "tokens today",
+                info: format!("5h: {}  ·  Today: {} ({} msgs)  ·  7d: {} (avg {}/d)", compact(self.c5h), compact(self.ctoday), self.cmsgs, compact(self.c7d), compact(self.c7d / 7)),
+                detail: Some(format!("7d  In {} · Out {} · Cache w {} / r {}  |  {}", compact(self.cbreak[0]), compact(self.cbreak[1]), compact(self.cbreak[2]), compact(self.cbreak[3]), shares(&self.cmodels))),
+                spark: norm(&self.cdays),
+            });
+        }
+        if self.has_gemini {
+            rows.push(Row {
+                title: "Gemini", rgb: (0.541, 0.706, 0.973), live: self.g_live, big: self.gtoday.to_string(), sub: "prompts today",
+                info: format!("Today: {}  ·  7d: {} (avg {}/d)  ·  All: {}", self.gtoday, self.g7d, self.g7d / 7, self.gtotal),
+                detail: None, spark: norm(&self.gdays),
+            });
+        }
+        if self.has_omp {
+            rows.push(Row {
+                title: "OMP", rgb: (0.451, 0.824, 0.541), live: self.o_live, big: compact(self.otoday), sub: "tokens today",
+                info: format!("Today: {}  ·  7d: {} (avg {}/d)", compact(self.otoday), compact(self.o7d), compact(self.o7d / 7)),
+                detail: Some(format!("7d  In {} · Out {} · Cache w {} / r {} · ${:.2}  |  {}", compact(self.obreak[0]), compact(self.obreak[1]), compact(self.obreak[2]), compact(self.obreak[3]), self.ocost7d, shares(&self.omodels))),
+                spark: norm(&self.odays),
+            });
+        }
+        if self.has_copilot {
+            rows.push(Row {
+                title: "Copilot", rgb: (0.639, 0.443, 0.969), live: self.p_live, big: compact(self.ptoday), sub: "tokens today",
+                info: format!("Today: {}  ·  7d: {} (avg {}/d)", compact(self.ptoday), compact(self.p7d), compact(self.p7d / 7)),
+                detail: Some(format!("7d  In {} · Out {} · Cache w {} / r {}  |  {}", compact(self.pbreak[0]), compact(self.pbreak[1]), compact(self.pbreak[2]), compact(self.pbreak[3]), shares(&self.pmodels))),
+                spark: norm(&self.pdays),
+            });
+        }
+        rows
     }
 }
 

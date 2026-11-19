@@ -15,8 +15,7 @@ BASE_CONFIG = {
 }
 
 BLOCK = """-- >>> waybar-pill-bar BEGIN (managed block, do not edit) >>>
--- Popup animation: pop in
-hl.layer_rule({ match = { namespace = "waybar-popup" }, animation = "popin 88%" })
+hl.layer_rule({ match = { namespace = "waybar-notch" }, blur = false })
 -- <<< waybar-pill-bar END <<<
 """
 
@@ -42,74 +41,19 @@ class SetupTests(unittest.TestCase):
     def cfg(self, apps):
         return {"apps": [{"id": i, "background": b} for i, b in apps]}
 
-    def render(self, apps, conf=None):
-        conf = json.loads(json.dumps(conf or BASE_CONFIG))
-        self.m.render_apps(conf, self.cfg(apps))
-        return conf
-
-    def test_empty_then_reselected_restores_group_and_removal_drops_stale_modules(self):
-        conf = self.render([("spotify", False), ("steam", False)])
-        self.assertEqual(conf["group/apps"]["modules"], ["custom/spotify", "custom/steam"])
-        self.assertEqual(conf["group/left"]["modules"], ["custom/launcher", "hyprland/workspaces", "group/apps"])
-        conf = self.render([], conf)
-        self.assertNotIn("group/apps", conf["group/left"]["modules"])
-        self.assertFalse([k for k in conf if k.startswith("custom/")])
-        conf = self.render([("steam", True)], conf)
-        self.assertEqual(conf["group/left"]["modules"], ["custom/launcher", "hyprland/workspaces", "group/apps"])
-        self.assertEqual(conf["group/apps"]["modules"], ["custom/steam"])
-        self.assertNotIn("custom/spotify", conf)
-
-    def test_group_returns_at_the_end_when_workspaces_module_is_absent(self):
-        base = {"group/left": {"modules": ["custom/launcher"]}}
-        conf = self.render([("steam", False)], base)
-        self.assertEqual(conf["group/left"]["modules"], ["custom/launcher", "group/apps"])
-
-    def test_order_background_and_shell_quoting(self):
-        conf = self.render([("whatsapp", True), ("spotify", False)])
-        self.assertEqual(conf["group/apps"]["modules"], ["custom/whatsapp", "custom/spotify"])
-        wa = conf["custom/whatsapp"]
-        self.assertTrue(wa["exec"].endswith("waybar-notch' --waybar-app-status whatsapp") or wa["exec"].endswith("waybar-notch --waybar-app-status whatsapp"))
-        self.assertNotIn("interval", wa)
-        self.assertIn("waybar-bgapp.sh toggle whatsapp", wa["on-click"])
-        self.assertIn("'web\\.whatsapp\\.com'", wa["on-click"])
-        self.assertIn("waybar-app.sh click", conf["custom/spotify"]["on-click"])
-
-    def test_script_path_with_spaces_is_quoted(self):
-        self.m.WAYBAR = os.path.join(self.tmp, "my bar")
-        conf = self.render([("steam", True)])
-        self.assertTrue(conf["custom/steam"]["on-click"].startswith("'%s/scripts/waybar-bgapp.sh'" % self.m.WAYBAR))
-
-    def test_status_signal_is_shared_and_avoids_other_modules(self):
-        base = json.loads(json.dumps(BASE_CONFIG))
-        base["custom/other"] = {"signal": 1}
-        base["custom/media"] = {"signal": 2}
-        conf = self.render([("spotify", False), ("steam", True)], base)
-        self.assertEqual({conf["custom/spotify"]["signal"], conf["custom/steam"]["signal"]}, {3})
-        again = self.render([("spotify", False)], conf)  # its own old signal must not count as taken
-        self.assertEqual(again["custom/spotify"]["signal"], 3)
-
-    def test_all_signals_taken_is_an_error_and_leaves_config_untouched(self):
-        base = json.loads(json.dumps(BASE_CONFIG))
-        for n in range(1, 31):
-            base["custom/x%d" % n] = {"signal": n}
-        conf = json.loads(json.dumps(base))
-        with self.assertRaises(self.m.ConfigError):
-            self.m.render_apps(conf, self.cfg([("steam", False)]))
-        self.assertEqual(conf, base)
-
     def test_autostart_only_bg_rules_inside_the_block_change(self):
         text = "-- mine\nbefore()\n" + BLOCK + "after()\n"
         out = self.m.replace_bg_rules(text, ["rule -- @bg"])
         self.assertTrue(out.startswith("-- mine\nbefore()\n") and out.endswith("after()\n"))
-        self.assertIn("rule -- @bg\n-- Popup animation:", out)
+        self.assertIn("rule -- @bg\n-- <<< waybar-pill-bar END <<<", out)
         again = self.m.replace_bg_rules(out, [])
         self.assertEqual(again, text)  # fully reversible, no @bg residue
 
     def test_missing_or_duplicate_anchors_change_nothing(self):
-        for bad in ("nothing here\n", BLOCK + BLOCK, BLOCK.replace("-- Popup animation:", "-- renamed:")):
+        for bad in ("nothing here\n", BLOCK + BLOCK, BLOCK.replace("-- <<< waybar-pill-bar END <<<", "-- renamed:")):
             with self.assertRaises(self.m.ConfigError) as cm:
                 self.m.replace_bg_rules(bad, ["x -- @bg"])
-            self.assertIn("install.sh", str(cm.exception))
+            self.assertIn("re-enable", str(cm.exception))
 
     def test_render_has_window_rules_but_no_launch_or_bar_hide(self):
         cfg = self.cfg([("steam", True)])
@@ -127,7 +71,27 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn("exec_on_start", text)
         self.assertNotEqual(self.m.main(["render-autostart", src, out, "--plugin"]), 0)
 
-    def test_apply_in_plugin_mode_rolls_back_both_files_and_never_starts_services(self):
+    def test_patch_lua_stages_without_changing_destination(self):
+        target = os.path.join(self.tmp, "target.lua")
+        snippet = os.path.join(self.tmp, "snippet.lua")
+        staged = os.path.join(self.tmp, "staged.lua")
+        original = "-- mine\n" + BLOCK + "after()\n"
+        updated = BLOCK.replace("blur = false", "blur = true")
+        with open(target, "w") as f:
+            f.write(original)
+        with open(snippet, "w") as f:
+            f.write(updated)
+        self.m.cmd_patch_lua(target, snippet, staged)
+        with open(target) as f:
+            self.assertEqual(f.read(), original)
+        with open(staged) as f:
+            self.assertEqual(f.read(), "-- mine\n" + updated + "after()\n")
+        with open(target, "w") as f:
+            f.write(BLOCK + BLOCK)
+        with self.assertRaises(self.m.ConfigError):
+            self.m.cmd_patch_lua(target, snippet, staged)
+
+    def test_apply_in_plugin_mode_rolls_back_the_autostart_and_never_starts_services(self):
         wb = self.m.WAYBAR
         auto = os.path.join(self.home, ".config", "hypr", "autostart.lua")
         os.makedirs(os.path.join(wb, "scripts"))
@@ -161,8 +125,6 @@ class SetupTests(unittest.TestCase):
             self.m.cmd_apply()
         with open(auto) as f:
             self.assertEqual(f.read(), before)
-        with open(os.path.join(wb, "config.jsonc")) as f:
-            self.assertEqual(f.read(), conf_text)
         os.unlink(os.path.join(self.tmp, "bad"))
         self.m.cmd_apply()
         with open(auto) as f:
@@ -247,8 +209,6 @@ class SetupTests(unittest.TestCase):
             os.umask(old)
         self.assertEqual(S_IMODE(os.stat(conf).st_mode), 0o600)
         self.assertEqual(S_IMODE(os.stat(auto).st_mode), 0o644)
-        with open(conf) as f:
-            self.assertNotEqual(f.read(), conf_text)  # it really was rewritten
         roots = [os.path.join(self.m.WAYBAR, n) for n in os.listdir(self.m.WAYBAR) if n.startswith("backup-")]
         self.assertEqual(len(roots), 1)
         for d in (roots[0], os.path.join(roots[0], "hypr")):
@@ -256,7 +216,6 @@ class SetupTests(unittest.TestCase):
         with open(os.path.join(roots[0], "hypr", "autostart.lua")) as f:
             self.assertEqual(f.read(), BLOCK)
         self.assertEqual(S_IMODE(os.stat(os.path.join(roots[0], "hypr", "autostart.lua")).st_mode), 0o644)
-        self.assertEqual(S_IMODE(os.stat(os.path.join(roots[0], "config.jsonc")).st_mode), 0o600)
 
     def test_rejected_apply_restores_bytes_and_modes(self):
         from stat import S_IMODE

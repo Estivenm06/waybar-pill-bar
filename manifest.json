@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "waybar.pill-bar",
   "name": "Waybar Pill Bar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Estivenm06",
   "license": "MIT",
-  "description": "Bridge service for the external Rust/GTK pill bar and notch: while enabled it runs Waybar and the notch in place of the native bar, notifications and OSD; disabling restores them. Run ./install.sh once before enabling.",
+  "description": "Rust pill bar and notch service. Enabling provisions managed files and replaces the native bar, notifications and OSD; disabling or removal restores files and the native desktop. Preferences and credentials remain.",
   "kinds": ["service"],
   "entryPoints": { "service": "Service.qml" },
   "keepLoaded": true

@@ -5,15 +5,18 @@ import Quickshell.Io
 // Bridge to the external Waybar Pill Bar. The backend owns the product processes; this component only holds a lease
 // socket open and, when the backend asks (stage "connect-relay"), attaches this shell's notification server to the
 // notch's cards. Closing the lease (disable, removal, shell exit or crash, or any failure here) makes the backend stop
-// the product and restore the native bar, notifications and OSD. Nothing here installs, builds or reconnects.
+// the product and restore managed files, the native bar, notifications and OSD. Enable provisions before takeover.
 Item {
     id: root
 
     readonly property string home: Quickshell.env("HOME")
     readonly property string runtime: Quickshell.env("XDG_RUNTIME_DIR")
+    readonly property string checkout: decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")).replace(/\/$/, "")
+    readonly property string provisionLog: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/waybar-notch/provision.log"
+    property bool provisioning: false
 
     function fail(what) {
-        console.warn("waybar.pill-bar: " + what + ". Run ./install.sh in the plugin checkout, fix any reported error, then disable and re-enable the plugin.")
+        console.warn("waybar.pill-bar: " + what + ". See " + root.provisionLog + "; fix the reported error, then disable and re-enable the plugin.")
     }
 
     function abort(what) {
@@ -23,7 +26,7 @@ Item {
 
     Process {
         id: launcher
-        command: ["python3", root.home + "/.config/waybar/scripts/waybar-pill-plugin", "start"]
+        command: ["python3", root.checkout + "/files/scripts/waybar-pill-plugin", "start", "--checkout", root.checkout]
         stderr: StdioCollector {
             id: launcherErr
         }
@@ -49,10 +52,15 @@ Item {
             onRead: line => {
                 var reply = {}
                 try { reply = JSON.parse(line) } catch (e) {}
-                if (!reply.ok)
-                    root.fail("the backend refused the lease: " + (reply.error || "unknown error"))
-                else if (reply.stage === "connect-relay")
+                if (!reply.ok) {
+                    root.provisioning = false
+                    root.abort("the backend refused the lease: " + (reply.error || "unknown error"))
+                } else if (reply.stage === "provisioning") {
+                    root.provisioning = true
+                } else if (reply.stage === "connect-relay") {
+                    root.provisioning = false
                     relay.active = true
+                }
             }
         }
         onError: error => root.fail("the control socket failed")

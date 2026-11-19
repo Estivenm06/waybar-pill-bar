@@ -1,33 +1,31 @@
 //! Bounded, worker-side decoding of untrusted local image files.
 //!
-//! `load_file` never runs on the GTK thread: it opens without following links or blocking, refuses anything that
-//! is not a regular file (a FIFO never reaches a decoder), caps the encoded size, rejects huge dimensions as soon as
-//! the loader reports them and returns only validated RGB/RGBA pixels. `texture` then wraps those pixels on GTK
-//! without reopening a path or copying them.
+//! `load_file` never runs on the UI thread: it opens without following links or blocking, refuses anything that
+//! is not a regular file (a FIFO never reaches a decoder), caps the encoded size, rejects huge dimensions from the
+//! header before decoding and returns only validated straight-alpha RGBA pixels (`Send`). `DecodedImage::into_image`
+//! then builds the premultiplied `render::Image` on the UI thread.
 
-use gtk4::gdk_pixbuf::prelude::*;
-use gtk4::gdk_pixbuf::{Colorspace, InterpType, PixbufLoader};
-use gtk4::{gdk, glib};
-use std::cell::Cell;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 /// Largest accepted source image, in pixels (a 4096x4096 picture).
-pub const MAX_SOURCE_PIXELS: i64 = 16_777_216;
-/// Largest decoded pixel buffer that is handed out.
-const MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
-const CHUNK: usize = 64 * 1024;
+pub const MAX_SOURCE_PIXELS: u64 = 16_777_216;
 
-/// Validated pixels; `bytes` is shared, immutable storage with `rowstride` bytes per row.
+/// Validated straight-alpha RGBA8 pixels, `width * height * 4` bytes.
 #[derive(Clone, Debug)]
 pub struct DecodedImage {
-    pub width: i32,
-    pub height: i32,
-    pub rowstride: usize,
-    pub alpha: bool,
-    pub bytes: glib::Bytes,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl DecodedImage {
+    /// Premultiplies into a drawable image (UI thread).
+    pub fn into_image(self) -> Option<crate::render::Image> {
+        crate::render::Image::from_rgba8(self.width, self.height, &self.rgba)
+    }
 }
 
 /// Absolute paths and local `file:` URIs (empty or `localhost` authority) only.
@@ -36,23 +34,26 @@ pub fn local_path(value: &str) -> Option<PathBuf> {
     if value.starts_with('/') { return Some(PathBuf::from(value)); }
     let (scheme, _) = value.split_once(':')?;
     if !scheme.eq_ignore_ascii_case("file") { return None; }
-    let (path, host) = glib::filename_from_uri(value).ok()?;
-    if host.is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost")) { return None; }
-    use std::os::unix::ffi::OsStrExt;
+    if !value.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://")) { return None; }
+    let url = url::Url::parse(value).ok()?;
+    if url.host_str().is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost")) { return None; }
+    if url.query().is_some() || url.fragment().is_some() { return None; }
+    let path = url.to_file_path().ok()?;
     (path.is_absolute() && !path.as_os_str().as_bytes().contains(&0)).then_some(path)
 }
 
-fn target_size(w: i32, h: i32, max_edge: i32) -> (i32, i32) {
+fn target_size(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
     let m = w.max(h);
     if m <= max_edge { return (w, h); }
-    let scale = |v: i32| ((v as i64 * max_edge as i64 / m as i64).max(1)) as i32;
+    let scale = |v: u32| ((v as u64 * max_edge as u64 / m as u64).max(1)) as u32;
     (scale(w), scale(h))
 }
 
 /// Decodes `path` to at most `max_edge` pixels on its longest side. Errors are fixed strings (no paths, no content).
 pub fn load_file(path: &Path, max_edge: i32) -> Result<DecodedImage, String> {
     if max_edge <= 0 { return Err("invalid target size".into()); }
-    let mut file = std::fs::OpenOptions::new()
+    let max_edge = max_edge as u32;
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
@@ -62,70 +63,25 @@ pub fn load_file(path: &Path, max_edge: i32) -> Result<DecodedImage, String> {
     if md.len() == 0 { return Err("empty image".into()); }
     if md.len() > crate::art_cache::MAX_ART_BYTES { return Err("image file too large".into()); }
 
-    let loader = PixbufLoader::new();
-    let rejected = Rc::new(Cell::new(false));
-    let dims = Rc::new(Cell::new((0i32, 0i32)));
-    {
-        let (rejected, dims) = (rejected.clone(), dims.clone());
-        loader.connect_size_prepared(move |l, w, h| {
-            let pixels = (w as i64).checked_mul(h as i64);
-            if w <= 0 || h <= 0 || pixels.is_none_or(|p| p > MAX_SOURCE_PIXELS) {
-                rejected.set(true);
-                l.set_size(1, 1);
-                return;
-            }
-            dims.set((w, h));
-            let (tw, th) = target_size(w, h, max_edge);
-            if (tw, th) != (w, h) { l.set_size(tw, th); }
-        });
-    }
-    let fail = |loader: &PixbufLoader, msg: &str| -> Result<DecodedImage, String> {
-        let _ = loader.close();
-        Err(msg.to_string())
+    let mut data = Vec::with_capacity(md.len() as usize);
+    file.take(crate::art_cache::MAX_ART_BYTES + 1).read_to_end(&mut data).map_err(|_| "cannot read image".to_string())?;
+    if data.len() as u64 > crate::art_cache::MAX_ART_BYTES { return Err("image file too large".into()); }
+
+    let reader = || image::ImageReader::new(std::io::Cursor::new(&data)).with_guessed_format().map_err(|_| "malformed image".to_string());
+    let (w, h) = reader()?.into_dimensions().map_err(|_| "malformed image".to_string())?;
+    if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_SOURCE_PIXELS { return Err("image dimensions too large".into()); }
+    let mut dec = reader()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    dec.limits(limits);
+    let img = dec.decode().map_err(|_| "malformed image".to_string())?;
+    let (tw, th) = target_size(img.width(), img.height(), max_edge);
+    let rgba = if (tw, th) != (img.width(), img.height()) {
+        image::imageops::resize(&img.to_rgba8(), tw, th, image::imageops::FilterType::Triangle)
+    } else {
+        img.to_rgba8()
     };
-
-    let mut buf = vec![0u8; CHUNK];
-    let mut total = 0u64;
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return fail(&loader, "cannot read image"),
-        };
-        total += n as u64;
-        if total > crate::art_cache::MAX_ART_BYTES { return fail(&loader, "image file too large"); }
-        let wrote = loader.write(&buf[..n]);
-        if rejected.get() { return fail(&loader, "image dimensions too large"); }
-        if wrote.is_err() { return fail(&loader, "malformed image"); }
-    }
-    if loader.close().is_err() { return Err("malformed image".into()); }
-    if rejected.get() { return Err("image dimensions too large".into()); }
-    let mut pb = loader.pixbuf().ok_or_else(|| "no image decoded".to_string())?;
-    if pb.width() > max_edge || pb.height() > max_edge {
-        let (tw, th) = target_size(pb.width(), pb.height(), max_edge);
-        pb = pb.scale_simple(tw, th, InterpType::Bilinear).ok_or_else(|| "cannot scale image".to_string())?;
-    }
-
-    let (w, h, alpha, channels) = (pb.width(), pb.height(), pb.has_alpha(), pb.n_channels());
-    if pb.colorspace() != Colorspace::Rgb || pb.bits_per_sample() != 8 || channels != if alpha { 4 } else { 3 } {
-        return Err("unsupported pixel format".into());
-    }
-    if w <= 0 || h <= 0 || w > max_edge || h > max_edge { return Err("invalid image size".into()); }
-    let rowstride = usize::try_from(pb.rowstride()).map_err(|_| "invalid rowstride".to_string())?;
-    let (uw, uh, ch) = (w as usize, h as usize, channels as usize);
-    let total_bytes = rowstride.checked_mul(uh).filter(|&t| t <= MAX_PIXEL_BYTES).ok_or_else(|| "image too large".to_string())?;
-    let min_bytes = (uh - 1) * rowstride + uw * ch;
-    if rowstride < uw * ch || total_bytes < min_bytes { return Err("invalid rowstride".into()); }
-    let bytes = pb.read_pixel_bytes();
-    if bytes.len() < min_bytes { return Err("short pixel buffer".into()); }
-    Ok(DecodedImage { width: w, height: h, rowstride, alpha, bytes })
-}
-
-/// Wraps already validated pixels; cheap and safe on the GTK thread.
-pub fn texture(image: DecodedImage) -> gdk::MemoryTexture {
-    let format = if image.alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
-    gdk::MemoryTexture::new(image.width, image.height, format, &image.bytes, image.rowstride)
+    Ok(DecodedImage { width: tw, height: th, rgba: rgba.into_raw() })
 }
 
 /// A real 1x1 RGBA PNG for tests.
@@ -156,8 +112,8 @@ mod tests {
         let p = d.join("a.png");
         std::fs::write(&p, TINY_PNG).unwrap();
         let img = load_file(&p, 384).unwrap();
-        assert_eq!((img.width, img.height, img.alpha), (1, 1, true));
-        assert!(img.rowstride >= 4 && img.bytes.len() >= 4);
+        assert_eq!((img.width, img.height), (1, 1));
+        assert_eq!(img.rgba.len(), 4);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -165,12 +121,11 @@ mod tests {
     fn large_picture_is_scaled_to_the_edge_limit() {
         let d = dir("scale");
         let p = d.join("big.png");
-        let pb = gtk4::gdk_pixbuf::Pixbuf::new(Colorspace::Rgb, false, 8, 600, 300).unwrap();
-        pb.fill(0xff0000ff);
-        pb.savev(&p, "png", &[]).unwrap();
+        image::RgbImage::from_pixel(600, 300, image::Rgb([255, 0, 0])).save(&p).unwrap();
         let img = load_file(&p, 384).unwrap();
-        assert_eq!((img.width, img.height, img.alpha), (384, 192, false));
-        assert!(img.rowstride >= 384 * 3);
+        assert_eq!((img.width, img.height), (384, 192));
+        assert_eq!(img.rgba.len(), 384 * 192 * 4);
+        assert_eq!(&img.rgba[..4], &[255, 0, 0, 255]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -212,10 +167,8 @@ mod tests {
     fn oversized_dimensions_are_rejected() {
         let d = dir("dims");
         let p = d.join("huge.png");
-        // A genuine PNG just over the pixel budget (4100 x 4100 > 16,777,216), encoded by gdk-pixbuf.
-        let pb = gtk4::gdk_pixbuf::Pixbuf::new(Colorspace::Rgb, false, 8, 4100, 4100).unwrap();
-        pb.fill(0);
-        std::fs::write(&p, pb.save_to_bufferv("png", &[]).unwrap()).unwrap();
+        // A genuine PNG just over the pixel budget (4100 x 4100 > 16,777,216), encoded by the image crate.
+        image::GrayImage::new(4100, 4100).save(&p).unwrap();
         assert!(std::fs::metadata(&p).unwrap().len() < crate::art_cache::MAX_ART_BYTES);
         assert_eq!(load_file(&p, 384).unwrap_err(), "image dimensions too large");
         let _ = std::fs::remove_dir_all(&d);

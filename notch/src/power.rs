@@ -72,6 +72,45 @@ fn secs(x: f64) -> Option<u64> {
 /// Typed readings for every present internal battery plus the external-power state.
 pub fn snapshot() -> PowerSnapshot { snapshot_at(Path::new(ROOT)) }
 
+/// Power-profiles-daemon modes (`powerprofilesctl`): the profiles this machine offers and the active one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profiles { pub available: Vec<String>, pub active: String }
+
+/// Profile names from `powerprofilesctl list`: top-level `name:` lines, the active one prefixed by `* `.
+pub fn parse_profiles(list: &str, get: &str) -> Option<Profiles> {
+    let available: Vec<String> = list.lines()
+        .filter_map(|l| l.strip_prefix("* ").or_else(|| l.strip_prefix("  ").filter(|r| !r.starts_with(char::is_whitespace)))?.strip_suffix(':'))
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .map(str::to_string).collect();
+    let active = get.trim().to_string();
+    (!available.is_empty() && available.contains(&active)).then_some(Profiles { available, active })
+}
+
+fn ppctl(args: &[&str]) -> Result<String, String> {
+    let o = std::process::Command::new("powerprofilesctl").args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
+    if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).into_owned()) }
+    else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) }
+}
+
+/// Offered and active power profiles; `None` when power-profiles-daemon is unavailable.
+pub fn profiles() -> Option<Profiles> { parse_profiles(&ppctl(&["list"]).ok()?, &ppctl(&["get"]).ok()?) }
+
+/// Switch to one of the offered profiles.
+pub fn set_profile(name: &str) -> Result<(), String> {
+    let known = profiles().is_some_and(|p| p.available.iter().any(|a| a == name));
+    if !known { return Err(format!("Power mode \"{name}\" is not available")); }
+    ppctl(&["set", name]).map(drop).map_err(|e| if e.is_empty() { "Power mode change failed".into() } else { format!("Power mode change failed: {e}") })
+}
+
+pub fn profile_label(name: &str) -> String {
+    match name { "performance" => "Performance".into(), "balanced" => "Balanced".into(), "power-saver" => "Power saver".into(), o => o.to_string() }
+}
+
+/// An available supply with at least one battery that is really charging (drives the charging glow).
+pub fn actively_charging(p: &PowerSnapshot) -> bool {
+    p.available && p.batteries.iter().any(|b| b.state == BatteryState::Charging)
+}
+
 fn snapshot_at(root: &Path) -> PowerSnapshot {
     let unavailable = PowerSnapshot { available: false, ac_online: None, batteries: vec![], percentage: None };
     let Ok(rd) = std::fs::read_dir(root) else { return unavailable };
@@ -184,6 +223,29 @@ fn battery_at(d: &Path) -> Option<BatterySnapshot> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn with_states(states: &[BatteryState], available: bool, ac: Option<bool>) -> PowerSnapshot {
+        PowerSnapshot {
+            available, ac_online: ac, percentage: None,
+            batteries: states.iter().map(|s| BatterySnapshot {
+                name: "BAT".into(), state: *s, percentage: None, power_w: None, energy_now_wh: None, energy_full_wh: None,
+                energy_design_wh: None, health_pct: None, voltage_v: None, cycles: None, technology: None,
+                manufacturer: None, model: None, time_to_empty_secs: None, time_to_full_secs: None,
+            }).collect(),
+        }
+    }
+
+    #[test]
+    fn only_an_available_charging_battery_is_active_charging() {
+        use BatteryState::*;
+        assert!(!actively_charging(&with_states(&[Discharging], true, Some(false))));
+        assert!(actively_charging(&with_states(&[Charging], true, Some(true))));
+        assert!(!actively_charging(&with_states(&[Full], true, Some(true))));
+        assert!(!actively_charging(&with_states(&[NotCharging, Unknown], true, Some(true))));
+        assert!(!actively_charging(&with_states(&[], true, Some(true))));
+        assert!(!actively_charging(&with_states(&[Charging], false, None)));
+    }
+
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn empty_root() -> std::path::PathBuf {
@@ -381,5 +443,15 @@ mod tests {
         assert_eq!(s.time_to_empty_secs, None);
         let s = snap(&[("energy_now", "1e308"), ("energy_full", "1"), ("energy_full_design", "1e-308")]).unwrap();
         assert!(s.health_pct.is_none_or(|h| h.is_finite()));
+    }
+
+    #[test]
+    fn profiles_parse_from_powerprofilesctl_output() {
+        let list = "* performance:\n    CpuDriver:\tintel_pstate\n\n  balanced:\n    CpuDriver:\tintel_pstate\n\n  power-saver:\n    Degraded:   no\n";
+        let p = parse_profiles(list, "performance\n").unwrap();
+        assert_eq!(p.available, ["performance", "balanced", "power-saver"]);
+        assert_eq!(p.active, "performance");
+        assert!(parse_profiles(list, "unknown").is_none());
+        assert!(parse_profiles("", "balanced").is_none());
     }
 }

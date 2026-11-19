@@ -92,23 +92,42 @@ class Base(unittest.TestCase):
     def cli(self, script, *args):
         return subprocess.run([sys.executable, script, *args], env=self.env(), capture_output=True, text=True)
 
+    def stage(self, env=None):
+        """Run `widget-adapters.py stage DIR`; (CompletedProcess, entries or None when it failed)."""
+        self._stages = getattr(self, "_stages", 0) + 1
+        r = subprocess.run([sys.executable, ADAPTERS, "stage", os.path.join(self.tmp, "stage-%d" % self._stages)],
+                           env=env or self.env(), capture_output=True, text=True)
+        return r, (json.loads(r.stdout) if r.returncode == 0 else None)
+
+    def refused_stage(self, why):
+        """Trust and record failures must be errors, not silently skipped adapters."""
+        r, entries = self.stage()
+        self.assertNotEqual(r.returncode, 0, (why, r.stdout))
+        self.assertIsNone(entries)
+        return r
+
+    def publish(self, paths, entries, env=None):
+        """What the installer does: begin, prepare every file, publish every file, finish."""
+        run = lambda *a: subprocess.run([sys.executable, STATEPY, *a], env=env or self.env(), capture_output=True, text=True)
+        for step in (("begin", *paths),
+                     *(("prepare", e["path"], e["source"], e["mode"]) for e in entries),
+                     *(("publish", e["path"]) for e in entries), ("finish",)):
+            r = run(*step)
+            self.assertEqual(r.returncode, 0, (step, r.stderr))
+
+    def full_install(self):
+        r, entries = self.stage()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        paths = [e["path"] for e in entries]
+        self.publish(paths, entries)
+        return paths
+
     def write_plan(self):
         plan = self.m.planned_whatsapp_adapter(self.cfg)
         for p, c in plan.items():
             with open(p, "w") as f:
                 f.write(c)
         return plan
-
-    def full_install(self):
-        paths = self.cli(ADAPTERS, "paths").stdout.split()
-        for step in (("begin", *paths), ("finish",)):
-            if step[0] == "begin":
-                self.assertEqual(self.cli(STATEPY, *step).returncode, 0)
-                r = self.cli(ADAPTERS, "apply")
-                self.assertEqual(r.returncode, 0, r.stderr)
-            else:
-                self.assertEqual(self.cli(STATEPY, *step).returncode, 0)
-        return paths
 
 
 class PatcherTests(Base):
@@ -136,17 +155,38 @@ class PatcherTests(Base):
 
     def test_absent_whatsapp_changes_nothing(self):
         self.assertEqual(self.m.planned_whatsapp_adapter(self.cfg), {})
-        env = self.env()
-        for cmd in ("paths", "apply"):
-            r = subprocess.run([sys.executable, ADAPTERS, cmd], env=env, capture_output=True, text=True)
-            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        r, entries = self.stage()
+        self.assertEqual((r.returncode, entries, r.stderr), (0, [], ""))
         self.assertFalse(os.path.exists(os.path.join(self.cfg, "omarchy")))
+
+    def test_disabled_whatsapp_stages_nothing(self):
+        self.install_panel()
+        with open(os.path.join(self.cfg, "omarchy", "shell.json"), "w") as f:
+            json.dump({"disabledPlugins": ["io.github.ricky.whatsapp"]}, f)
+        r, entries = self.stage()
+        self.assertEqual((r.returncode, entries, r.stderr), (0, [], ""))
+        self.assertEqual(self.read(self.panel), STOCK)
+        self.assertFalse(os.path.exists(self.anchor))
+
+    def test_staging_is_private_and_never_publishes_destinations(self):
+        self.install_panel()
+        r, entries = self.stage()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.read(self.panel), STOCK)
+        self.assertFalse(os.path.exists(self.anchor))
+        expected = self.m.planned_whatsapp_adapter(self.cfg)
+        self.assertEqual({e["path"] for e in entries}, set(expected))
+        for e in entries:
+            self.assertEqual(os.stat(os.path.dirname(e["source"])).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(e["source"]).st_mode & 0o777, 0o600)
+            self.assertEqual(self.read(e["source"]), expected[e["path"]])
 
     def refused(self, panel_text, why):
         self.install_panel(panel_text)
         before = self.read(self.panel)
-        r = self.cli(ADAPTERS, "apply")
-        self.assertNotEqual(r.returncode, 0, why)
+        r, entries = self.stage()
+        self.assertEqual((r.returncode, entries), (0, []), (why, r.stderr))
+        self.assertIn("not embedded in the notch", r.stderr)
         self.assertEqual(self.read(self.panel), before, why)
         self.assertFalse(os.path.exists(self.anchor), why)
         return r
@@ -181,12 +221,12 @@ class PatcherTests(Base):
         real = os.path.join(self.tmp, "real.qml")
         os.rename(self.panel, real)
         os.symlink(real, self.panel)
-        self.assertNotEqual(self.cli(ADAPTERS, "apply").returncode, 0)
+        self.refused_stage("symlinked panel")
         self.assertTrue(os.path.islink(self.panel))
         os.unlink(self.panel)
         self.install_panel()
         os.symlink(real, self.anchor)
-        self.assertNotEqual(self.cli(ADAPTERS, "apply").returncode, 0)
+        self.refused_stage("symlinked adapter")
         self.assertEqual(self.read(self.panel), STOCK)
 
     def test_unrecorded_adapter_files_are_collisions_even_with_the_management_comment(self):
@@ -194,10 +234,8 @@ class PatcherTests(Base):
         for content in ("// somebody else's file\n", "// waybar-pill-bar anchor adapter\nItem {}\n", self.read(os.path.join(ROOT, "files", "qml", "WaybarPillAnchor.qml"))):
             with open(self.anchor, "w") as f:
                 f.write(content)
-            for cmd in ("paths", "apply"):
-                r = self.cli(ADAPTERS, cmd)
-                self.assertNotEqual(r.returncode, 0, content[:20])
-                self.assertIn("not a Pill Bar adapter", r.stderr)
+            r = self.refused_stage(content[:20])
+            self.assertIn("not a Pill Bar adapter", r.stderr)
             self.assertEqual(self.read(self.anchor), content)
             self.assertEqual(self.read(self.panel), STOCK)
 
@@ -205,17 +243,19 @@ class PatcherTests(Base):
 class InstallRecordTests(Base):
     def test_record_restores_the_original_panel_and_removes_the_adapter(self):
         self.install_panel()
-        paths = self.cli(ADAPTERS, "paths").stdout.split()
+        r, entries = self.stage()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        paths = [e["path"] for e in entries]
         self.assertEqual(sorted(paths), sorted([self.panel, self.anchor]))
+        self.assertEqual({e["mode"] for e in entries}, {"644"})
         self.full_install()
         self.assertEqual(oct(os.stat(self.anchor).st_mode & 0o777), "0o644")
         patched = self.read(self.panel)
         self.assertNotEqual(patched, STOCK)
-        # a reinstall through the record is byte-stable
-        self.assertEqual(self.cli(STATEPY, "begin", *paths).returncode, 0)
-        self.assertEqual(self.cli(ADAPTERS, "apply").returncode, 0)
+        # A fresh enable restores the previous baseline before provisioning again.
+        self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
+        self.full_install()
         self.assertEqual(self.read(self.panel), patched)
-        self.assertEqual(self.cli(STATEPY, "finish").returncode, 0)
         self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
         self.assertEqual(self.read(self.panel).encode(), STOCK.encode())
         self.assertFalse(os.path.exists(self.anchor))
@@ -224,11 +264,16 @@ class InstallRecordTests(Base):
         self.install_panel()
         paths = [self.panel, self.anchor]
         # the earlier Pill Bar: begin (backs up the stock Panel), install its three-block Panel + adapter, finish
-        self.assertEqual(self.cli(STATEPY, "begin", *paths).returncode, 0)
-        self.install_panel(previous_version_panel())
-        with open(self.anchor, "w") as f:
-            f.write(OLD_ADAPTER)
-        self.assertEqual(self.cli(STATEPY, "finish").returncode, 0)
+        old = {self.panel: previous_version_panel(), self.anchor: OLD_ADAPTER}
+        entries = []
+        for p, text in old.items():
+            src = os.path.join(self.tmp, "old-" + os.path.basename(p))
+            with open(src, "w") as f:
+                f.write(text)
+            entries.append({"path": p, "source": src, "mode": "644"})
+        self.publish(paths, entries)
+        self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
+        self.assertEqual(self.read(self.panel), STOCK)
         self.full_install()
         self.assertEqual(self.read(self.panel), self.m.patch_panel(STOCK, "p"))
         self.assertEqual(self.read(self.anchor), self.read(os.path.join(ROOT, "files", "qml", "WaybarPillAnchor.qml")))
@@ -236,7 +281,7 @@ class InstallRecordTests(Base):
         self.assertEqual(self.read(self.panel).encode(), STOCK.encode(), "the original, not the placement-only Panel")
         self.assertFalse(os.path.exists(self.anchor))
 
-    def test_edited_recorded_targets_are_refused_by_reinstall_and_by_direct_apply(self):
+    def test_edited_recorded_targets_are_refused_by_reinstall_and_by_stage(self):
         self.install_panel()
         paths = self.full_install()
         for target, edit in ((self.panel, "// edited after install\n"), (self.anchor, "// edited adapter\n")):
@@ -246,17 +291,15 @@ class InstallRecordTests(Base):
             edited = self.read(target)
             r = self.cli(STATEPY, "begin", *paths)
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("modified", r.stderr)
-            r = self.cli(ADAPTERS, "apply")
-            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("previous setup", r.stderr)
+            r = self.refused_stage("edited " + os.path.basename(target))
             self.assertIn("modified", r.stderr)
             self.assertEqual(self.read(target), edited)
             self.assertNotEqual(self.cli(STATEPY, "uninstall").returncode, 0)
             with open(target, "w") as f:
                 f.write(original)  # the user reverts: everything works again
-            self.assertEqual(self.cli(STATEPY, "begin", *paths).returncode, 0)
-            self.assertEqual(self.cli(ADAPTERS, "apply").returncode, 0)
-            self.assertEqual(self.cli(STATEPY, "finish").returncode, 0)
+            self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
+            self.full_install()
 
 
 class PrivateAdapterTests(Base):
@@ -268,15 +311,18 @@ class PrivateAdapterTests(Base):
                 self.install_panel(STOCK + self.SECRET)
                 os.chmod(self.panel, mode)
                 original = self.read(self.panel)
-                paths = self.cli(ADAPTERS, "paths").stdout.split()
-                for _ in range(2):  # apply, then reapply through the record
-                    self.assertEqual(self.cli(STATEPY, "begin", *paths).returncode, 0)
-                    r = self.cli(ADAPTERS, "apply")
+                for _ in range(2):  # install, then reinstall through the record
+                    r, entries = self.stage()
                     self.assertEqual(r.returncode, 0, r.stderr)
-                    self.assertEqual(self.cli(STATEPY, "finish").returncode, 0)
+                    self.assertEqual({e["path"]: e["mode"] for e in entries},
+                                     {self.panel: "%o" % mode, self.anchor: "644"})
+                    self.publish([e["path"] for e in entries], entries)
                     self.assertEqual(os.stat(self.panel).st_mode & 0o7777, mode)
                     self.assertIn(self.SECRET, self.read(self.panel))
                     self.assertEqual(os.stat(self.anchor).st_mode & 0o7777, 0o644)
+                    self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
+                    self.assertEqual(self.read(self.panel), original)
+                    self.assertFalse(os.path.exists(self.anchor))
                 self.assertEqual([n for n in os.listdir(self.plugin) if n.startswith(".pill-adapter-")], [])
                 self.assertEqual(self.cli(STATEPY, "uninstall").returncode, 0)
                 self.assertEqual(self.read(self.panel), original)
@@ -286,7 +332,7 @@ class PrivateAdapterTests(Base):
     def state_path(self):
         return os.path.join(self.home, ".local", "state", "waybar-notch", "plugin-install.json")
 
-    def test_malformed_or_untrusted_records_block_paths_and_apply(self):
+    def test_malformed_or_untrusted_records_block_staging(self):
         self.install_panel()
         os.chmod(self.panel, 0o600)
         sentinel = os.path.join(self.tmp, "sentinel")
@@ -307,30 +353,27 @@ class PrivateAdapterTests(Base):
             with self.subTest(why):
                 with open(self.state_path(), "w") as f:
                     f.write(rec if isinstance(rec, str) else json.dumps(rec))
-                for cmd in ("paths", "apply"):
-                    r = self.cli(ADAPTERS, cmd)
-                    self.assertNotEqual(r.returncode, 0, (why, cmd))
-                    self.assertNotIn(sentinel, r.stdout)
+                self.refused_stage(why)
                 self.assertEqual(self.read(self.panel), STOCK)
                 self.assertEqual(os.stat(self.panel).st_mode & 0o777, 0o600)
                 self.assertFalse(os.path.exists(self.anchor))
         os.unlink(self.state_path())
         os.symlink(sentinel, self.state_path())
-        for cmd in ("paths", "apply"):
-            self.assertNotEqual(self.cli(ADAPTERS, cmd).returncode, 0)
+        self.refused_stage("symlinked record")
         self.assertEqual(self.read(self.panel), STOCK)
 
     def test_unsafe_plugin_directory_and_foreign_config_roots_are_refused(self):
         self.install_panel()
         os.chmod(self.plugin, 0o775)
-        for cmd in ("paths", "apply"):
-            self.assertNotEqual(self.cli(ADAPTERS, cmd).returncode, 0)
+        self.refused_stage("unsafe plugin directory")
         self.assertEqual(self.read(self.panel), STOCK)
         self.assertFalse(os.path.exists(self.anchor))
         os.chmod(self.plugin, 0o755)
         with self.assertRaises(self.m.AdapterError):
             self.m.planned_whatsapp_adapter(os.path.join(self.tmp, "other-config"))
-        self.assertEqual(self.cli(ADAPTERS, "apply").returncode, 0)
+        r, entries = self.stage()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(entries), 2)
 
     def test_custom_xdg_config_root_works_with_a_trusted_ancestry(self):
         cfg = os.path.join(self.tmp, "xdg-config")
@@ -339,13 +382,13 @@ class PrivateAdapterTests(Base):
         with open(os.path.join(plugin, "Panel.qml"), "w") as f:
             f.write(STOCK)
         env = dict(self.env(), XDG_CONFIG_HOME=cfg)
-        run = lambda script, *a: subprocess.run([sys.executable, script, *a], env=env, capture_output=True, text=True)
-        paths = run(ADAPTERS, "paths").stdout.split()
+        r, entries = self.stage(env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        paths = [e["path"] for e in entries]
         self.assertEqual(sorted(paths), sorted([os.path.join(plugin, "Panel.qml"), os.path.join(plugin, "WaybarPillAnchor.qml")]))
-        self.assertEqual(run(STATEPY, "begin", *paths).returncode, 0)
-        self.assertEqual(run(ADAPTERS, "apply").returncode, 0)
-        self.assertEqual(run(STATEPY, "finish").returncode, 0)
-        self.assertEqual(run(STATEPY, "uninstall").returncode, 0)
+        self.publish(paths, entries, env=env)
+        r = subprocess.run([sys.executable, STATEPY, "uninstall"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
         with open(os.path.join(plugin, "Panel.qml")) as f:
             self.assertEqual(f.read(), STOCK)
 
@@ -718,6 +761,15 @@ class HostTests(Base):
         self.toggle()
         self.assertEqual(self.srv.wait("close")["home"], False)
         self.hide_page()
+
+    def test_ping_answers_ok_on_the_selected_output_without_opening_anything(self):
+        r = self.ipc(self.target, "ping")
+        self.assertEqual(r.stdout.strip(), "ok", r.stdout + r.stderr)
+        s = self.state()
+        self.assertFalse(s["active"] or s["surfaceVisible"], "ping must not start a session")
+        other = subprocess.run(["qs", "-p", self.cfgdir, "ipc", "call", "waybar-pill-whatsapp-NOPE-9", "ping"],
+                               env=self.qenv, capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(other.stdout.strip(), "ok")
 
 
 if __name__ == "__main__":

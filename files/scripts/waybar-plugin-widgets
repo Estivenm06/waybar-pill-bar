@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Bridge between Waybar and the Omarchy desktop plugins hosted by the (parked) native bar.
 
-Usage: waybar-plugin-widgets open power | open whatsapp | whatsapp-status
+Usage: waybar-plugin-widgets open power | open whatsapp --output NAME | whatsapp-status
 
 `open` summons the plugin's existing panel through the running shell; it never enables, installs or restarts anything.
-`open whatsapp` instead asks the clicked output's WhatsApp content to toggle inside the central notch (the adapter Pill
+`open whatsapp --output NAME` instead asks that output's WhatsApp content to toggle inside the central notch (the adapter Pill
 Bar installs next to the WhatsApp panel). Both require an active Pill Bar session.
 `whatsapp-status` is a long-running Waybar `return-type: json` stream: the WhatsApp daemon's unread badge and link state.
 Chat and message contents are never read out of the frames, printed or logged."""
 import json
-import math
 import os
 import select
 import socket
@@ -22,7 +21,8 @@ WHATSAPP = WIDGETS["whatsapp"]
 GLYPH = "\uf232"
 MAX_LINE = 512 * 1024
 RECONNECT = 2.0
-HYPR_TIMEOUT = 2
+PING_WAIT = 5.0
+PING_INTERVAL = 0.25
 
 
 def fail(msg):
@@ -47,136 +47,63 @@ def pill_bar_guard():
     return None if active else "Pill Bar is not active"
 
 
-class AnchorError(Exception):
-    pass
+def valid_output(name):
+    return isinstance(name, str) and bool(name.strip()) and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name)
 
 
-def hypr_json(sig, what):
-    try:
-        r = subprocess.run(["hyprctl", "-i", sig, "-j", what], capture_output=True, text=True, timeout=HYPR_TIMEOUT)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise AnchorError("hyprctl %s failed: %s" % (what, e))
-    if r.returncode != 0:
-        raise AnchorError("hyprctl %s failed: %s" % (what, r.stderr.strip() or "exit %d" % r.returncode))
-    try:
-        return json.loads(r.stdout)
-    except ValueError as e:
-        raise AnchorError("hyprctl %s returned bad JSON: %s" % (what, e))
+def shell_call(args, timeout=10):
+    return subprocess.run(["omarchy-shell", *args], capture_output=True, text=True, timeout=timeout)
 
 
-def hypr_signature():
-    """$HYPRLAND_INSTANCE_SIGNATURE, else the newest instance directory whose compositor answers."""
-    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-    if sig:
-        return sig
-    base = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr")
-    try:
-        ents = sorted(os.scandir(base), key=lambda e: e.stat().st_mtime, reverse=True)
-    except OSError as e:
-        raise AnchorError("no Hyprland instance found: %s" % e)
-    for e in ents:
+def wait_for_endpoint(target):
+    """True once the selected output's adapter endpoint answers ping with exactly ok (bounded by PING_WAIT)."""
+    end = time.monotonic() + PING_WAIT
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
         try:
-            hypr_json(e.name, "cursorpos")
-            return e.name
-        except AnchorError:
-            continue
-    raise AnchorError("no live Hyprland instance answers")
+            r = shell_call([target, "ping"], timeout=remaining)
+            if r.returncode == 0 and r.stdout.strip() == "ok":
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(PING_INTERVAL, remaining))
 
 
-def query_compositor():
-    sig = hypr_signature()
-    return hypr_json(sig, "cursorpos"), hypr_json(sig, "monitors"), hypr_json(sig, "layers")
-
-
-def _num(v):
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
-
-
-def logical_size(mon):
-    w, h, scale = _num(mon.get("width")), _num(mon.get("height")), _num(mon.get("scale"))
-    if w is None or h is None or w <= 0 or h <= 0:
-        return None
-    if scale is None or scale <= 0:
-        scale = 1.0
-    lw, lh = w / scale, h / scale
-    if (_num(mon.get("transform")) or 0) % 2 != 0:
-        lw, lh = lh, lw
-    return lw, lh
-
-
-def layer_rects(layers, output):
-    levels = ((layers or {}).get(output) or {}).get("levels") or {}
-    groups = levels.values() if isinstance(levels, dict) else levels
-    for group in groups:
-        for layer in group or []:
-            if isinstance(layer, dict) and layer.get("namespace") == "waybar":
-                yield layer
-
-
-def whatsapp_output(cursor, monitors, layers):
-    """Name of the output whose top Waybar was clicked.
-    Hyprland reports the cursor and layer rectangles in global logical coordinates; monitor sizes are physical."""
+def open_whatsapp_notch(output):
+    """Toggle WhatsApp inside the notch of the explicit output; never falls back to a native summon or a browser."""
+    if not valid_output(output):
+        return fail("cannot open WhatsApp in the notch: a notch output name is required (--output NAME)")
+    target = "waybar-pill-whatsapp-" + output
+    if not wait_for_endpoint(target):
+        return fail("WhatsApp did not open in the notch on %s: its Pill Bar adapter endpoint is not answering (is the "
+                    "WhatsApp plugin enabled, and the Pill Bar session active?)" % output)
     try:
-        cx, cy = _num(cursor["x"]), _num(cursor["y"])
-    except (KeyError, TypeError):
-        cx = cy = None
-    if cx is None or cy is None:
-        raise AnchorError("the cursor position is unavailable")
-    if not isinstance(monitors, list):
-        raise AnchorError("the monitor list is unavailable")
-    for mon in monitors:
-        if not isinstance(mon, dict) or mon.get("disabled") is True or not isinstance(mon.get("name"), str):
-            continue
-        size, mx, my = logical_size(mon), _num(mon.get("x")), _num(mon.get("y"))
-        if size is None or mx is None or my is None:
-            continue
-        lx, ly = cx - mx, cy - my
-        if not (0 <= lx < size[0] and 0 <= ly < size[1]):
-            continue
-        name = mon["name"]
-        hits = []
-        for layer in layer_rects(layers, name):
-            x, y, w, h = (_num(layer.get(k)) for k in ("x", "y", "w", "h"))
-            if None in (x, y, w, h) or w <= 0 or h <= 0:
-                continue
-            x, y = x - mx, y - my
-            if w > h and y >= 0 and y + h <= size[1] / 2 and x <= lx < x + w and y <= ly < y + h:
-                hits.append(layer)
-        if len(hits) != 1:
-            raise AnchorError("the click on %s is not on a single top Waybar bar (%d matches)" % (name, len(hits)))
-        return name
-    raise AnchorError("the cursor is not on an enabled output")
-
-
-def open_whatsapp_notch():
-    try:
-        name = whatsapp_output(*query_compositor())
-    except AnchorError as e:
-        return fail("cannot open WhatsApp in the notch: %s" % e)
-    try:
-        r = subprocess.run(["omarchy-shell", "waybar-pill-whatsapp-" + name, "toggleNotch"],
-                           capture_output=True, text=True, timeout=10)
+        r = shell_call([target, "toggleNotch"])
     except (OSError, subprocess.SubprocessError) as e:
         return fail("cannot run omarchy-shell: %s" % e)
     if r.returncode != 0 or r.stdout.strip() != "ok":
         detail = r.stderr.strip() or r.stdout.strip() or "exit %d" % r.returncode
-        return fail("WhatsApp did not open in the notch on %s (the Pill Bar WhatsApp adapter may not be loaded: reinstall "
-                    "Pill Bar and run 'omarchy restart shell'): %s" % (name, detail))
+        return fail("WhatsApp did not open in the notch on %s: %s" % (output, detail))
     return 0
 
 
-def cmd_open(which):
+def cmd_open(which, output=None):
     plugin = WIDGETS.get(which)
-    if plugin is None:
+    if plugin is None or (output is not None and which != "whatsapp"):
         print(__doc__, file=sys.stderr)
         return 2
     why = pill_bar_guard()
     if why:
         return fail(why)
     if which == "whatsapp":
-        return open_whatsapp_notch()
+        return open_whatsapp_notch(output)
     try:
-        r = subprocess.run(["omarchy-shell", "shell", "summon", plugin, "{}"], capture_output=True, text=True, timeout=10)
+        r = shell_call(["shell", "summon", plugin, "{}"])
     except (OSError, subprocess.SubprocessError) as e:
         return fail("cannot run omarchy-shell: %s" % e)
     if r.returncode != 0 or r.stdout.strip() != "ok":
@@ -357,6 +284,8 @@ def cmd_status(out=None, once=False):
 def main(argv):
     if len(argv) == 2 and argv[0] == "open":
         return cmd_open(argv[1])
+    if len(argv) == 4 and argv[:2] == ["open", "whatsapp"] and argv[2] == "--output":
+        return cmd_open("whatsapp", argv[3])
     if argv == ["whatsapp-status"]:
         return cmd_status()
     print(__doc__, file=sys.stderr)

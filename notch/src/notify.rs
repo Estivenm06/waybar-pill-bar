@@ -1,30 +1,35 @@
-//! Notification cards (notch-style black pills) for notifications forwarded by the Omarchy shell's relay.
-//! Cards hang below the right-hand Waybar pill. Do-Not-Disturb is shared with the Omarchy state file so the Controls
-//! tile and Waybar keep working.
+//! Notification cards (notch-style glass pills) for notifications forwarded by the Omarchy shell's relay.
+//! Cards hang below the right-hand pill. Do-Not-Disturb is shared with the Omarchy state file so the Controls
+//! tile keeps working.
 //!
 //! Everything a notification sender controls is bounded here: at most five active cards, at most five retiring
-//! widgets/timers, a bounded GTK-side event consumer, and file icons decoded by one worker thread (never on the GTK
-//! thread) through capacity-five channels.
-use gtk::{gdk, glib, prelude::*};
+//! cards, relay events handled one at a time (the shell never has more than 32 unacknowledged), and file icons
+//! decoded by one worker thread (never on the UI thread) through capacity-five queues.
+//!
+//! Data flow: relay reader thread -> `start()` pump -> `Poster` -> `handle_event` on the UI thread -> `Notes`
+//! (the `State` slice) -> `CardsView` (the layer surface that draws the slice).
 use crate::image_loader::{self, DecodedImage};
-use crate::notification_relay::{Command, Event};
-use gtk4 as gtk;
-use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use std::cell::{Cell, RefCell};
+use crate::layout::{Rect, rect, smooth};
+use crate::notification_relay::{self, Command, Event};
+use crate::render::{Canvas, HAlign, Image, TextStyle, TextSys, VAlign, r_all, with_a};
+use crate::state::State;
+use crate::ui::{Hits, Palette, glass};
+use crate::wayland::{Button, Cmd, Ctx, Cursor, DrawCtx, Event as UiEvent, KbMode, PanelSpec, Poster, View};
+use smithay_client_toolkit::shell::wlr_layer::{Anchor, Layer};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const MAX_CARDS: usize = 5;
 const MAX_RETIRING: usize = 5;
 const DEFAULT_MS: u64 = 6000;
-const SLIDE_MS: u32 = 240;
+/// Slide-in / slide-out duration of a card.
+const SLIDE_S: f32 = 0.24;
 /// File icons are shown at 36 logical pixels; 72 covers a 2x scale.
 const ICON_EDGE: i32 = 72;
 const ICON_QUEUE: usize = 5;
-/// Events (or icon completions) the GTK thread handles before yielding to its main loop.
-pub const EVENT_BATCH: usize = 16;
 
 pub const REASON_EXPIRED: u32 = 1;
 pub const REASON_DISMISSED: u32 = 2;
@@ -58,27 +63,9 @@ pub fn set_dnd(on: bool) {
     let _ = std::fs::write(&p, format!("{{\n  \"version\": 3,\n  \"dnd\": {on}\n}}\n"));
 }
 
-// ------------------------------------------------------------------ bounded consumption
-
-/// Handles items from `rx` on the GLib main loop: at most [`EVENT_BATCH`] per turn, then a one-millisecond timeout
-/// future so timers, drawing and input run between batches of a flood. Below the batch size it sleeps on the channel.
-/// `handle` returns `false` to stop consuming.
-pub async fn consume<T>(rx: async_channel::Receiver<T>, mut handle: impl FnMut(T) -> bool) {
-    while let Ok(first) = rx.recv().await {
-        if !handle(first) { return; }
-        let mut taken = 1;
-        while taken < EVENT_BATCH {
-            let Ok(item) = rx.try_recv() else { break };
-            if !handle(item) { return; }
-            taken += 1;
-        }
-        if taken == EVENT_BATCH { glib::timeout_future(Duration::from_millis(1)).await; }
-    }
-}
-
 /// The one ordered handling path of a relay event: Do-Not-Disturb rejection, card creation or closure, then exactly
 /// one acknowledgement so the shell may send another event.
-pub fn dispatch(ev: Event, dnd: impl FnOnce() -> bool, relay: &std::sync::mpsc::Sender<Command>, show: impl FnOnce(Note), close: impl FnOnce(u32)) {
+pub fn dispatch(ev: Event, dnd: impl FnOnce() -> bool, relay: &mpsc::Sender<Command>, show: impl FnOnce(Note), close: impl FnOnce(u32)) {
     let seq = match ev {
         Event::Notify { seq, note } => {
             if note.urgency < 2 && dnd() {
@@ -135,70 +122,69 @@ pub struct IconDone {
     pub image: Result<DecodedImage, String>,
 }
 
+struct JobQueue {
+    jobs: VecDeque<IconJob>,
+    closed: bool,
+}
+
 /// One decoder thread for every notification icon. Requests wait in a queue of five; when it is full the oldest
 /// not-yet-started job is discarded for the newest. Completions are returned through a second queue of five.
 pub struct IconWorker {
-    jobs: async_channel::Sender<IconJob>,
-    oldest: async_channel::Receiver<IconJob>,
+    queue: Arc<(Mutex<JobQueue>, Condvar)>,
 }
 
 impl IconWorker {
-    pub fn start(load: impl Fn(&Path) -> Result<DecodedImage, String> + Send + 'static) -> (IconWorker, async_channel::Receiver<IconDone>) {
-        let (jobs, rx) = async_channel::bounded::<IconJob>(ICON_QUEUE);
-        let (done_tx, done_rx) = async_channel::bounded::<IconDone>(ICON_QUEUE);
-        let oldest = rx.clone();
+    pub fn start(load: impl Fn(&Path) -> Result<DecodedImage, String> + Send + 'static) -> (IconWorker, mpsc::Receiver<IconDone>) {
+        let queue = Arc::new((Mutex::new(JobQueue { jobs: VecDeque::new(), closed: false }), Condvar::new()));
+        let (done_tx, done_rx) = mpsc::sync_channel::<IconDone>(ICON_QUEUE);
+        let q = queue.clone();
         let _ = std::thread::Builder::new().name("notify-icons".into()).spawn(move || {
-            while let Ok(job) = rx.recv_blocking() {
+            loop {
+                let job = {
+                    let (lock, cv) = &*q;
+                    let mut g = lock.lock().unwrap();
+                    loop {
+                        if let Some(j) = g.jobs.pop_front() { break j; }
+                        if g.closed { return; }
+                        g = cv.wait(g).unwrap();
+                    }
+                };
                 let image = load(&job.path);
-                if done_tx.send_blocking(IconDone { id: job.id, generation: job.generation, image }).is_err() { return; }
+                if done_tx.send(IconDone { id: job.id, generation: job.generation, image }).is_err() { return; }
             }
         });
-        (IconWorker { jobs, oldest }, done_rx)
+        (IconWorker { queue }, done_rx)
     }
 
-    pub fn submit(&self, mut job: IconJob) {
-        loop {
-            match self.jobs.try_send(job) {
-                Ok(()) | Err(async_channel::TrySendError::Closed(_)) => return,
-                Err(async_channel::TrySendError::Full(j)) => {
-                    job = j;
-                    let _ = self.oldest.try_recv(); // drop the oldest job that has not started
-                }
-            }
-        }
+    pub fn submit(&self, job: IconJob) {
+        let (lock, cv) = &*self.queue;
+        let mut g = lock.lock().unwrap();
+        while g.jobs.len() >= ICON_QUEUE { g.jobs.pop_front(); } // drop the oldest job that has not started
+        g.jobs.push_back(job);
+        cv.notify_one();
     }
 }
 
-// ------------------------------------------------------------------ UI
-struct Card {
-    id: u32,
-    rev: gtk::Revealer,
-    icon: gtk::Image,
-    timer: RefCell<Option<glib::SourceId>>,
+impl Drop for IconWorker {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.queue;
+        lock.lock().unwrap().closed = true;
+        cv.notify_all();
+    }
 }
 
-/// A widget sliding out; its removal timer is cancelled if the queue overflows.
-struct Retiring {
-    token: u64,
-    rev: gtk::Revealer,
-    timer: glib::SourceId,
+/// Worker-side icon decode: absolute paths are sender-supplied files (hardened loader); anything else is a themed
+/// icon name resolved through the icon theme.
+fn load_icon(p: &Path) -> Result<DecodedImage, String> {
+    if p.is_absolute() { return image_loader::load_file(p, ICON_EDGE); }
+    let name = p.to_str().ok_or("invalid icon name")?;
+    let found = crate::icon_theme::find(name, 36).ok_or("icon not found")?;
+    image_loader::load_file(&found, ICON_EDGE)
 }
 
-pub struct NotifyUi {
-    win: gtk::ApplicationWindow,
-    col: gtk::Box,
-    cards: RefCell<Vec<Rc<Card>>>,
-    retiring: RefCell<VecDeque<Retiring>>,
-    retire_token: Cell<u64>,
-    gens: RefCell<IconGenerations>,
-    icons: IconWorker,
-    hidden: Cell<bool>,
-    animations: Cell<bool>,
-    mon: RefCell<String>,
-    relay: std::sync::mpsc::Sender<Command>,
-}
+// ------------------------------------------------------------------ text hygiene
 
-fn strip_markup(s: &str) -> String {
+pub fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
     for c in s.chars() {
@@ -212,293 +198,402 @@ fn strip_markup(s: &str) -> String {
     out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
 }
 
-/// Cards show at most a few lines; laying out thousands of characters (one unbreakable word is enough) makes
-/// GTK ask the GPU for a surface far beyond its limits and crashes the whole process. Clip before layout.
+/// Cards show at most a few lines; laying out thousands of characters (one unbreakable word is enough) is wasted
+/// work and can exhaust memory in the shaper. Clip before layout.
 const CARD_APP_CHARS: usize = 64;
 const CARD_SUMMARY_CHARS: usize = 160;
 const CARD_BODY_CHARS: usize = 400;
 
-fn clip_chars(s: &str, max: usize) -> String {
+pub fn clip_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((end, _)) => s[..end].to_string(),
         None => s.to_string(),
     }
 }
 
-impl NotifyUi {
-    pub fn new(app: &gtk::Application, relay: std::sync::mpsc::Sender<Command>) -> Rc<Self> {
-        let win = gtk::ApplicationWindow::new(app);
-        win.init_layer_shell();
-        win.set_layer(Layer::Overlay);
-        win.set_namespace(Some("waybar-notifications"));
-        win.set_anchor(Edge::Top, true);
-        win.set_anchor(Edge::Right, true);
-        win.set_margin(Edge::Top, 34); // Waybar bar height 26 + 8 gap
-        win.set_margin(Edge::Right, 6); // matches the Waybar right margin
-        win.set_exclusive_zone(-1);
-        win.set_keyboard_mode(KeyboardMode::None);
-        win.set_default_size(1, 1);
-        let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        col.set_halign(gtk::Align::End);
-        col.set_valign(gtk::Align::Start);
-        win.set_child(Some(&col));
-        let (icons, done) = IconWorker::start(|p| image_loader::load_file(p, ICON_EDGE));
-        let ui = Rc::new(NotifyUi {
-            win, col, cards: RefCell::new(Vec::new()), retiring: RefCell::new(VecDeque::new()), retire_token: Cell::new(0),
-            gens: RefCell::new(IconGenerations::default()), icons, hidden: Cell::new(false), animations: Cell::new(true),
-            mon: RefCell::new(String::new()), relay,
-        });
-        let weak = Rc::downgrade(&ui);
-        glib::MainContext::default().spawn_local(consume(done, move |d| match weak.upgrade() {
-            Some(u) => { u.apply_icon(d); true }
-            None => false,
-        }));
-        ui
+/// How long a card stays: `None` = until dismissed (critical or persistent).
+fn lifetime(n: &Note) -> Option<Duration> {
+    match (n.timeout_ms, n.urgency) {
+        (_, 2) | (0, _) => None,
+        (t, _) if t < 0 => Some(Duration::from_millis(DEFAULT_MS)),
+        (t, _) => Some(Duration::from_millis(t as u64)),
     }
+}
 
-    /// Consume relay events on the GTK main loop (bounded batches); every event is acknowledged once handled.
-    pub fn run_events(self: &Rc<Self>, events: async_channel::Receiver<Event>) {
-        let weak = Rc::downgrade(self);
-        glib::MainContext::default().spawn_local(consume(events, move |ev| {
-            let Some(u) = weak.upgrade() else { return false };
-            let (shower, closer) = (u.clone(), u.clone());
-            dispatch(ev, dnd_on, &u.relay, move |n| shower.show(n), move |id| closer.close(id, REASON_CLOSED, true));
-            true
-        }));
-    }
+// ------------------------------------------------------------------ state slice
 
-    /// A finished icon decode: applied only while the card that asked for it is still the active one for that id.
-    fn apply_icon(&self, done: IconDone) {
-        if !self.gens.borrow().accepts(done.id, done.generation) { return; }
-        let Ok(image) = done.image else { return }; // rejected or undecodable: the fallback icon stays
-        if let Some(card) = self.cards.borrow().iter().find(|c| c.id == done.id) {
-            card.icon.set_paintable(Some(&image_loader::texture(image)));
+pub struct Card {
+    pub note: Note,
+    /// Cleaned, clipped display strings.
+    pub app: String,
+    pub summary: String,
+    pub body: String,
+    generation: u64,
+    deadline: Option<Instant>,
+    /// Slide progress 0..=1 (grows while shown, shrinks while closing).
+    progress: f32,
+    closing: bool,
+    icon: Option<Image>,
+    lay: Option<CardLayout>,
+}
+
+impl Card {
+    fn new(n: Note, generation: u64, now: Instant) -> Card {
+        Card {
+            app: clip_chars(&n.app, CARD_APP_CHARS),
+            summary: clip_chars(&strip_markup(&n.summary), CARD_SUMMARY_CHARS),
+            body: clip_chars(&strip_markup(&n.body), CARD_BODY_CHARS),
+            generation,
+            deadline: lifetime(&n).map(|d| now + d),
+            progress: 0.0,
+            closing: false,
+            icon: None,
+            lay: None,
+            note: n,
         }
     }
 
+    pub fn closing(&self) -> bool { self.closing }
+}
+
+#[derive(Default)]
+pub struct Notes {
+    /// Newest first; closing cards stay until their slide-out finishes.
+    pub cards: Vec<Card>,
+    gens: IconGenerations,
+    icons: Option<IconWorker>,
+    relay: Option<mpsc::Sender<Command>>,
+    /// Fullscreen: hide the stack (timers keep running).
+    pub hidden: bool,
+    /// Output the stack appears on (the notch's destination); `None` = compositor's choice.
+    pub output: Option<String>,
+    open: bool,
+}
+
+impl Notes {
     fn emit_closed(&self, id: u32, reason: u32) {
         // closure reason 3 means the sender already removed it (replacement/external close): nothing to echo
-        if reason != REASON_CLOSED { let _ = self.relay.send(Command::Close { id, reason }); }
+        if reason != REASON_CLOSED { if let Some(r) = &self.relay { let _ = r.send(Command::Close { id, reason }); } }
     }
 
-    fn emit_action(&self, id: u32, key: &str) {
-        let _ = self.relay.send(Command::Action { id, key: key.to_owned() });
+    pub fn action(&self, id: u32, key: &str) {
+        if let Some(r) = &self.relay { let _ = r.send(Command::Action { id, key: key.to_owned() }); }
     }
 
-    fn sync_visibility(&self) {
-        let show = !self.cards.borrow().is_empty() && !self.hidden.get();
-        self.win.set_visible(show);
-    }
+    /// Number of cards that are not sliding out.
+    fn active(&self) -> usize { self.cards.iter().filter(|c| !c.closing).count() }
 
-    /// Fullscreen: hide the stack (timers keep running); restore after.
-    pub fn set_hidden(&self, h: bool) {
-        self.hidden.set(h);
-        self.sync_visibility();
-    }
-
-    /// Output the cards appear on (the notch's destination).
-    pub fn set_monitor(&self, gm: &gdk::Monitor) {
-        let name = gm.connector().map(|c| c.to_string()).unwrap_or_default();
-        if *self.mon.borrow() == name { return; }
-        *self.mon.borrow_mut() = name;
-        self.win.set_visible(false);
-        self.win.set_monitor(Some(gm));
-        self.sync_visibility();
-    }
-
-    pub fn set_animations(&self, on: bool) {
-        self.animations.set(on);
-        if on { self.win.remove_css_class("no-anim") } else { self.win.add_css_class("no-anim") }
-    }
-
-    fn slide_ms(&self) -> u32 {
-        if self.animations.get() { SLIDE_MS } else { 0 }
-    }
-
-    /// The card widget, its icon (a fallback until a file icon is decoded) and the local file to decode, if any.
-    fn make_card(self: &Rc<Self>, n: &Note) -> (gtk::Box, gtk::Image, Option<PathBuf>) {
-        let card = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        card.add_css_class("ncard");
-        card.set_overflow(gtk::Overflow::Hidden);
-        card.set_size_request(380, -1);
-
-        let bar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        bar.add_css_class("nbar");
-        bar.add_css_class(match n.urgency { 0 => "nbar-low", 2 => "nbar-crit", _ => "nbar-norm" });
-        card.append(&bar);
-
-        let inner = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        inner.set_margin_start(12);
-        inner.set_margin_end(14);
-        inner.set_margin_top(10);
-        inner.set_margin_bottom(10);
-        inner.set_hexpand(true);
-
-        // A sender-supplied file is never opened here: the fallback shows at once and a worker decodes the file.
-        let local = n.icon.starts_with('/') || n.icon.starts_with("file://");
-        let img = if !local && !n.icon.is_empty() {
-            gtk::Image::from_icon_name(&n.icon)
-        } else {
-            gtk::Image::from_icon_name("dialog-information-symbolic")
-        };
-        let icon_path = if local { image_loader::local_path(&n.icon) } else { None };
-        img.set_pixel_size(36);
-        img.set_valign(gtk::Align::Start);
-        img.add_css_class("nicon");
-        inner.append(&img);
-
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        text.set_hexpand(true);
-        if !n.app.is_empty() {
-            let app = gtk::Label::new(Some(&clip_chars(&n.app, CARD_APP_CHARS)));
-            app.add_css_class("napp");
-            app.set_xalign(0.0);
-            text.append(&app);
-        }
-        let sum = gtk::Label::new(Some(&clip_chars(&strip_markup(&n.summary), CARD_SUMMARY_CHARS)));
-        sum.add_css_class("nsum");
-        sum.set_xalign(0.0);
-        sum.set_wrap(true);
-        sum.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        sum.set_lines(2);
-        sum.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        sum.set_max_width_chars(34);
-        text.append(&sum);
-        if !n.body.is_empty() {
-            let body = gtk::Label::new(Some(&clip_chars(&strip_markup(&n.body), CARD_BODY_CHARS)));
-            body.add_css_class("nbody");
-            body.set_xalign(0.0);
-            body.set_wrap(true);
-            body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            body.set_lines(3);
-            body.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            body.set_max_width_chars(38);
-            text.append(&body);
-        }
-        let btns: Vec<&(String, String)> = n.actions.iter().filter(|(k, _)| k != "default").collect();
-        if !btns.is_empty() {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.set_margin_top(6);
-            for (key, label) in btns {
-                let b = gtk::Button::with_label(label);
-                b.add_css_class("nbtn");
-                let (u, id, key) = (self.clone(), n.id, key.clone());
-                b.connect_clicked(move |_| {
-                    u.emit_action(id, &key);
-                    u.close(id, REASON_DISMISSED, true);
-                });
-                row.append(&b);
-            }
-            text.append(&row);
-        }
-        inner.append(&text);
-        card.append(&inner);
-
-        // left click: default action + dismiss; right click: dismiss
-        let click = gtk::GestureClick::new();
-        click.set_button(0);
-        let (u, id) = (self.clone(), n.id);
-        let has_default = n.actions.iter().any(|(k, _)| k == "default");
-        click.connect_released(move |g, _, _, _| {
-            if g.current_button() == 1 && has_default { u.emit_action(id, "default"); }
-            u.close(id, REASON_DISMISSED, true);
-        });
-        card.add_controller(click);
-        (card, img, icon_path)
-    }
-
-    pub fn show(self: &Rc<Self>, n: Note) {
-        // a replaces_id update swaps the card in place of the old one; the old widget goes away synchronously
+    pub fn show(&mut self, n: Note, cmds: &mut Vec<Cmd>) {
+        // a replaces_id update swaps the card in place of the old one; the old card goes away synchronously
         self.close_with(n.id, REASON_CLOSED, false, false);
 
-        let (widget, icon, icon_path) = self.make_card(&n);
-        let rev = gtk::Revealer::new();
-        rev.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-        rev.set_transition_duration(self.slide_ms());
-        rev.set_child(Some(&widget));
-        self.col.prepend(&rev);
-
-        let card = Rc::new(Card { id: n.id, rev: rev.clone(), icon, timer: RefCell::new(None) });
-        self.cards.borrow_mut().insert(0, card.clone());
-        let generation = self.gens.borrow_mut().begin(n.id);
-        if let Some(path) = icon_path { self.icons.submit(IconJob { id: n.id, generation, path }); }
-
-        let ms = match (n.timeout_ms, n.urgency) {
-            (_, 2) | (0, _) => 0,
-            (t, _) if t < 0 => DEFAULT_MS,
-            (t, _) => t as u64,
-        };
-        if ms > 0 {
-            let (u, id) = (self.clone(), n.id);
-            *card.timer.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_millis(ms), move || {
-                // the timer fired: drop the stored id so close() does not try to remove it again
-                if let Some(c) = u.cards.borrow().iter().find(|c| c.id == id) { c.timer.borrow_mut().take(); }
-                u.close(id, REASON_EXPIRED, true);
-            }));
-        }
-        self.sync_visibility();
-        rev.set_reveal_child(true);
+        let generation = self.gens.begin(n.id);
+        let local = image_loader::local_path(&n.icon);
+        let source = local.or_else(|| (!n.icon.is_empty() && !n.icon.starts_with('/') && !n.icon.contains(':')).then(|| PathBuf::from(&n.icon)));
+        let id = n.id;
+        self.cards.insert(0, Card::new(n, generation, Instant::now()));
+        if let (Some(path), Some(w)) = (source, &self.icons) { w.submit(IconJob { id, generation, path }); }
 
         // cap the stack: expire the oldest without animating it
-        let overflow = { let c = self.cards.borrow(); if c.len() > MAX_CARDS { Some(c[c.len() - 1].id) } else { None } };
-        if let Some(id) = overflow { self.close_with(id, REASON_EXPIRED, true, false); }
+        if self.active() > MAX_CARDS {
+            if let Some(old) = self.cards.iter().rev().find(|c| !c.closing).map(|c| c.note.id) {
+                self.close_with(old, REASON_EXPIRED, true, false);
+            }
+        }
+        if !self.open {
+            self.open = true;
+            cmds.push(Cmd::Open { view: Box::new(CardsView::default()), output: self.output.clone() });
+        }
     }
 
     /// Close a card. Dismissals and expiries slide out; a sender-side closure (replacement or external close) does not.
-    pub fn close(self: &Rc<Self>, id: u32, reason: u32, notify: bool) {
+    pub fn close(&mut self, id: u32, reason: u32, notify: bool) {
         self.close_with(id, reason, notify, reason != REASON_CLOSED);
     }
 
-    fn close_with(self: &Rc<Self>, id: u32, reason: u32, notify: bool, animate: bool) {
-        let card = {
-            let mut cards = self.cards.borrow_mut();
-            match cards.iter().position(|c| c.id == id) {
-                Some(i) => cards.remove(i),
-                None => return,
-            }
-        };
-        self.gens.borrow_mut().end(id);
-        if let Some(t) = card.timer.borrow_mut().take() { t.remove(); }
+    fn close_with(&mut self, id: u32, reason: u32, notify: bool, animate: bool) {
+        let Some(i) = self.cards.iter().position(|c| c.note.id == id && !c.closing) else { return };
+        self.gens.end(id);
         if notify { self.emit_closed(id, reason); }
-        self.retire(card.rev.clone(), animate);
-    }
-
-    /// Remove a closed card's widget, sliding it out when asked. At most [`MAX_RETIRING`] widgets (each with one
-    /// timer) are ever in flight: the oldest is removed immediately when a sixth arrives.
-    fn retire(self: &Rc<Self>, rev: gtk::Revealer, animate: bool) {
-        if !animate || self.hidden.get() || !self.win.is_visible() {
-            self.col.remove(&rev);
-            self.sync_visibility();
+        if !animate || self.hidden {
+            self.cards.remove(i);
             return;
         }
-        loop {
-            let oldest = {
-                let mut q = self.retiring.borrow_mut();
-                if q.len() < MAX_RETIRING { break; }
-                q.pop_front()
-            };
-            if let Some(old) = oldest {
-                old.timer.remove();
-                self.col.remove(&old.rev);
-            }
+        self.cards[i].closing = true;
+        self.cards[i].deadline = None;
+        // at most MAX_RETIRING sliding-out cards: the oldest is removed immediately when another arrives
+        while self.cards.iter().filter(|c| c.closing).count() > MAX_RETIRING {
+            if let Some(j) = self.cards.iter().rposition(|c| c.closing) { self.cards.remove(j); }
         }
-        let token = self.retire_token.get() + 1;
-        self.retire_token.set(token);
-        rev.set_reveal_child(false);
-        let u = self.clone();
-        let timer = glib::timeout_add_local_once(Duration::from_millis(self.slide_ms() as u64 + 30), move || u.finish_retire(token));
-        self.retiring.borrow_mut().push_back(Retiring { token, rev, timer });
     }
 
-    fn finish_retire(&self, token: u64) {
-        let done = {
-            let mut q = self.retiring.borrow_mut();
-            q.iter().position(|r| r.token == token).and_then(|i| q.remove(i))
-        };
-        // the timer that called us has fired and is gone; only the widget is left to remove
-        if let Some(r) = done {
-            self.col.remove(&r.rev);
-            self.sync_visibility();
+    /// A finished icon decode: applied only while the card that asked for it is still the active one for that id.
+    fn apply_icon(&mut self, done: IconDone) {
+        if !self.gens.accepts(done.id, done.generation) { return; }
+        let Ok(image) = done.image else { return }; // rejected or undecodable: the fallback icon stays
+        if let Some(card) = self.cards.iter_mut().find(|c| c.note.id == done.id && !c.closing) {
+            card.icon = image.into_image();
+        }
+    }
+
+    /// Advance slide animations and expire due cards. Returns true while another frame is needed soon.
+    fn step(&mut self, dt: f32, animate: bool, now: Instant) -> bool {
+        let due: Vec<u32> = self.cards.iter().filter(|c| !c.closing && c.deadline.is_some_and(|d| now >= d)).map(|c| c.note.id).collect();
+        for id in due { self.close(id, REASON_EXPIRED, true); }
+        let mut busy = false;
+        for c in &mut self.cards {
+            let (target, k) = if c.closing { (0.0, -1.0) } else { (1.0, 1.0) };
+            if !animate { c.progress = target; continue; }
+            if c.progress != target {
+                c.progress = (c.progress + k * dt / SLIDE_S).clamp(0.0, 1.0);
+                busy = true;
+            }
+        }
+        self.cards.retain(|c| !(c.closing && c.progress <= 0.0));
+        // wake precisely for the next expiry instead of polling at the idle second tick
+        busy || self.cards.iter().any(|c| !c.closing && c.deadline.is_some_and(|d| d.saturating_duration_since(now) < Duration::from_millis(1100)))
+    }
+}
+
+/// Handle one relay event on the UI thread (see `dispatch`).
+fn handle_event(st: &mut State, cmds: &mut Vec<Cmd>, ev: Event) {
+    let Some(relay) = st.notes.relay.clone() else { return };
+    let cell = std::cell::RefCell::new((&mut st.notes, cmds));
+    dispatch(ev, dnd_on, &relay,
+        |n| { let mut g = cell.borrow_mut(); let (notes, cmds) = &mut *g; notes.show(n, cmds); },
+        |id| cell.borrow_mut().0.close(id, REASON_CLOSED, false));
+}
+
+/// Bind the relay socket and start the worker threads. Quickshell owns `org.freedesktop.Notifications` and relays
+/// every notification here; a transport failure exits the app (there would be no notification UI).
+pub fn start(shell_pid: i32, poster: &Poster) -> std::io::Result<()> {
+    let (etx, erx) = mpsc::sync_channel::<Event>(notification_relay::INGRESS);
+    let (ftx, frx) = mpsc::channel::<String>();
+    let cmds = notification_relay::start(shell_pid, ftx, etx)?;
+    let (worker, done) = IconWorker::start(load_icon);
+    poster.post(move |st, _| {
+        st.notes.relay = Some(cmds);
+        st.notes.icons = Some(worker);
+    });
+    let p = poster.clone();
+    std::thread::spawn(move || {
+        while let Ok(ev) = erx.recv() { p.post(move |st, cmds| handle_event(st, cmds, ev)); }
+    });
+    let p = poster.clone();
+    std::thread::spawn(move || {
+        while let Ok(d) = done.recv() { p.post(move |st, _| st.notes.apply_icon(d)); }
+    });
+    let p = poster.clone();
+    std::thread::spawn(move || {
+        if let Ok(why) = frx.recv() {
+            eprintln!("notification relay failed: {why}");
+            p.post(|_, cmds| cmds.push(Cmd::Exit));
+        }
+    });
+    Ok(())
+}
+
+// ------------------------------------------------------------------ cards view
+
+const CARD_W: f32 = 380.0;
+const GAP: f32 = 8.0;
+const RADIUS: f32 = 20.0;
+const ICON: f32 = 36.0;
+/// Text column width: card minus accent bar, margins and icon.
+const TEXT_W: f32 = CARD_W - 4.0 - 12.0 - ICON - 12.0 - 14.0;
+const BTN_H: f32 = 20.0;
+
+#[derive(Clone, Copy)]
+struct CardLayout {
+    fs: f32,
+    h: f32,
+    app_h: f32,
+    sum_h: f32,
+    body_h: f32,
+    btn_row: bool,
+}
+
+fn app_style(p: &Palette) -> TextStyle { TextStyle::new(p.fs(10.0), p.dim).bold() }
+fn sum_style(p: &Palette) -> TextStyle { TextStyle::new(p.fs(13.0), p.fg_hi).bold() }
+fn body_style(p: &Palette) -> TextStyle { TextStyle::new(p.fs(12.0), with_a(p.fg, 0.85)) }
+fn btn_style(p: &Palette) -> TextStyle { TextStyle::new(p.fs(11.0), p.fg_hi) }
+fn line_h(st: &TextStyle) -> f32 { (st.size * 1.3).ceil() }
+
+fn action_buttons(c: &Card) -> Vec<&(String, String)> { c.note.actions.iter().filter(|(k, _)| k != "default").collect() }
+
+fn layout_card(ts: &mut TextSys, p: &Palette, c: &Card) -> CardLayout {
+    let wrapped = |ts: &mut TextSys, s: &str, st: &TextStyle, cap: f32| {
+        if s.is_empty() { return 0.0; }
+        let lh = line_h(st);
+        let lines = (ts.measure(s, st, Some(TEXT_W)).1 / lh).round().clamp(1.0, cap);
+        lines * lh
+    };
+    let app_h = if c.app.is_empty() { 0.0 } else { line_h(&app_style(p)) };
+    let sum_h = wrapped(ts, &c.summary, &sum_style(p), 2.0);
+    let body_h = wrapped(ts, &c.body, &body_style(p), 3.0);
+    let btn_row = !action_buttons(c).is_empty();
+    let parts: Vec<f32> = [app_h, sum_h, body_h].into_iter().filter(|h| *h > 0.0).collect();
+    let mut text_h = parts.iter().sum::<f32>() + 2.0 * parts.len().saturating_sub(1) as f32;
+    if btn_row { text_h += 6.0 + BTN_H + if parts.is_empty() { 0.0 } else { 2.0 }; }
+    CardLayout { fs: p.font_scale, h: 10.0 + text_h.max(ICON) + 10.0, app_h, sum_h, body_h, btn_row }
+}
+
+/// The notification stack surface: one layer surface, top-right under the pill, sized to its cards.
+#[derive(Default)]
+pub struct CardsView {
+    hits: Hits,
+    /// Note id per card slot registered in the last frame (hit ids are `slot * 16 + part`).
+    slots: Vec<u32>,
+    height: f32,
+    hidden: bool,
+}
+
+impl CardsView {
+    fn visible_height(cards: &[Card]) -> f32 {
+        let mut h = 0.0;
+        for c in cards {
+            if let Some(l) = &c.lay { h += (l.h + GAP) * smooth(c.progress); }
+        }
+        (h - GAP).max(0.0)
+    }
+}
+
+impl View for CardsView {
+    fn spec(&self, _st: &State) -> PanelSpec {
+        PanelSpec {
+            namespace: "waybar-notifications",
+            layer: Layer::Overlay,
+            anchor: Anchor::TOP | Anchor::RIGHT,
+            size: (CARD_W as u32, self.height.ceil().max(1.0) as u32),
+            margin: (34, 6, 0, 0),
+            exclusive: -1,
+            kb: KbMode::None,
+        }
+    }
+
+    fn tick(&mut self, dt: f32, ctx: &mut Ctx) -> bool {
+        let animate = ctx.state.settings.behavior.animations;
+        let State { notes, pal, .. } = &mut *ctx.state;
+        // the stack follows the notch to another output: re-create it there
+        if notes.output.is_some() && ctx.output.is_some() && notes.output.as_deref() != ctx.output {
+            ctx.cmds.push(Cmd::Close(ctx.id));
+            ctx.cmds.push(Cmd::Open { view: Box::new(CardsView::default()), output: notes.output.clone() });
+            return false;
+        }
+        let busy = notes.step(dt, animate, Instant::now());
+        for c in notes.cards.iter_mut() {
+            if c.lay.is_none_or(|l| l.fs != pal.font_scale) { c.lay = Some(layout_card(ctx.text, pal, c)); }
+        }
+        self.hidden = notes.hidden;
+        self.height = if self.hidden { 0.0 } else { Self::visible_height(&notes.cards) };
+        if notes.cards.is_empty() {
+            notes.open = false;
+            ctx.cmds.push(Cmd::Close(ctx.id));
+        }
+        busy
+    }
+
+    fn input_region(&self) -> Option<Vec<Rect>> {
+        if self.hidden { Some(Vec::new()) } else { None }
+    }
+
+    fn ticks_seconds(&self) -> bool { true }
+
+    fn cursor(&self) -> Cursor { self.hits.cursor() }
+
+    fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx) {
+        self.hits.clear();
+        self.slots.clear();
+        if self.hidden { return; }
+        let pal = &dc.state.pal;
+        let mut y = 0.0;
+        for c in &dc.state.notes.cards {
+            let Some(l) = c.lay else { continue };
+            let e = smooth(c.progress);
+            let vis = rect(0.0, y, CARD_W, l.h * e);
+            if vis.h >= 0.5 {
+                let slot = self.slots.len() as u32;
+                if !c.closing { self.slots.push(c.note.id); } else { self.slots.push(u32::MAX); }
+                cv.with_alpha(e.sqrt(), |cv| cv.with_clip(vis, r_all(0.0), |cv| {
+                    draw_card(cv, pal, c, &l, y, if c.closing { None } else { Some((&mut self.hits, slot, vis)) });
+                }));
+            }
+            y += (l.h + GAP) * e;
+        }
+    }
+
+    fn event(&mut self, ev: UiEvent, ctx: &mut Ctx) {
+        let Some(click) = self.hits.event(&ev) else { return };
+        let Some(&id) = self.slots.get((click.id / 16) as usize) else { return };
+        if id == u32::MAX { return; }
+        let part = click.id % 16;
+        let notes = &mut ctx.state.notes;
+        let Some(card) = notes.cards.iter().find(|c| c.note.id == id && !c.closing) else { return };
+        if part == 0 {
+            // left click: default action + dismiss; any other button: dismiss
+            if click.button == Button::Left && card.note.actions.iter().any(|(k, _)| k == "default") { notes.action(id, "default"); }
+        } else if let Some((key, _)) = action_buttons(card).get(part as usize - 1) {
+            let key = key.clone();
+            notes.action(id, &key);
+        }
+        notes.close(id, REASON_DISMISSED, true);
+    }
+}
+
+/// Draw one card with its top at `y` (full height; the caller clips to the revealed part).
+fn draw_card(cv: &mut Canvas, p: &Palette, c: &Card, l: &CardLayout, y: f32, hits: Option<(&mut Hits, u32, Rect)>) {
+    let r = rect(0.0, y, CARD_W, l.h);
+    glass(cv, p, r, r_all(RADIUS));
+    let bar = match c.note.urgency { 0 => with_a(p.fg, 0.3), 2 => p.red, _ => p.accent };
+    cv.with_clip(r.pad(1.0), r_all(RADIUS - 1.0), |cv| cv.fill_rect(rect(r.x, r.y, 5.0, r.h), bar));
+
+    // icon: decoded image or a generic glyph
+    let ir = rect(4.0 + 12.0, y + 10.0, ICON, ICON);
+    match &c.icon {
+        Some(img) => cv.image_cover(img, ir, r_all(8.0)),
+        None => {
+            cv.text("\u{f05a}", &TextStyle::icon(26.0, p.accent), ir.center(), HAlign::Center, VAlign::Middle);
+        }
+    }
+
+    let tx = ir.right() + 12.0;
+    let mut ty = y + 10.0;
+    // each text block sits 2px below the previous one
+    fn place(ty: &mut f32, first: &mut bool, h: f32) -> f32 {
+        if !*first { *ty += 2.0; }
+        *first = false;
+        let t = *ty;
+        *ty += h;
+        t
+    }
+    let mut first = true;
+    if l.app_h > 0.0 {
+        let t = place(&mut ty, &mut first, l.app_h);
+        cv.text_in(&c.app, &app_style(p), rect(tx, t, TEXT_W, l.app_h), HAlign::Left);
+    }
+    if l.sum_h > 0.0 {
+        let t = place(&mut ty, &mut first, l.sum_h);
+        cv.text_wrap(&c.summary, &sum_style(p), rect(tx, t, TEXT_W, l.sum_h), HAlign::Left, 2);
+    }
+    if l.body_h > 0.0 {
+        let t = place(&mut ty, &mut first, l.body_h);
+        cv.text_wrap(&c.body, &body_style(p), rect(tx, t, TEXT_W, l.body_h), HAlign::Left, 3);
+    }
+    let mut hits = hits;
+    if let Some((h, slot, vis)) = hits.as_mut() { h.add_in(r, *vis, *slot * 16); }
+    if l.btn_row {
+        let by = ty + 6.0 + if first { 0.0 } else { 2.0 };
+        let st = btn_style(p);
+        let mut x = tx;
+        for (i, (_, label)) in action_buttons(c).into_iter().enumerate() {
+            let label = cv.text.ellipsize(label, &st, TEXT_W - 20.0);
+            let w = (cv.measure(&label, &st).0 + 20.0).min(TEXT_W);
+            if x + w > tx + TEXT_W + 0.5 { break; }
+            let br = rect(x, by, w, BTN_H);
+            let hovered = match hits.as_mut() { Some((h, slot, vis)) => h.add_in(br, *vis, *slot * 16 + 1 + i as u32), None => false };
+            cv.fill_rrect(br, r_all(9.0), with_a(p.fg, if hovered { 0.20 } else { 0.10 }));
+            cv.text(&label, &st, br.center(), HAlign::Center, VAlign::Middle);
+            x += w + 6.0;
         }
     }
 }
@@ -506,8 +601,7 @@ impl NotifyUi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::mpsc;
 
     #[test]
     fn card_text_is_clipped_on_char_boundaries() {
@@ -517,13 +611,17 @@ mod tests {
         assert_eq!(clip_chars("", 3), "");
     }
 
+    #[test]
+    fn markup_is_stripped_and_entities_decoded() {
+        assert_eq!(strip_markup("<b>Hi</b> &amp; <i>bye</i> &lt;3 &quot;q&quot; it&#39;s"), "Hi & bye <3 \"q\" it's");
+        assert_eq!(strip_markup("a < b"), "a ");
+    }
+
     fn note(id: u32, urgency: u8) -> Note {
         Note { id, app: "A".into(), icon: String::new(), summary: "S".into(), body: "B".into(), actions: Vec::new(), urgency, timeout_ms: -1 }
     }
 
-    fn tiny() -> DecodedImage {
-        DecodedImage { width: 1, height: 1, rowstride: 4, alpha: true, bytes: glib::Bytes::from_owned(vec![0u8; 4]) }
-    }
+    fn tiny() -> DecodedImage { DecodedImage { width: 1, height: 1, rgba: vec![0u8; 4] } }
 
     /// Runs `dispatch` and reports (shown ids, closed ids, relay commands as strings).
     fn run(ev: Event, dnd: bool) -> (Vec<u32>, Vec<u32>, Vec<String>) {
@@ -562,6 +660,17 @@ mod tests {
     }
 
     #[test]
+    fn card_interior_is_opaque_over_any_backdrop() {
+        let mut rig = crate::testkit::Rig::new();
+        let mut cmds = Vec::new();
+        rig.st.notes.show(note(1, 1), &mut cmds);
+        let mut v = CardsView::default();
+        rig.run(&mut v, 1.0);
+        let pm = rig.draw(&mut v);
+        crate::ui::assert_opaque_interior(&pm, "notification card");
+    }
+
+    #[test]
     fn stale_icon_completions_cannot_update_a_newer_card() {
         let mut g = IconGenerations::default();
         let first = g.begin(7);
@@ -590,7 +699,7 @@ mod tests {
         assert_eq!(started_rx.recv().unwrap(), PathBuf::from("/icon/1")); // job 1 is running and blocked
         for id in 2..=7 { worker.submit(job(id)); } // five fit; the sixth evicts the oldest waiting job (2)
         for _ in 0..6 { gate_tx.send(()).unwrap(); }
-        let got: Vec<(u32, u64)> = (0..6).map(|_| { let d = done.recv_blocking().unwrap(); assert!(d.image.is_ok()); (d.id, d.generation) }).collect();
+        let got: Vec<(u32, u64)> = (0..6).map(|_| { let d = done.recv().unwrap(); assert!(d.image.is_ok()); (d.id, d.generation) }).collect();
         assert_eq!(got, vec![(1, 10), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70)]);
     }
 
@@ -598,45 +707,88 @@ mod tests {
     fn decoder_errors_come_back_as_errors_not_panics() {
         let (worker, done) = IconWorker::start(|_| Err("rejected".to_string()));
         worker.submit(IconJob { id: 1, generation: 1, path: PathBuf::from("/nope") });
-        let d = done.recv_blocking().unwrap();
+        let d = done.recv().unwrap();
         assert_eq!((d.id, d.generation, d.image.err().as_deref()), (1, 1, Some("rejected")));
     }
 
     #[test]
-    fn the_consumer_yields_to_the_main_loop_between_batches() {
-        let ctx = glib::MainContext::new();
-        let total = EVENT_BATCH * 3;
-        let (tx, rx) = async_channel::unbounded::<usize>();
-        for i in 0..total { tx.try_send(i).unwrap(); }
-        drop(tx);
-        let consumed = Arc::new(AtomicUsize::new(0));
-        let at_heartbeat = Arc::new(AtomicUsize::new(usize::MAX));
-        ctx.block_on(async {
-            let (c, beat, attach_ctx) = (consumed.clone(), at_heartbeat.clone(), ctx.clone());
-            consume(rx, move |_| {
-                if c.fetch_add(1, Ordering::SeqCst) == 0 {
-                    // a default-priority idle callback: it can only run once the consumer gives the loop a turn
-                    let (c, beat) = (c.clone(), beat.clone());
-                    glib::idle_source_new(None, glib::Priority::DEFAULT, move || {
-                        beat.store(c.load(Ordering::SeqCst), Ordering::SeqCst);
-                        glib::ControlFlow::Break
-                    }).attach(Some(&attach_ctx));
-                }
-                true
-            }).await;
-        });
-        assert_eq!(consumed.load(Ordering::SeqCst), total, "every queued event is eventually handled");
-        assert_eq!(at_heartbeat.load(Ordering::SeqCst), EVENT_BATCH, "the main loop ran after one batch, long before the flood was consumed");
+    fn lifetimes_follow_urgency_and_timeout() {
+        let n = |t: i32, u: u8| Note { timeout_ms: t, ..note(1, u) };
+        assert_eq!(lifetime(&n(-1, 1)), Some(Duration::from_millis(DEFAULT_MS)));
+        assert_eq!(lifetime(&n(2500, 0)), Some(Duration::from_millis(2500)));
+        assert_eq!(lifetime(&n(0, 1)), None, "0 means persistent");
+        assert_eq!(lifetime(&n(1000, 2)), None, "critical never expires on its own");
     }
 
     #[test]
-    fn the_consumer_sleeps_below_the_batch_size_and_can_stop() {
-        let ctx = glib::MainContext::new();
-        let (tx, rx) = async_channel::unbounded::<u32>();
-        for i in 0..5 { tx.try_send(i).unwrap(); }
-        let seen = std::cell::RefCell::new(Vec::new());
-        ctx.block_on(consume(rx, |i| { seen.borrow_mut().push(i); i < 3 }));
-        assert_eq!(*seen.borrow(), vec![0, 1, 2, 3], "handle returning false stops consumption");
-        drop(tx);
+    fn replacement_swaps_in_place_and_the_stack_is_capped() {
+        let mut notes = Notes::default();
+        let mut cmds = Vec::new();
+        notes.show(note(1, 1), &mut cmds);
+        assert!(matches!(cmds.as_slice(), [Cmd::Open { .. }]), "the first card opens the surface");
+        notes.show(note(1, 1), &mut cmds);
+        assert_eq!(notes.cards.len(), 1, "same id replaces the old card");
+        assert_eq!(cmds.len(), 1, "no second surface");
+        for id in 2..=7 { notes.show(note(id, 1), &mut cmds); }
+        assert_eq!(notes.active(), MAX_CARDS);
+        assert_eq!(notes.cards[0].note.id, 7, "newest first");
+        assert!(notes.cards.iter().all(|c| c.note.id != 1), "the oldest was expired");
+    }
+
+    #[test]
+    fn dismissal_slides_out_then_removes_and_expiry_fires_once_due() {
+        let mut notes = Notes::default();
+        let mut cmds = Vec::new();
+        let mut n = note(5, 1);
+        n.timeout_ms = 500;
+        notes.show(n, &mut cmds);
+        let t0 = Instant::now();
+        assert!(notes.step(0.1, true, t0), "sliding in");
+        assert!(notes.cards[0].progress > 0.0 && notes.cards[0].progress < 1.0);
+        notes.step(1.0, true, t0);
+        assert_eq!(notes.cards[0].progress, 1.0);
+        assert!(!notes.cards[0].closing);
+        notes.step(0.016, true, t0 + Duration::from_millis(600));
+        assert!(notes.cards[0].closing, "expired by deadline");
+        assert!(notes.cards[0].deadline.is_none());
+        notes.step(1.0, true, t0 + Duration::from_secs(2));
+        assert!(notes.cards.is_empty(), "removed once slid out");
+        // no animations: immediate
+        notes.show(note(6, 1), &mut cmds);
+        notes.step(0.0, false, t0);
+        assert_eq!(notes.cards[0].progress, 1.0);
+        notes.close(6, REASON_DISMISSED, true);
+        notes.step(0.0, false, t0);
+        assert!(notes.cards.is_empty());
+    }
+
+    #[test]
+    fn icon_arrival_only_applies_to_the_current_card() {
+        let mut notes = Notes::default();
+        let mut cmds = Vec::new();
+        notes.show(note(1, 1), &mut cmds);
+        let old_gen = notes.cards[0].generation;
+        notes.show(note(1, 1), &mut cmds);
+        notes.apply_icon(IconDone { id: 1, generation: old_gen, image: Ok(DecodedImage { width: 1, height: 1, rgba: vec![255; 4] }) });
+        assert!(notes.cards[0].icon.is_none());
+        let g = notes.cards[0].generation;
+        notes.apply_icon(IconDone { id: 1, generation: g, image: Ok(DecodedImage { width: 1, height: 1, rgba: vec![255; 4] }) });
+        assert!(notes.cards[0].icon.is_some());
+    }
+
+    #[test]
+    fn preview_card_stack() {
+        let mut rig = crate::testkit::Rig::new();
+        let mut cmds = Vec::new();
+        let mk = |id: u32, app: &str, sum: &str, body: &str, urg: u8, actions: &[(&str, &str)]| Note {
+            id, app: app.into(), icon: String::new(), summary: sum.into(), body: body.into(),
+            actions: actions.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), urgency: urg, timeout_ms: 0,
+        };
+        rig.st.notes.show(mk(1, "Calendar", "Standup in 5 minutes", "", 0, &[]), &mut cmds);
+        rig.st.notes.show(mk(2, "Discord", "<b>Ana</b> sent a message", "hey, are you joining the call? we are waiting for you in the usual channel and everyone is already here", 1, &[("default", "Open"), ("reply", "Reply"), ("mute", "Mute")]), &mut cmds);
+        rig.st.notes.show(mk(3, "Battery", "Battery critically low", "Plug in the charger now", 2, &[("ok", "Dismiss")]), &mut cmds);
+        let mut v = CardsView::default();
+        rig.snap(&mut v, "rp_notify");
+        assert_eq!(rig.st.notes.cards.len(), 3);
     }
 }

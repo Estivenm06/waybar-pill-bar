@@ -4,7 +4,6 @@
 //! dials; there is never a second lookup. Environment proxies are disabled so they cannot bypass the check.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use gtk4::glib;
 use std::time::{Duration, Instant};
 use ureq::config::Config;
 use ureq::http::Uri;
@@ -52,7 +51,7 @@ fn v6_allowed(ip: Ipv6Addr) -> bool {
     true
 }
 
-/// The conservative public-destination policy shared (as a table) with `media-art.py`.
+/// The conservative public-destination policy, kept as a table in `tests/fixtures/network-address-policy.json`.
 pub fn address_allowed(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_allowed(v4),
@@ -102,11 +101,17 @@ pub fn loopback_agent(timeout: Duration) -> ureq::Agent {
 #[derive(Debug, PartialEq, Eq)]
 pub enum GetError { Final, Retry }
 
-fn check_url(url: &str) -> Result<glib::Uri, ()> {
-    let uri = glib::Uri::parse(url, glib::UriFlags::NONE).map_err(|_| ())?;
+/// The `url` crate treats `http:///x` as host `x` (WHATWG); an authority must be written out explicitly.
+pub(crate) fn explicit_authority(raw: &str) -> bool {
+    raw.split_once("://").is_some_and(|(_, rest)| !rest.starts_with(['/', '\\', '?', '#']))
+}
+
+fn check_url(url: &str) -> Result<url::Url, ()> {
+    if !explicit_authority(url) { return Err(()); }
+    let uri = url::Url::parse(url).map_err(|_| ())?;
     let scheme = uri.scheme();
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) { return Err(()); }
-    if uri.userinfo().is_some() || uri.host().is_none_or(|h| h.is_empty()) { return Err(()); }
+    if !uri.username().is_empty() || uri.password().is_some() || uri.host_str().is_none_or(|h| h.is_empty()) { return Err(()); }
     Ok(uri)
 }
 
@@ -114,8 +119,8 @@ fn check_url(url: &str) -> Result<glib::Uri, ()> {
 pub fn next_hop(current: &str, location: &str) -> Result<String, ()> {
     if location.bytes().any(|b| b.is_ascii_control()) { return Err(()); }
     let cur = check_url(current)?;
-    let next = glib::Uri::resolve_relative(Some(current), location, glib::UriFlags::NONE).map_err(|_| ())?;
-    let nu = check_url(&next)?;
+    let next = cur.join(location).map_err(|_| ())?;
+    let nu = check_url(next.as_str())?;
     if cur.scheme().eq_ignore_ascii_case("https") && nu.scheme().eq_ignore_ascii_case("http") { return Err(()); }
     Ok(next.to_string())
 }

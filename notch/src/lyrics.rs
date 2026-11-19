@@ -9,10 +9,11 @@ const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum Lyrics {
     Synced(Vec<(f64, String)>),
     Plain(Vec<String>),
+    #[default]
     None,
 }
 

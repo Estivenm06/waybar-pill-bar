@@ -1,10 +1,7 @@
 #!/bin/bash
-# Run by omarchy-hook after a theme or font change: restyle Waybar and the notch.
+# Run by omarchy-hook after a theme or font change: tell the running notch and pills to reload.
 HELPER="__HOME__/.config/waybar/scripts/waybar-pill-plugin"
 [ "$(python3 "$HELPER" mode 2>/dev/null)" = plugin ] || { echo "waybar-pill-bar: plugin setup has not been run (./install.sh)" >&2; exit 1; }
-"__HOME__/.local/bin/waybar-notch" --gen-waybar-theme || exit 1
-python3 "$HELPER" record-generated "__HOME__/.config/waybar/pill-theme.css" || exit 1
-# a disabled plugin only saves the theme; nothing is started
+# a disabled plugin has nothing to restyle
 python3 "$HELPER" active || exit 0
 python3 "$HELPER" reload
-"__HOME__/.config/waybar/scripts/waybar-popupctl" reload-theme

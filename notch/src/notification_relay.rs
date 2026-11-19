@@ -7,7 +7,7 @@
 //! QML keeps at most 32 events unacknowledged, so the bounded `events` ingress never has to drop anything and the
 //! reader thread blocks (instead of queueing without limit) when the GTK consumer falls behind.
 //! Only the expected Quickshell PID of the current user may connect. Message contents are never logged.
-use crate::{notify, Msg};
+use crate::notify;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -17,6 +17,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 pub const VERSION: u64 = 2;
+/// Capacity of the events ingress; a full queue blocks the socket reader.
+pub const INGRESS: usize = 32;
 const MAX_LINE: usize = 512 * 1024; // JSON text plus its newline, in UTF-8 bytes
 const HELLO_WAIT: Duration = Duration::from_secs(5);
 /// Highest integer a JavaScript number represents exactly; the QML side counts `seq` in one.
@@ -53,11 +55,11 @@ pub fn socket_path() -> io::Result<PathBuf> {
 
 /// Bind the relay socket and serve the one authenticated Quickshell connection on worker threads. `tx` carries only
 /// transport failures; notification traffic goes through the bounded `events` channel.
-pub fn start(shell_pid: i32, tx: async_channel::Sender<Msg>, events: async_channel::Sender<Event>) -> io::Result<mpsc::Sender<Command>> {
+pub fn start(shell_pid: i32, tx: mpsc::Sender<String>, events: mpsc::SyncSender<Event>) -> io::Result<mpsc::Sender<Command>> {
     start_at(&socket_path()?, shell_pid, tx, events)
 }
 
-pub fn start_at(path: &Path, shell_pid: i32, tx: async_channel::Sender<Msg>, events: async_channel::Sender<Event>) -> io::Result<mpsc::Sender<Command>> {
+pub fn start_at(path: &Path, shell_pid: i32, tx: mpsc::Sender<String>, events: mpsc::SyncSender<Event>) -> io::Result<mpsc::Sender<Command>> {
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let (ctx, crx) = mpsc::channel::<Command>();
@@ -80,8 +82,8 @@ pub fn start_at(path: &Path, shell_pid: i32, tx: async_channel::Sender<Msg>, eve
     Ok(ctx)
 }
 
-fn fail(tx: &async_channel::Sender<Msg>, why: String) {
-    let _ = tx.send_blocking(Msg::NotificationRelayFailed(why));
+fn fail(tx: &mpsc::Sender<String>, why: String) {
+    let _ = tx.send(why);
 }
 
 fn peer_pid(s: &UnixStream) -> io::Result<(i32, u32)> {
@@ -103,7 +105,7 @@ fn read_frame(r: &mut impl BufRead, buf: &mut Vec<u8>) -> io::Result<Option<serd
     serde_json::from_slice(buf).map(Some).map_err(|_| io::Error::other("relay sent a malformed frame"))
 }
 
-fn serve(stream: UnixStream, events: async_channel::Sender<Event>, crx: mpsc::Receiver<Command>) -> io::Result<()> {
+fn serve(stream: UnixStream, events: mpsc::SyncSender<Event>, crx: mpsc::Receiver<Command>) -> io::Result<()> {
     let mut writer = stream.try_clone()?;
     stream.set_read_timeout(Some(HELLO_WAIT))?;
     let mut reader = BufReader::new(stream);
@@ -143,7 +145,7 @@ fn serve(stream: UnixStream, events: async_channel::Sender<Event>, crx: mpsc::Re
             Event::Closed { seq, id: parse_id(&f)? }
         };
         // bounded ingress: QML never has more than 32 unacknowledged events, and a stalled consumer blocks only this thread
-        if events.send_blocking(event).is_err() {
+        if events.send(event).is_err() {
             return Err(io::Error::other("relay event consumer is gone"));
         }
     }
@@ -218,14 +220,14 @@ mod tests {
     }
 
     /// Relay with the production-sized events ingress.
-    fn relay(tag: &str) -> (PathBuf, mpsc::Sender<Command>, async_channel::Receiver<Msg>, async_channel::Receiver<Event>) {
+    fn relay(tag: &str) -> (PathBuf, mpsc::Sender<Command>, mpsc::Receiver<String>, mpsc::Receiver<Event>) {
         relay_with(tag, 32)
     }
 
-    fn relay_with(tag: &str, capacity: usize) -> (PathBuf, mpsc::Sender<Command>, async_channel::Receiver<Msg>, async_channel::Receiver<Event>) {
+    fn relay_with(tag: &str, capacity: usize) -> (PathBuf, mpsc::Sender<Command>, mpsc::Receiver<String>, mpsc::Receiver<Event>) {
         let p = sock(tag);
-        let (tx, rx) = async_channel::unbounded();
-        let (etx, erx) = async_channel::bounded(capacity);
+        let (tx, rx) = mpsc::channel();
+        let (etx, erx) = mpsc::sync_channel(capacity);
         let cmds = start_at(&p, me(), tx, etx).unwrap();
         (p, cmds, rx, erx)
     }
@@ -239,11 +241,11 @@ mod tests {
         }
     }
 
-    fn recv(rx: &async_channel::Receiver<Msg>) -> Msg {
+    fn recv(rx: &mpsc::Receiver<String>) -> String {
         wait("a message", || rx.try_recv().ok())
     }
 
-    fn recv_event(rx: &async_channel::Receiver<Event>) -> Event {
+    fn recv_event(rx: &mpsc::Receiver<Event>) -> Event {
         wait("an event", || rx.try_recv().ok())
     }
 
@@ -281,35 +283,26 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_consumer_blocks_the_reader_instead_of_queueing() {
+    fn a_paused_consumer_blocks_the_reader_instead_of_dropping() {
         let (p, _cmds, rx, erx) = relay_with("pause", 2);
         let (mut s, _r) = handshake(&p);
         for seq in 1..=5u64 { writeln!(s, "{}", note(seq, seq as u32, "x")).unwrap(); }
-        wait("the ingress to fill", || (erx.len() == 2).then_some(()));
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(erx.len(), 2, "the ingress must stay at its capacity while the consumer is paused");
         assert!(rx.try_recv().is_err(), "a slow consumer is not a transport failure");
         for want in 1..=5u64 {
             match recv_event(&erx) {
                 Event::Notify { seq, .. } => assert_eq!(seq, want),
                 e => panic!("expected Notify, got {e:?}"),
             }
-            assert!(erx.len() <= 2);
         }
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn the_events_ingress_has_the_documented_capacity() {
-        let (_p, _cmds, _rx, erx) = relay("cap");
-        assert_eq!(erx.capacity(), Some(32));
-    }
-
-    #[test]
     fn wrong_peer_is_rejected() {
         let p = sock("peer");
-        let (tx, rx) = async_channel::unbounded();
-        let (etx, erx) = async_channel::bounded(32);
+        let (tx, rx) = mpsc::channel();
+        let (etx, erx) = mpsc::sync_channel(32);
         start_at(&p, me() + 1, tx, etx).unwrap();
         let (mut s, mut r) = connect(&p);
         let _ = s.write_all(b"{\"op\":\"hello\",\"version\":2}\n");
@@ -330,7 +323,7 @@ mod tests {
             let (p, _cmds, rx, _erx) = relay(tag);
             let (mut s, _r) = connect(&p);
             s.write_all(&payload).unwrap();
-            assert!(matches!(recv(&rx), Msg::NotificationRelayFailed(_)), "{tag}");
+            assert!(!recv(&rx).is_empty(), "{tag}");
             let _ = std::fs::remove_file(&p);
         }
         let long_summary = format!("{{\"op\":\"notify\",\"seq\":1,\"id\":7,\"app\":\"A\",\"icon\":\"\",\"summary\":\"{}\",\"body\":\"B\",\"actions\":[],\"urgency\":1,\"timeout_ms\":-1}}\n", "x".repeat(MAX_SUMMARY + 1));
@@ -360,7 +353,7 @@ mod tests {
             let (mut s, _r) = handshake(&p);
             let _ = s.write_all(frame.as_bytes());
             if frame.is_empty() { s.shutdown(std::net::Shutdown::Both).unwrap(); }
-            assert!(matches!(recv(&rx), Msg::NotificationRelayFailed(_)), "{tag}");
+            assert!(!recv(&rx).is_empty(), "{tag}");
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -372,7 +365,7 @@ mod tests {
         writeln!(s, "{}", note(5, 1, "a")).unwrap();
         writeln!(s, "{}", note(5, 2, "b")).unwrap();
         assert!(matches!(recv_event(&erx), Event::Notify { seq: 5, .. }));
-        assert!(matches!(recv(&rx), Msg::NotificationRelayFailed(_)));
+        assert!(!recv(&rx).is_empty());
         assert!(erx.try_recv().is_err());
         let _ = std::fs::remove_file(&p);
     }

@@ -400,6 +400,7 @@ Item {
     enabled: root.ready
     target: "waybar-pill-whatsapp-" + (root.screenObj ? root.screenObj.name : "")
 
+    function ping(): string { return root.ready ? "ok" : "error: WhatsApp panel is not attached to a native bar window" }
     function toggleNotch(): string { return root.toggleNotchRequest() }
   }
 
