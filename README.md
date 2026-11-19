@@ -6,9 +6,9 @@ A pure-Rust pill bar and notch (no GTK, no Waybar) for **Arch Linux + Omarchy 4.
 
 ![waybar-pill-bar: one notch for media, power modes, Wi-Fi, Bluetooth, audio and more](preview.png)
 
-<video src="https://github.com/Estivenm06/waybar-pill-bar/raw/main/docs/demo.mp4" controls muted loop playsinline width="100%"></video>
+[![Demo: the notch follows what is playing, then switches the power mode](docs/demo.gif)](docs/demo.mp4)
 
-*Demo: the notch follows whatever is playing (here a local file in mpv), then switches the power mode with a sliding highlight. [Open the video](docs/demo.mp4) if your viewer does not play it inline. Recorded with a synthetic track on an empty workspace: no personal data.*
+*Demo: the notch follows whatever is playing (here a local file in mpv), then switches the power mode with a sliding highlight. Click the animation for the full-quality [MP4](docs/demo.mp4). Recorded with a synthetic track on an empty workspace: no personal data.*
 
 ## What's new in 0.2
 
