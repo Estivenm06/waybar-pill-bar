@@ -34,6 +34,6 @@
       "cava",
       "sqlite"
     ],
-    "note": "Enabling the plugin installs missing packages with pacman through pkexec (or sudo in a terminal). Set PILL_BAR_NO_AUTO_INSTALL=1 to only list them."
+    "note": "Enabling the plugin installs only the missing required packages with pacman through pkexec (or sudo in a terminal). Optional packages are never installed automatically. Set PILL_BAR_NO_AUTO_INSTALL=1 to only list them."
   }
 }

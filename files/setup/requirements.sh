@@ -1,5 +1,6 @@
 #!/bin/bash
-# Install the packages listed in manifest.json ("requirements") that this machine is missing.
+# Install the REQUIRED packages listed in manifest.json ("requirements.pacman") that this machine is missing.
+# Optional packages are only mentioned, never installed.
 #
 # Called by install.sh --provision, so enabling the plugin through Omarchy also installs what it needs:
 #   as root           pacman directly
@@ -39,7 +40,10 @@ missing_of() {
 mapfile -t miss_req < <(missing_of "${required[@]}")
 mapfile -t miss_opt < <([ "${#optional[@]}" -gt 0 ] && missing_of "${optional[@]}")
 
-if [ "${#miss_req[@]}" -eq 0 ] && [ "${#miss_opt[@]}" -eq 0 ]; then echo "requirements: all packages present"; exit 0; fi
+if [ "${#miss_req[@]}" -eq 0 ]; then
+  [ "${#miss_opt[@]}" -gt 0 ] && echo "requirements: optional, not installed: ${miss_opt[*]} (sudo pacman -S --needed ${miss_opt[*]})"
+  echo "requirements: all required packages present"; exit 0
+fi
 [ "$CHECK" = 1 ] && { printf '%s\n' "${miss_req[@]}"; [ "${#miss_req[@]}" -eq 0 ]; exit; }
 
 install_pkgs() {
@@ -54,16 +58,16 @@ install_pkgs() {
 }
 
 if [ "${PILL_BAR_NO_AUTO_INSTALL:-0}" = 1 ]; then
-  echo "requirements: missing ${miss_req[*]} ${miss_opt[*]} (automatic install is off: sudo pacman -S --needed ${miss_req[*]} ${miss_opt[*]})"
+  echo "requirements: missing ${miss_req[*]} (automatic install is off: sudo pacman -S --needed ${miss_req[*]})"
   [ "${#miss_req[@]}" -eq 0 ]; exit
 fi
 if [ "${#miss_req[@]}" -gt 0 ]; then
   install_pkgs "${miss_req[@]}" || echo "requirements: could not install ${miss_req[*]}: sudo pacman -S --needed ${miss_req[*]}"
   mapfile -t miss_req < <(missing_of "${required[@]}")
 fi
-# optional packages are best effort: a failure never blocks the plugin
+# optional packages are never installed automatically: they are only mentioned
 if [ "${#miss_opt[@]}" -gt 0 ]; then
-  install_pkgs "${miss_opt[@]}" || echo "requirements: optional packages skipped (${miss_opt[*]}); the plugin works without them"
+  echo "requirements: optional, not installed: ${miss_opt[*]} (sudo pacman -S --needed ${miss_opt[*]})"
 fi
 if [ "${#miss_req[@]}" -gt 0 ]; then echo "requirements: still missing ${miss_req[*]}"; exit 1; fi
 echo "requirements: ok"

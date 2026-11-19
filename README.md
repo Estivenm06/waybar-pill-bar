@@ -108,14 +108,14 @@ omarchy plugin enable waybar.pill-bar      # rebuilds the notch from the new sou
 
 ## Requirements / what you must do
 
-1. **Packages are installed for you.** `manifest.json` lists them under `requirements` (`pacman` = required, `optional` = nice to have). When you enable the plugin, provisioning installs whatever is missing with `pacman -S --needed`:
+1. **Packages are installed for you.** `manifest.json` lists them under `requirements` (`pacman` = required, `optional` = nice to have). When you enable the plugin, provisioning installs the required packages that are missing with `pacman -S --needed`:
    - from the Omarchy shell (the normal `omarchy plugin enable ...`): `pkexec` shows the Omarchy password dialog;
    - from a terminal (`./install.sh --provision`): `sudo` asks in that terminal;
    - `PILL_BAR_NO_AUTO_INSTALL=1` turns it off; the missing packages are then only listed.
 
-   Only names from the manifest are passed to pacman. Optional packages (`wl-clipboard`, `cava`, `sqlite`) never block the plugin. Required: `playerctl jq libpulse pamixer libxkbcommon wayland pkgconf bluez-utils networkmanager upower power-profiles-daemon rust fontconfig` (a `cargo` from rustup also satisfies `rust`). To install them yourself first:
+   Only the required names from the manifest are passed to pacman. Optional packages (`wl-clipboard`, `cava`, `sqlite`) are never installed automatically; the log just tells you how to add them. Required: `playerctl jq libpulse pamixer libxkbcommon wayland pkgconf bluez-utils networkmanager upower power-profiles-daemon rust fontconfig` (a `cargo` from rustup also satisfies `rust`). To install them yourself first:
    ```bash
-   sudo pacman -S --needed $(jq -r '.requirements.pacman + .requirements.optional | join(" ")' ~/.config/omarchy/plugins/waybar.pill-bar/manifest.json)
+   sudo pacman -S --needed $(jq -r '.requirements.pacman | join(" ")' ~/.config/omarchy/plugins/waybar.pill-bar/manifest.json)
    ```
    `files/setup/requirements.sh --check` lists what is missing without installing anything. The guided Google login needs only an interactive terminal and your normal browser.
 2. **Enable the plugin** through Omarchy, as above. Build output lives in `${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch/target`, never inside the watched plugin checkout.

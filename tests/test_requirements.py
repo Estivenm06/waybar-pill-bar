@@ -57,7 +57,8 @@ class RequirementsTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         lines = self.log()
         self.assertTrue(any(l.startswith("pkexec") and "pacman -S --needed --noconfirm alpha beta rust" in l for l in lines), lines)
-        self.assertTrue(any("gamma" in l for l in lines), "optional packages are installed too")
+        self.assertFalse(any("gamma" in l for l in lines), "optional packages are never installed automatically")
+        self.assertIn("optional, not installed: gamma", r.stdout)
 
     def test_present_packages_are_not_reinstalled(self):
         self.set_installed(["alpha", "beta", "rust", "gamma"])
@@ -65,15 +66,11 @@ class RequirementsTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(self.log(), [])
 
-    def test_failed_install_reports_and_fails_only_for_required_packages(self):
+    def test_failed_install_reports_and_fails(self):
         open(os.path.join(self.bin, "fail"), "w").close()
         r = self.run_script()
         self.assertEqual(r.returncode, 1)
         self.assertIn("still missing", r.stdout)
-        self.set_installed(["alpha", "beta", "rust"])  # only the optional one fails
-        r = self.run_script()
-        self.assertEqual(r.returncode, 0)
-        self.assertIn("optional packages skipped", r.stdout)
 
     def test_opt_out_only_lists(self):
         r = self.run_script(env={"PILL_BAR_NO_AUTO_INSTALL": "1"})
