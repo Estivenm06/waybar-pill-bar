@@ -4,7 +4,7 @@
 # You normally never run this. Enabling the plugin (`omarchy plugin enable waybar.pill-bar`) starts its backend, which
 # runs `install.sh --provision` while the native bar, notifications and OSD stay untouched, and restores every file it
 # wrote when the plugin is disabled or removed. Build output, staging and the log live outside the plugin directory:
-#   cargo target   ${XDG_CACHE_HOME:-~/.cache}/waybar-notch/target
+#   cargo target   ${XDG_CACHE_HOME:-~/.cache}/waybar-notch/source-target-v1 (compiled), .../prebuilt (pinned download)
 #   provision log  ${XDG_STATE_HOME:-~/.local/state}/waybar-notch/provision.log (written by the backend)
 #
 # Usage: ./install.sh --provision [--no-restart] [--reconfigure]
@@ -63,19 +63,22 @@ python3 "$SRC/scripts/waybar-pill-plugin" validate-checkout "$ROOT"
 
 # Build products and staging stay outside the plugin directory, which Omarchy watches for changes.
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch"
-export CARGO_TARGET_DIR="$CACHE/target"
-BIN="$CARGO_TARGET_DIR/release/waybar-notch"
+export CARGO_TARGET_DIR="$CACHE/source-target-v1"
+SRC_BIN="$CARGO_TARGET_DIR/release/waybar-notch"
+PRE_BIN="$CACHE/prebuilt/waybar-notch"
 . "$SRC/setup/progress.sh"
 # A content hash of the sources, not file times: git operations touch times without changing code.
 SRC_HASH=$(bash "$SRC/setup/source-hash.sh" "$ROOT")
-STAMP="$CACHE/built-source.sha256"
-if [ -x "$BIN" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$SRC_HASH" ]; then
+STAMP="$CACHE/source-built-v1.sha256"
+# Compiled and downloaded executables live apart: only the checkout-pinned download is ever accepted.
+if [ -x "$SRC_BIN" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$SRC_HASH" ]; then
   echo "== Rust notch is already built for these sources (skipping the build)"
+  BIN="$SRC_BIN"
 else
-  progress "Setting up the notch: downloading the prebuilt version…"
+  progress "Setting up the notch: looking for a verified prebuilt version…"
   echo "== Looking for a prebuilt notch for these sources"
-  if bash "$SRC/setup/fetch-prebuilt.sh" "$ROOT" "$SRC_HASH" "$CACHE/prebuilt.$$"; then
-    mkdir -p "$(dirname "$BIN")" && mv -f "$CACHE/prebuilt.$$" "$BIN"
+  if bash "$SRC/setup/fetch-prebuilt.sh" "$ROOT" "$SRC_HASH" "$PRE_BIN"; then
+    BIN="$PRE_BIN"
   else
     echo "== Building the Rust notch"
     progress "Building the notch from source (1 to 2 minutes)…"
@@ -89,10 +92,11 @@ else
       progress "The build failed, so the native bar stays. See ${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log"
       exit 1
     fi
+    BIN="$SRC_BIN"
+    [ -x "$BIN" ] || { echo "The notch binary is missing: $BIN"; progress "Setup failed: no notch binary. See the provision log."; exit 1; }
+    mkdir -p -m 700 "$CACHE"
+    printf '%s\n' "$SRC_HASH" > "$STAMP"
   fi
-  [ -x "$BIN" ] || { echo "The notch binary is missing: $BIN"; progress "Setup failed: no notch binary. See the provision log."; exit 1; }
-  mkdir -p -m 700 "$CACHE"
-  printf '%s\n' "$SRC_HASH" > "$STAMP"
 fi
 progress "Installing the bar files…"
 

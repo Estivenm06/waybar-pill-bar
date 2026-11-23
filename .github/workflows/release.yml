@@ -1,9 +1,10 @@
 name: Prebuilt notch
 
-# Keeps the downloadable notch (GitHub release v<manifest version>) in step with the sources.
-#   verify  : check that the currently listed snapshot belongs to the sources of this commit (changes nothing)
-#   publish : verify the commit (tests), then build and publish the snapshot for it
-# A push that changes the Rust sources publishes automatically, so installs never fall back to compiling for long.
+# Publishes candidate notch builds (GitHub release notch-<commit>); a candidate is never overwritten.
+# Installs trust a binary only after a maintainer reviews the printed candidate pin and commits it as
+# files/setup/prebuilt.json. A pin-only commit does not trigger another candidate.
+#   verify  : check that the committed pin authorizes an artifact for the sources of this commit (changes nothing)
+#   publish : test the commit, then build and publish a candidate and print its pin
 on:
   push:
     branches: [main]
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "verify = check the currently listed snapshot; publish = verify and publish a newer upstream commit"
+        description: "verify = check the committed pin; publish = publish a new candidate for this commit and print its pin"
         type: choice
         options: [verify, publish]
         default: verify
@@ -32,10 +33,10 @@ jobs:
           fetch-depth: 0
       - name: Trust the workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Verify the listed snapshot
+      - name: Verify the committed pin
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'verify'
         run: ./release.sh --verify
-      - name: Verify and publish
+      - name: Publish candidate (pin needs review)
         if: github.event_name == 'push' || inputs.action == 'publish'
         env:
           GH_TOKEN: ${{ github.token }}

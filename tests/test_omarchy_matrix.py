@@ -181,10 +181,10 @@ class SandboxInstall(Base):
         self.stub("omarchy", 'echo "omarchy $*" >> "%s"; [ "$1 $2" = "plugin list" ] && echo "[]"; exit 0' % self.calls_log)
         self.stub("cargo", '''set -eu
 [ "$*" = "build --release --locked --color never" ]
-case "$CARGO_TARGET_DIR" in "$HOME"/.cache/waybar-notch/target) ;; *) exit 90 ;; esac
+case "$CARGO_TARGET_DIR" in "$HOME"/.cache/waybar-notch/source-target-v1) ;; *) exit 90 ;; esac
 echo "cargo $*" >> "%s"
 mkdir -p "$CARGO_TARGET_DIR/release"
-printf '#!/bin/sh\\nexit 0\\n' > "$CARGO_TARGET_DIR/release/waybar-notch"
+printf '#!/bin/sh\\necho built\\n' > "$CARGO_TARGET_DIR/release/waybar-notch"
 chmod 755 "$CARGO_TARGET_DIR/release/waybar-notch"''' % self.calls_log)
         h = os.path.join(self.home, ".config", "hypr")
         os.makedirs(h)
@@ -282,6 +282,71 @@ chmod 755 "$CARGO_TARGET_DIR/release/waybar-notch"''' % self.calls_log)
         shutil.rmtree(self.checkout)
         self.assert_manager_restored()
         self.assertFalse(os.path.exists(self.calls_log))
+
+    def installed(self):
+        with open(os.path.join(self.home, ".local", "bin", "waybar-notch"), "rb") as f:
+            return f.read()
+
+    def cargo_builds(self):
+        with open(self.calls_log) as f:
+            return f.read().count("cargo build")
+
+    def seed_pinned_prebuilt(self, data=b"#!/bin/sh\necho prebuilt\n"):
+        import hashlib
+        sh = subprocess.run(["bash", os.path.join(self.checkout, "files", "setup", "source-hash.sh"), self.checkout],
+                            capture_output=True, text=True, check=True).stdout.strip()
+        commit = "a" * 40
+        with open(os.path.join(self.checkout, "files", "setup", "prebuilt.json"), "w") as f:
+            json.dump({"source_commit": commit, "tag": "notch-" + commit, "source_hash": sh, "arch": "x86_64",
+                       "binary_sha256": hashlib.sha256(b"#!/bin/sh\necho prebuilt\n").hexdigest()}, f)
+        cached = os.path.join(self.home, ".cache", "waybar-notch", "prebuilt", "waybar-notch")
+        os.makedirs(os.path.dirname(cached))
+        with open(cached, "wb") as f:
+            f.write(data)
+        os.chmod(cached, 0o755)
+
+    def test_legacy_cache_is_never_selected_and_source_build_is_reused(self):
+        cache = os.path.join(self.home, ".cache", "waybar-notch")
+        old = os.path.join(cache, "target", "release")
+        os.makedirs(old)
+        with open(os.path.join(old, "waybar-notch"), "w") as f:
+            f.write("#!/bin/sh\necho MARKER\n")
+        os.chmod(os.path.join(old, "waybar-notch"), 0o755)
+        src = subprocess.run(["bash", os.path.join(self.checkout, "files", "setup", "source-hash.sh"), self.checkout],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        with open(os.path.join(cache, "built-source.sha256"), "w") as f:
+            f.write(src + "\n")
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.installed(), b"#!/bin/sh\necho built\n")
+        self.assertEqual(self.cargo_builds(), 1)
+        r = self.sh("bash", "uninstall.sh")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.cargo_builds(), 1)
+
+    def test_pinned_cached_prebuilt_is_used_without_cargo(self):
+        self.seed_pinned_prebuilt()
+        self.env.pop("PILL_BAR_NO_PREBUILT")
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.installed(), b"#!/bin/sh\necho prebuilt\n")
+        self.assertFalse(os.path.exists(self.calls_log) and self.cargo_builds())
+
+    def test_tampered_prebuilt_builds_from_source(self):
+        self.seed_pinned_prebuilt(b"#!/bin/sh\necho evil\n")
+        self.env.pop("PILL_BAR_NO_PREBUILT")
+        self.env["PILL_BAR_RELEASE_URL"] = "file://" + os.path.join(self.tmp, "missing")
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.installed(), b"#!/bin/sh\necho built\n")
+
+    def test_opt_out_ignores_valid_cached_prebuilt(self):
+        self.seed_pinned_prebuilt()
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.installed(), b"#!/bin/sh\necho built\n")
 
     def test_manager_failed_build_leaves_native_desktop_untouched(self):
         self.manager_desktop()

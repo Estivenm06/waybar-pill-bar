@@ -1,10 +1,13 @@
 #!/bin/bash
 # Maintainer script for the prebuilt notch that first installs download (files/setup/fetch-prebuilt.sh).
 #
-#   ./release.sh --verify    check the currently listed snapshot (release v<version>): its source hash must equal the
-#                            sources in this checkout and its binary must match its checksum. Changes nothing.
-#   ./release.sh [--publish] verify and publish: test and build the committed sources, then create or update
-#                            release v<version> so the snapshot matches the newer commit.
+# Installers trust only the pin committed in files/setup/prebuilt.json, never anything the release host serves.
+#
+#   ./release.sh --verify    check the committed pin: its source hash must equal the sources in this checkout, and the
+#                            asset published under its tag must match its checksum. Changes nothing.
+#   ./release.sh [--publish] test and build the committed sources and publish them as a NEW candidate release
+#                            notch-<commit>. Existing releases are never overwritten. The candidate pin is printed;
+#                            review it and commit it as files/setup/prebuilt.json to approve the binary.
 #
 # --publish needs a clean, pushed git tree, cargo, zstd and an authenticated `gh` (GH_TOKEN works).
 set -euo pipefail
@@ -13,42 +16,40 @@ MODE=publish
 case "${1:-}" in --verify) MODE=verify ;; --publish|"") ;; *) echo "usage: ./release.sh [--verify|--publish]"; exit 2 ;; esac
 
 if [ "$MODE" = verify ]; then
-  VERSION=$(jq -r '.version' manifest.json)
   HASH=$(bash files/setup/source-hash.sh .)
-  BASE="${PILL_BAR_RELEASE_URL:-https://github.com/Estivenm06/waybar-pill-bar/releases/download/v$VERSION}"
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-  curl -fsSL --max-time 60 -o "$T/info.json" "$BASE/release-info.json" || { echo "verify: no snapshot is listed for v$VERSION (run ./release.sh --publish)"; exit 1; }
-  LISTED=$(jq -r '.source_hash' "$T/info.json")
-  [ "$LISTED" = "$HASH" ] || { echo "verify: STALE. v$VERSION lists sources $LISTED, this checkout has $HASH (run ./release.sh --publish)"; exit 1; }
-  curl -fsSL --max-time 120 -o "$T/bin.zst" "$BASE/waybar-notch-x86_64.zst" && zstd -d -q -o "$T/bin" "$T/bin.zst" \
-    || { echo "verify: the listed binary cannot be downloaded or unpacked"; exit 1; }
-  [ "$(sha256sum "$T/bin" | cut -d' ' -f1)" = "$(jq -r '.binary_sha256' "$T/info.json")" ] || { echo "verify: the listed binary does not match its checksum"; exit 1; }
-  echo "verify: ok, v$VERSION is the snapshot of the current sources ($HASH)"
+  PILL_BAR_NO_PREBUILT=0 bash files/setup/fetch-prebuilt.sh . "$HASH" "$T/waybar-notch" || { echo "verify: FAILED, the committed pin does not authorize an artifact for these sources"; exit 1; }
+  echo "verify: ok, the pinned artifact matches the current sources ($HASH)"
   exit 0
 fi
 
 [ -z "$(git status --porcelain)" ] || { echo "release: commit your changes first (the binary must match the pushed sources)"; exit 1; }
 git fetch -q origin
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "release: push main first"; exit 1; }
+COMMIT=$(git rev-parse HEAD)
+[ "$COMMIT" = "$(git rev-parse origin/main)" ] || { echo "release: push main first"; exit 1; }
 
 VERSION=$(jq -r '.version' manifest.json)
-TAG="v$VERSION"
+TAG="notch-$COMMIT"
 HASH=$(bash files/setup/source-hash.sh .)
 OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 
-export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch/target"
+# Only a confirmed 404 for this exact tag permits creating it.
+if ERR=$(gh api "repos/{owner}/{repo}/releases/tags/$TAG" 2>&1 >/dev/null); then
+  echo "release: candidate already exists; refusing to overwrite"; exit 1
+fi
+case "$ERR" in *"HTTP 404"*) ;; *) echo "release: could not check for $TAG: $ERR"; exit 1 ;; esac
+
+export CARGO_TARGET_DIR="$OUT/target"
 cargo test --locked --manifest-path notch/Cargo.toml
 cargo build --release --locked --manifest-path notch/Cargo.toml
 BIN="$CARGO_TARGET_DIR/release/waybar-notch"
 zstd -19 -q -o "$OUT/waybar-notch-x86_64.zst" "$BIN"
-jq -n --arg h "$HASH" --arg s "$(sha256sum "$BIN" | cut -d' ' -f1)" --arg v "$VERSION" \
-  '{version:$v, source_hash:$h, binary_sha256:$s, arch:"x86_64"}' > "$OUT/release-info.json"
+jq -n --arg c "$COMMIT" --arg t "$TAG" --arg h "$HASH" --arg s "$(sha256sum "$BIN" | cut -d' ' -f1)" \
+  '{source_commit:$c, tag:$t, source_hash:$h, arch:"x86_64", binary_sha256:$s}' > "$OUT/release-info.json"
 
-if gh release view "$TAG" >/dev/null 2>&1; then
-  gh release upload "$TAG" "$OUT/waybar-notch-x86_64.zst" "$OUT/release-info.json" --clobber
-else
-  gh release create "$TAG" "$OUT/waybar-notch-x86_64.zst" "$OUT/release-info.json" \
-    --target "$(git rev-parse HEAD)" --title "Pill Bar $VERSION" \
-    --notes "Prebuilt notch for x86_64 Arch/Omarchy. Installs download it automatically (and compile from source if it does not match)."
-fi
-echo "release: published $TAG (source $HASH)"
+gh release create "$TAG" "$OUT/waybar-notch-x86_64.zst" "$OUT/release-info.json" \
+  --target "$COMMIT" --title "Notch candidate $COMMIT" \
+  --notes "Candidate prebuilt notch (Pill Bar $VERSION). Installs use it only after its pin is committed to files/setup/prebuilt.json."
+echo "release: published candidate $TAG (source $HASH)"
+echo "release: candidate pin (review and commit as files/setup/prebuilt.json):"
+cat "$OUT/release-info.json"
