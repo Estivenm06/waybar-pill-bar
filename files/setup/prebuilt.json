@@ -1,1 +1,7 @@
-{}
+{
+  "source_commit": "a7519389fc4f2f833e531030f27021d9eced5635",
+  "tag": "notch-a7519389fc4f2f833e531030f27021d9eced5635",
+  "source_hash": "83c54d9ab5927f34d7babfd631fdf3cf4ed3e085fe6376ead474b1ace1cf6a46",
+  "arch": "x86_64",
+  "binary_sha256": "9803f76ee6d76988446837bc80c73d34f8ea67a945db59cf698254e0e85e42d6"
+}
