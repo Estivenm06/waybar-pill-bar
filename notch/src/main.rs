@@ -42,6 +42,7 @@ mod sysinfo;
 #[cfg(test)]
 mod testkit;
 mod theme;
+mod update_check;
 mod usage;
 mod ui;
 mod wayland;
@@ -110,6 +111,7 @@ fn main() {
         weather::start(poster);
         popups::start_fifo(poster);
         calendar::start(poster);
+        update_check::start(poster);
         settings_page::watch_config(poster);
         if let Some(pid) = shell_pid {
             whatsapp::start(pid, poster);

@@ -129,6 +129,8 @@ omarchy plugin enable waybar.pill-bar      # rebuilds the notch from the new sou
 
 `update.sh` fast-forwards the checkout from GitHub, lets the backend restore the native desktop, then enables the plugin again so the new version is built and provisioned. Your settings, Google credentials and build cache are kept. If the plugin's `Service.qml` changed between versions, run `omarchy-restart-shell` once afterwards (Qt caches loaded plugin QML). If `omarchy plugin update` says it cannot fast-forward, the checkout has local edits: stash or discard them (`git -C ~/.config/omarchy/plugins/waybar.pill-bar status`).
 
+**Update notice.** Five minutes after the bar starts, and then once a day, it compares your installed `manifest.json` version with the one on GitHub `main` and shows one notification per new version naming `update.sh`. It never updates by itself. Only that public manifest is requested. To turn it off, set `"notch": {"behavior": {"check_updates": false}}` in `~/.config/waybar-notch/config.json`.
+
 ## Requirements / what you must do
 
 1. **Packages are installed for you.** `manifest.json` lists them under `requirements` (`pacman` = required, `optional` = nice to have). When you enable the plugin, provisioning installs the required packages that are missing with `pacman -S --needed`:
