@@ -26,7 +26,7 @@ requests full restoration, subject to file-conflict and filesystem trust checks.
 the newly installed adapter may need one shell restart and is not hot-reloaded. These adapter files contain UI
 integration code, not WhatsApp credentials or message history.
 
-Three features contact the network about what you play, and nothing else about your media leaves the computer:
+Three features contact the network. The first two concern what you play, and nothing else about your media leaves the computer; the third concerns only the plugin version:
 - **Lyrics:** the Media tab asks LRCLIB (`lrclib.net`) for lyrics, sending the current track's artist, title and duration as query parameters. There is no API key and no account. Responses are size-limited.
 - **Cover art:** when a media player supplies an artwork URL (`http` or `https`), the app, and the optional `media-art` Waybar helper if you enable it, fetch that URL from whatever server the player named. That server sees your IP address and the request. Only public internet addresses are contacted; private, loopback and link-local addresses are refused. Local artwork files are read from disk only.
 - **Update check:** once a day the app downloads the public `manifest.json` from `raw.githubusercontent.com` (GitHub sees your IP address and the request) and compares its version with your installed one. Nothing about you or your usage is sent. Disable it with `"notch": {"behavior": {"check_updates": false}}` in `~/.config/waybar-notch/config.json`.
