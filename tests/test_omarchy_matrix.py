@@ -430,6 +430,130 @@ chmod 755 "$CARGO_TARGET_DIR/release/waybar-notch"''' % self.calls_log)
         for p in sentinels[1:]:
             self.assertFalse(os.path.exists(p))
 
+    def cache(self):
+        return os.path.join(self.home, ".cache", "waybar-notch")
+
+    def assert_no_build(self):
+        self.assertFalse(os.path.exists(self.calls_log) and self.cargo_builds())
+
+    def test_stamp_symlink_is_rejected_before_any_build(self):
+        os.makedirs(self.cache(), mode=0o700)
+        sentinel = os.path.join(self.tmp, "victim")
+        with open(sentinel, "w") as f:
+            f.write("sentinel")
+        os.symlink(sentinel, os.path.join(self.cache(), "source-built-v1.sha256"))
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertNotEqual(r.returncode, 0)
+        with open(sentinel) as f:
+            self.assertEqual(f.read(), "sentinel")
+        self.assert_no_build()
+
+    def test_cache_ancestry_that_is_linked_or_writable_is_rejected(self):
+        real = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(real, mode=0o700)
+        os.makedirs(os.path.join(self.home, ".cache"), mode=0o700)
+        os.symlink(real, self.cache())
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(os.listdir(real), [])
+        self.assert_no_build()
+        os.unlink(self.cache())
+        os.makedirs(self.cache(), mode=0o700)
+        os.chmod(self.cache(), 0o777)
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertNotEqual(r.returncode, 0)
+        self.assert_no_build()
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership cases need an unprivileged user")
+    def test_foreign_owned_cache_is_rejected(self):
+        os.makedirs(os.path.join(self.home, ".cache"), mode=0o700)
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")  # trusted cache is created and reused
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.cargo_builds(), 1)
+        r = self.sh("bash", "install.sh", "--provision", "--no-restart")
+        self.assertEqual(self.cargo_builds(), 1)
+        st = os.stat("/")
+        if st.st_uid == os.geteuid():
+            self.skipTest("cannot create a foreign-owned directory")
+        self.env["XDG_CACHE_HOME"] = "/"
+        r = self.sh("python3", os.path.join(self.checkout, "files", "setup", "plugin-state.py"), "cache-prepare")
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_cache_stamp_accepts_only_a_hash(self):
+        st = os.path.join(self.checkout, "files", "setup", "plugin-state.py")
+        self.assertEqual(self.sh("python3", st, "cache-prepare").returncode, 0)
+        self.assertNotEqual(self.sh("python3", st, "cache-stamp", "../x").returncode, 0)
+        h = "a" * 64
+        self.assertEqual(self.sh("python3", st, "cache-stamp", h).returncode, 0)
+        p = os.path.join(self.cache(), "source-built-v1.sha256")
+        with open(p) as f:
+            self.assertEqual(f.read(), h + "\n")
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+
+    def purge(self, *args):
+        return self.sh("python3", os.path.join(self.checkout, "files", "scripts", "waybar-pill-plugin"),
+                       "purge-credentials", *args)
+
+    def seed_credentials(self):
+        paths = {}
+        for rel in ((".config", "waybar-notch", "google.json"), (".config", "waybar-notch", "project-id"),
+                    (".local", "share", "waybar-notch", "google-token.json"),
+                    (".local", "share", "waybar-notch", "browser-profile", "Default", "Cookies")):
+            p = os.path.join(self.home, *rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write("x")
+            paths[rel[-1]] = p
+        return paths
+
+    def test_purge_removes_only_the_four_entries_and_never_follows_links(self):
+        paths = self.seed_credentials()
+        keep = os.path.join(self.home, ".config", "waybar-notch", "settings.json")
+        with open(keep, "w") as f:
+            f.write("keep")
+        outside = os.path.join(self.tmp, "outside")
+        with open(outside, "w") as f:
+            f.write("sentinel")
+        profile = os.path.join(self.home, ".local", "share", "waybar-notch", "browser-profile")
+        os.symlink(outside, os.path.join(profile, "SingletonLock"))
+        os.symlink(self.tmp, os.path.join(profile, "Default", "escape"))
+        self.assertEqual(self.purge("--check").returncode, 0)
+        self.assertTrue(os.path.exists(paths["google.json"]))
+        r = self.purge()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for p in (paths["google.json"], paths["project-id"], paths["google-token.json"], profile):
+            self.assertFalse(os.path.lexists(p), p)
+        self.assertTrue(os.path.exists(keep))
+        with open(outside) as f:
+            self.assertEqual(f.read(), "sentinel")
+        self.assertEqual(self.purge().returncode, 0)
+
+    def test_purge_rejects_linked_ancestors_without_deleting_anything(self):
+        paths = self.seed_credentials()
+        real = os.path.join(self.tmp, "real-data")
+        os.makedirs(os.path.join(real, "waybar-notch"))
+        target = os.path.join(real, "waybar-notch", "google-token.json")
+        with open(target, "w") as f:
+            f.write("sentinel")
+        data = os.path.join(self.home, ".local", "share")
+        shutil.rmtree(data)
+        os.makedirs(os.path.dirname(data), exist_ok=True)
+        os.symlink(real, data)
+        r = self.purge()
+        self.assertNotEqual(r.returncode, 0)
+        with open(target) as f:
+            self.assertEqual(f.read(), "sentinel")
+        self.assertTrue(os.path.exists(paths["google.json"]), "preflight must precede any removal")
+        r = self.sh("bash", "uninstall.sh", "--purge")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(os.path.exists(paths["google.json"]))
+
+    def test_purge_rejects_writable_ancestor(self):
+        paths = self.seed_credentials()
+        os.chmod(os.path.join(self.home, ".config"), 0o777)
+        self.assertNotEqual(self.purge().returncode, 0)
+        self.assertTrue(os.path.exists(paths["google.json"]))
+
     def test_legacy_standalone_files_fail_setup_without_writes(self):
         drop = os.path.join(self.home, ".config", "systemd", "user", "waybar.service.d", "50-waybar-notch.conf")
         os.makedirs(os.path.dirname(drop))

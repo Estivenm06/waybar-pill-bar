@@ -112,8 +112,8 @@ class RelayTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
-    def notify(self, summary, replaces=0, timeout=5000, actions="['default','Open']"):
-        r = self.gdbus("Notify", "Test App", str(replaces), "dialog-information", summary, "body text", actions, "{}", "int32 %d" % timeout)
+    def notify(self, summary, replaces=0, timeout=5000, actions="['default','Open']", hints="{}"):
+        r = self.gdbus("Notify", "Test App", str(replaces), "dialog-information", summary, "body text", actions, hints, "int32 %d" % timeout)
         return int(re.search(r"uint32 (\d+)", r.stdout).group(1))
 
     def sender(self, ops, timeout=120):
@@ -245,6 +245,18 @@ class RelayTests(unittest.TestCase):
         f = self.read_frame()
         self.assertEqual((f["op"], f["id"]), ("closed", nid))
         self.wait_signal(mon, r"NotificationClosed \(uint32 %d, uint32 3\)" % nid)
+
+    def test_suppress_sound_hint_is_forwarded(self):
+        self.ready()
+        time.sleep(0.3)
+        self.notify("plain")
+        self.assertIs(self.read_frame()["suppress_sound"], False)
+        self.notify("quiet", hints="{'suppress-sound': <true>}")
+        self.assertIs(self.read_frame()["suppress_sound"], True)
+        self.notify("one", hints="{'suppress-sound': <1>}")
+        self.assertIs(self.read_frame()["suppress_sound"], True)
+        self.notify("other", hints="{'suppress-sound': <'yes'>}")
+        self.assertIs(self.read_frame()["suppress_sound"], False)
 
     def test_default_timeout_is_forwarded_as_default(self):
         self.ready()

@@ -116,6 +116,18 @@ Item {
         return out
     }
 
+    // org.freedesktop.Notifications "suppress-sound" hint: boolean true or numeric 1 (never a sender-provided file/name)
+    function suppressSound(n) {
+        try {
+            var h = n.hints
+            if (!h) return false
+            var v = h["suppress-sound"]
+            return v === true || (typeof v === "number" && v === 1)
+        } catch (e) {
+            return false
+        }
+    }
+
     function snapshot(n) {
         var actions = []
         var kept = retainedActions(n)
@@ -132,7 +144,8 @@ Item {
             body: clip(n.body, maxBody),
             actions: actions,
             urgency: Math.max(0, Math.min(2, Number(n.urgency))),
-            timeout_ms: (!isFinite(timeout) || timeout < 0) ? -1 : Math.round(timeout)
+            timeout_ms: (!isFinite(timeout) || timeout < 0) ? -1 : Math.round(timeout),
+            suppress_sound: suppressSound(n)
         }
     }
 

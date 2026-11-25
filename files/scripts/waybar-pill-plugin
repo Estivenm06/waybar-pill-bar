@@ -1058,6 +1058,86 @@ def remove_tree(parent_fd, name, label, depth=0):
     os.rmdir(name, dir_fd=parent_fd)
 
 
+def purge_tree(parent_fd, name, label, depth=0):
+    """Descriptor-relative removal of a profile directory: subdirectories are entered only as owned real directories;
+    links, sockets and files are unlinked themselves, never opened or followed."""
+    if depth > MAX_TREE_DEPTH:
+        raise PluginError("%s is nested too deeply" % label)
+    fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise PluginError("%s is not owned by you" % label)
+        os.fchmod(fd, 0o700)
+        for entry in os.listdir(fd):
+            st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                purge_tree(fd, entry, label + "/" + entry, depth + 1)
+            else:
+                os.unlink(entry, dir_fd=fd)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+PURGE_TARGETS = (
+    (".config", "waybar-notch", "google.json"),
+    (".config", "waybar-notch", "project-id"),
+    (".local", "share", "waybar-notch", "google-token.json"),
+    (".local", "share", "waybar-notch", "browser-profile"),
+)
+
+
+def purge_credentials(check_only=False):
+    """Remove the product's Google credential footprint (the four fixed HOME-relative names) through descriptors.
+    Every parent is validated before anything is removed; links are unlinked, never followed; missing is success."""
+    h = home()
+    found = []
+    try:
+        for rel in PURGE_TARGETS:
+            parent = os.path.join(h, *rel[:-1])
+            dfd = open_directory_chain(parent, own_from=h)
+            if dfd is None:
+                continue
+            try:
+                try:
+                    st = os.stat(rel[-1], dir_fd=dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    fd = os.open(rel[-1], _DIR_FLAGS, dir_fd=dfd)
+                    try:
+                        if os.fstat(fd).st_uid != os.geteuid():
+                            raise PluginError("%s is not owned by you" % "/".join(rel))
+                    finally:
+                        os.close(fd)
+                elif not (stat.S_ISLNK(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid())):
+                    raise PluginError("%s is not an owned regular file, directory or link" % "/".join(rel))
+                found.append((rel, st))
+            finally:
+                os.close(dfd)
+        if check_only:
+            return
+        for rel, st in found:
+            dfd = open_directory_chain(os.path.join(h, *rel[:-1]), own_from=h)
+            if dfd is None:
+                continue
+            try:
+                if stat.S_ISDIR(st.st_mode):
+                    try:
+                        purge_tree(dfd, rel[-1], "/".join(rel))
+                    except FileNotFoundError:
+                        pass
+                else:
+                    try:
+                        os.unlink(rel[-1], dir_fd=dfd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(dfd)
+    except OSError as e:
+        raise PluginError("cannot remove the credentials: %s" % (e.strerror or type(e).__name__))
+
+
 def open_provision_log(rotate=False):
     """Append-mode descriptor of the private provisioning log (state directory 0700, log 0600). `rotate` empties a log
     that has grown past 1 MiB."""
@@ -1506,6 +1586,9 @@ def main(argv):
         return recover()
     if c == "runtime-dir" and len(argv) == 1:
         print(runtime_dir())
+        return 0
+    if c == "purge-credentials" and argv[1:] in ([], ["--check"]):
+        purge_credentials(check_only=bool(argv[1:]))
         return 0
     if c == "record-generated" and len(argv) > 1:
         record_generated_files(argv[1:])

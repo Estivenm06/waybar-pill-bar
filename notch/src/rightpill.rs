@@ -87,13 +87,23 @@ fn bt_sink_name(st: &State) -> Option<String> {
     st.net.bt.devs.iter().find(|d| d.connected && d.active).map(|d| d.name.clone())
 }
 
+/// Compact text: `87%` for one device reporting a battery, else the count, plus the lowest reported battery (`2 · 42%`).
+fn bt_summary(bt: &crate::state::BtStatus) -> String {
+    let low = bt.connected.iter().filter_map(|d| d.battery).min();
+    match (bt.connected.len(), low) {
+        (1, Some(b)) => format!("{b}%"),
+        (n, Some(b)) => format!("{n} · {b}%"),
+        (n, None) => n.to_string(),
+    }
+}
+
 fn items(st: &State) -> Vec<Item> {
     let mut v = Vec::new();
     let bt = &st.status.bt;
     if bt.available {
         let (icon, text, tint, dim) = if !bt.on { (GLYPH_BT_OFF, String::new(), Tint::Dim, true) }
             else if bt.connected.is_empty() { (GLYPH_BT, String::new(), Tint::Normal, false) }
-            else { (GLYPH_BT, bt.connected.len().to_string(), Tint::Accent, false) };
+            else { (GLYPH_BT, bt_summary(bt), Tint::Accent, false) };
         v.push(Item { id: ID_BT, icon, text, tint, dim });
     }
     let w = &st.status.wifi;
@@ -124,10 +134,10 @@ fn tooltip(st: &State, id: u32, volume_desc: Option<&str>) -> Option<String> {
             let bt = &st.status.bt;
             Some(if !bt.on { "Bluetooth: off".to_string() } else if bt.connected.is_empty() { "Bluetooth: on".to_string() } else {
                 let mut s = format!("{} connected", bt.connected.len());
-                for name in &bt.connected {
+                for d in &bt.connected {
                     s.push('\n');
-                    s.push_str(name);
-                    if let Some(b) = st.net.bt.devs.iter().find(|d| d.connected && d.name == *name).and_then(|d| d.battery) { s.push_str(&format!(" · {b}%")); }
+                    s.push_str(&d.name);
+                    if let Some(b) = d.battery { s.push_str(&format!(" · {b}%")); }
                 }
                 s
             })
@@ -152,6 +162,41 @@ struct Placed {
     icon_w: f32,
     text_w: f32,
     rect: Rect,
+}
+
+struct Geometry {
+    placed: Vec<Placed>,
+    clock: String,
+    clock_rect: Rect,
+    width: f32,
+}
+
+/// Item and clock placement; shared by `RightPill::layout` and `occupied_width`.
+fn geometry(ts: &mut crate::render::TextSys, st: &State) -> Geometry {
+    let pal = &st.pal;
+    let mut placed = Vec::new();
+    // pill border 1 + padding 6, then icons with 1px margins and 4px padding (min 18)
+    let mut x = 1.0 + 6.0;
+    for item in items(st) {
+        let icon_w = ts.measure(item.icon, &RightPill::icon_style(pal, pal.fg), None).0;
+        let text_w = if item.text.is_empty() { 0.0 } else { ts.measure(&item.text, &RightPill::text_style(pal, pal.fg), None).0 };
+        let content = icon_w + if text_w > 0.0 { 5.0 + text_w } else { 0.0 };
+        let w = (content + 8.0).max(18.0);
+        placed.push(Placed { item, icon_w, text_w, rect: rect(x + 1.0, 1.0, w, HEIGHT - 3.0) });
+        x += w + 2.0;
+    }
+    let clock = chrono::Local::now().format(st.settings.behavior.clock_format.chrono_pattern()).to_string();
+    let cw = ts.measure(&clock, &RightPill::clock_style(pal), None).0;
+    // clock: 4px margin, 1px left divider, 7px padding each side
+    let cx = x + 4.0;
+    let clock_rect = rect(cx, 1.0, 1.0 + 7.0 + cw + 7.0, HEIGHT - 3.0);
+    let width = (clock_rect.right() + 6.0 + 1.0).ceil();
+    Geometry { placed, clock, clock_rect, width }
+}
+
+/// Width the right pill takes from the output's right edge, outer margin included.
+pub(crate) fn occupied_width(st: &State, ts: &mut crate::render::TextSys) -> f32 {
+    geometry(ts, st).width + MARGIN_RIGHT as f32
 }
 
 pub struct RightPill {
@@ -191,24 +236,11 @@ impl RightPill {
     fn clock_style(pal: &Palette) -> TextStyle { TextStyle::new(pal.fs(11.5), pal.fg).bold() }
 
     fn layout(&mut self, ts: &mut crate::render::TextSys, st: &State) {
-        let pal = &st.pal;
-        self.placed.clear();
-        // pill border 1 + padding 6, then icons with 1px margins and 4px padding (min 18)
-        let mut x = 1.0 + 6.0;
-        for item in items(st) {
-            let icon_w = ts.measure(item.icon, &Self::icon_style(pal, pal.fg), None).0;
-            let text_w = if item.text.is_empty() { 0.0 } else { ts.measure(&item.text, &Self::text_style(pal, pal.fg), None).0 };
-            let content = icon_w + if text_w > 0.0 { 5.0 + text_w } else { 0.0 };
-            let w = (content + 8.0).max(18.0);
-            self.placed.push(Placed { item, icon_w, text_w, rect: rect(x + 1.0, 1.0, w, HEIGHT - 3.0) });
-            x += w + 2.0;
-        }
-        self.clock = chrono::Local::now().format(st.settings.behavior.clock_format.chrono_pattern()).to_string();
-        let cw = ts.measure(&self.clock, &Self::clock_style(pal), None).0;
-        // clock: 4px margin, 1px left divider, 7px padding each side
-        let cx = x + 4.0;
-        self.clock_rect = rect(cx, 1.0, 1.0 + 7.0 + cw + 7.0, HEIGHT - 3.0);
-        self.width = (self.clock_rect.right() + 6.0 + 1.0).ceil();
+        let g = geometry(ts, st);
+        self.placed = g.placed;
+        self.clock = g.clock;
+        self.clock_rect = g.clock_rect;
+        self.width = g.width;
     }
 
     fn close_tip(&mut self, cmds: &mut Vec<Cmd>) {
@@ -495,10 +527,32 @@ mod tests {
         st
     }
 
+    fn cbt(mac: &str, name: &str, battery: Option<u8>) -> crate::state::ConnectedBtDevice {
+        crate::state::ConnectedBtDevice { mac: mac.into(), name: name.into(), battery }
+    }
+
+    #[test]
+    fn battery_summary_and_tooltip_use_live_status() {
+        let one = BtStatus { available: true, on: true, connected: vec![cbt("A", "Buds", Some(87))] };
+        assert_eq!(bt_summary(&one), "87%");
+        let zero = BtStatus { available: true, on: true, connected: vec![cbt("A", "Buds", Some(0))] };
+        assert_eq!(bt_summary(&zero), "0%");
+        let two = BtStatus { available: true, on: true, connected: vec![cbt("A", "Same", Some(42)), cbt("B", "Same", Some(90))] };
+        assert_eq!(bt_summary(&two), "2 · 42%");
+        let mixed = BtStatus { available: true, on: true, connected: vec![cbt("A", "Same", None), cbt("B", "Same", Some(90))] };
+        assert_eq!(bt_summary(&mixed), "2 · 90%");
+        let none = BtStatus { available: true, on: true, connected: vec![cbt("A", "Mouse", None)] };
+        assert_eq!(bt_summary(&none), "1");
+        let mut st = st_with(two, WifiStatus::default(), Volume::default());
+        assert_eq!(tooltip(&st, ID_BT, None).unwrap(), "2 connected\nSame · 42%\nSame · 90%");
+        st.status.bt.connected.clear();
+        assert_eq!(tooltip(&st, ID_BT, None).unwrap(), "Bluetooth: on");
+    }
+
     #[test]
     fn items_follow_status() {
         let st = st_with(
-            BtStatus { available: true, on: true, connected: vec!["Buds".into(), "Mouse".into()] },
+            BtStatus { available: true, on: true, connected: vec![cbt("A", "Buds", None), cbt("B", "Mouse", None)] },
             WifiStatus { available: true, on: false, ssid: None, signal: 0 },
             Volume { available: true, percent: 50, muted: false },
         );
@@ -526,11 +580,11 @@ mod tests {
     #[test]
     fn tooltips_match_waybar_formats() {
         let mut st = st_with(
-            BtStatus { available: true, on: true, connected: vec!["Buds".into(), "Mouse".into()] },
+            BtStatus { available: true, on: true, connected: vec![cbt("A", "Buds", None), cbt("B", "Mouse", None)] },
             WifiStatus { available: true, on: true, ssid: Some("Home".into()), signal: 70 },
             Volume { available: true, percent: 42, muted: false },
         );
-        st.net.bt.devs.push(crate::net::BtDev { name: "Buds".into(), connected: true, battery: Some(80), ..Default::default() });
+        st.status.bt.connected[0].battery = Some(80);
         assert_eq!(tooltip(&st, ID_BT, None).unwrap(), "2 connected\nBuds · 80%\nMouse");
         assert_eq!(tooltip(&st, ID_WIFI, None).unwrap(), "Home");
         assert_eq!(tooltip(&st, ID_VOL, Some("Speakers")).unwrap(), "Speakers · 42%");
@@ -680,7 +734,7 @@ mod tests {
         for (name, bs, pct, charging_or_ac, muted_or_bt, connected) in cases {
             let mut rig = Rig::new();
             rig.st.status.power = Some(power(bs, pct, Some(charging_or_ac)));
-            rig.st.status.bt = BtStatus { available: true, on: connected || muted_or_bt, connected: if connected { vec!["Buds".into()] } else { vec![] } };
+            rig.st.status.bt = BtStatus { available: true, on: connected || muted_or_bt, connected: if connected { vec![cbt("A", "Buds", None)] } else { vec![] } };
             rig.st.status.wifi = WifiStatus { available: true, on: true, ssid: Some("Home".into()), signal: 60 };
             rig.st.status.volume = Volume { available: true, percent: 70, muted: name == "rp_pill_muted" };
             let mut pill = RightPill::new("eDP-1");

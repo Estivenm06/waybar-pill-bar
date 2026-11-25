@@ -18,12 +18,13 @@ const ID_CONFIRM_YES: u32 = 1;
 const ID_CONFIRM_NO: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Tile { Screenshot, Record, Nightlight, Dnd, Wifi, Bluetooth, Lock, ClearClipboard, Audio, Display, Settings }
+enum Tile { Screenshot, Record, Nightlight, Dnd, NotificationSounds, Wifi, Bluetooth, Lock, ClearClipboard, Audio, Display, Settings }
 
 impl Tile {
     fn from_id(id: &str) -> Option<Tile> {
         Some(match id {
             "screenshot" => Tile::Screenshot, "record" => Tile::Record, "nightlight" => Tile::Nightlight, "dnd" => Tile::Dnd,
+            "notification-sounds" => Tile::NotificationSounds,
             "wifi" => Tile::Wifi, "bluetooth" => Tile::Bluetooth, "lock" => Tile::Lock, "clear-clipboard" => Tile::ClearClipboard,
             "audio" => Tile::Audio, "display" => Tile::Display, _ => return None,
         })
@@ -44,6 +45,11 @@ fn tile_visual(t: Tile, st: &State) -> (&'static str, &'static str, bool) {
         Tile::Record => (if s.recording { "\u{f04d}" } else { "\u{f03d}" }, if s.recording { "Stop recording" } else { "Record" }, s.recording),
         Tile::Nightlight => (if s.nightlight { "\u{f06e}" } else { "\u{f070}" }, "Reading mode", s.nightlight),
         Tile::Dnd => (if s.dnd { "\u{f1f6}" } else { "\u{f0f3}" }, "Do not disturb", s.dnd),
+        Tile::NotificationSounds => {
+            let on = st.settings.behavior.notification_sounds;
+            // nf-md-volume_off: the plan's FA7-only U+F6A9 is missing from the installed Nerd fonts
+            (if on { "\u{f028}" } else { "\u{f0581}" }, if on { "Notification sounds" } else { "Sounds muted" }, on)
+        }
         Tile::Wifi => (if st.status.wifi.on { "\u{f1eb}" } else { "\u{f092e}" }, "Wi-Fi", st.status.wifi.on),
         Tile::Bluetooth => (if st.status.bt.on { "\u{f293}" } else { "\u{f294}" }, "Bluetooth", st.status.bt.on),
         Tile::Lock => ("\u{f023}", "Lock", false),
@@ -52,6 +58,14 @@ fn tile_visual(t: Tile, st: &State) -> (&'static str, &'static str, bool) {
         Tile::Display => ("\u{f108}", "Displays", false),
         Tile::Settings => ("\u{f013}", "Settings", false),
     }
+}
+
+/// Grid cell of tile `i` of `n`: three columns, an incomplete last row centred by its own item count.
+fn tile_rect(area: Rect, i: usize, n: usize, tw: f32) -> Rect {
+    let (c, r) = (i % COLS, i / COLS);
+    let in_row = (n - r * COLS).min(COLS);
+    let lead = (COLS - in_row) as f32 * (tw + GAP) / 2.0;
+    rect(area.x + lead + c as f32 * (tw + GAP), area.y + r as f32 * (TILE_H + GAP), tw, TILE_H)
 }
 
 /// Collapse the notch, wait for the collapse frames, then run `f` (screenshots/locks must not capture the notch).
@@ -90,8 +104,7 @@ impl Page for Controls {
         self.hits.clear();
         let tw = (area.w - GAP * (COLS as f32 - 1.0)) / COLS as f32;
         for (i, t) in self.tiles.iter().enumerate() {
-            let (c, r) = (i % COLS, i / COLS);
-            let rr = rect(area.x + c as f32 * (tw + GAP), area.y + r as f32 * (TILE_H + GAP), tw, TILE_H);
+            let rr = tile_rect(area, i, self.tiles.len(), tw);
             let id = if *t == Tile::Settings { ID_SETTINGS } else { ID_TILE0 + i as u32 };
             let hov = self.hits.add(rr, id);
             let (glyph, label, active) = tile_visual(*t, st);
@@ -102,7 +115,7 @@ impl Page for Controls {
             cv.fill_rrect(rr, r_all(12.0), fill);
             cv.stroke_rrect(rr, r_all(12.0), 1.0, if hov { with_a(pal.accent, 0.5) } else { with_a(pal.fg, 0.08) });
             let col = if rec { pal.red } else if active { pal.accent } else if hov { pal.fg_hi } else { with_a(pal.fg, 0.75) };
-            let busy = st.sys.capture_pending && matches!(t, Tile::Screenshot | Tile::Record);
+            let busy = (st.sys.capture_pending && matches!(t, Tile::Screenshot | Tile::Record)) || (st.sys.notification_sounds_pending && *t == Tile::NotificationSounds);
             cv.with_alpha(if busy { 0.5 } else { 1.0 }, |cv| {
                 cv.text(glyph, &TextStyle::icon(pal.fs(20.0), col), pt(rr.center().x, rr.y + 24.0), HAlign::Center, VAlign::Middle);
                 cv.text_in(label, &TextStyle::new(pal.fs(11.0), pal.fg_hi), rect(rr.x + 4.0, rr.y + 40.0, rr.w - 8.0, 20.0), HAlign::Center);
@@ -142,6 +155,7 @@ impl Page for Controls {
                     }
                     Tile::Nightlight => sysinfo::toggle_nightlight(ctx.poster),
                     Tile::Dnd => sysinfo::toggle_dnd(ctx.poster),
+                    Tile::NotificationSounds => sysinfo::toggle_notification_sounds(ctx.state, ctx.poster),
                     Tile::Wifi => ctx.state.nav = Some(NavTo::Page("wifi")),
                     Tile::Bluetooth => ctx.state.nav = Some(NavTo::Page("bt")),
                     Tile::Lock if sysinfo::on_path("omarchy") => after_collapse(ctx, |p| sysinfo::lock_screen(p)),
@@ -215,6 +229,56 @@ impl Page for Clipboard {
         if let Some(e) = ctx.state.sys.clip.get((c.id - 100) as usize).cloned() {
             sysinfo::clip_copy(&e);
             ctx.state.nav = Some(NavTo::Collapse);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_last_row_is_centred_and_everything_stays_inside() {
+        let area = rect(10.0, 5.0, 400.0, 300.0);
+        let tw = (area.w - GAP * 2.0) / 3.0;
+        for n in 1..=12usize {
+            let rects: Vec<Rect> = (0..n).map(|i| tile_rect(area, i, n, tw)).collect();
+            for r in &rects { assert!(r.x >= area.x - 0.01 && r.right() <= area.right() + 0.01, "n={n} {r:?}"); }
+            for i in 0..n { for j in i + 1..n { assert!(!(rects[i].x < rects[j].right() && rects[j].x < rects[i].right() && rects[i].y < rects[j].bottom() && rects[j].y < rects[i].bottom())); } }
+            let last_row: Vec<&Rect> = rects.iter().filter(|r| r.y == rects[n - 1].y).collect();
+            let left = last_row.first().unwrap().x - area.x;
+            let right = area.right() - last_row.last().unwrap().right();
+            assert!((left - right).abs() < 0.01, "n={n}: {left} vs {right}");
+        }
+        // ten tiles: Settings sits alone in the middle column
+        assert_eq!(tile_rect(area, 9, 10, tw).x, area.x + tw + GAP);
+    }
+
+    #[test]
+    fn sound_tile_follows_the_sound_preference_and_not_dnd() {
+        let mut st = State::new();
+        st.sys.dnd = true;
+        st.settings.behavior.notification_sounds = true;
+        assert_eq!(tile_visual(Tile::NotificationSounds, &st), ("\u{f028}", "Notification sounds", true));
+        st.settings.behavior.notification_sounds = false;
+        assert_eq!(tile_visual(Tile::NotificationSounds, &st), ("\u{f0581}", "Sounds muted", false));
+        assert_eq!(tile_visual(Tile::Dnd, &st).2, true);
+        assert_eq!(Tile::from_id("notification-sounds"), Some(Tile::NotificationSounds));
+    }
+
+    #[test]
+    fn controls_render_ten_tiles_with_a_centred_settings_tile() {
+        use crate::page::testutil::Harness;
+        let mut st = State::new();
+        st.settings.utilities = ["screenshot", "record", "nightlight", "dnd", "notification-sounds", "wifi", "bluetooth", "lock", "display"].map(String::from).to_vec();
+        let mut h = Harness::new();
+        let mut page = Controls::new();
+        for (on, path) in [(false, "/tmp/controls-sounds-muted.png"), (true, "/tmp/controls-sounds-on.png")] {
+            st.settings.behavior.notification_sounds = on;
+            let area = h.render(&mut page, &mut st, path);
+            assert_eq!(page.tiles.len(), 10);
+            assert_eq!(page.rows(), 4);
+            assert!(area.h >= 4.0 * (TILE_H + GAP) - GAP);
         }
     }
 }

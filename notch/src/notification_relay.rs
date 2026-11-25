@@ -182,6 +182,11 @@ fn parse_note(f: &serde_json::Value) -> io::Result<notify::Note> {
         actions,
         urgency: f["urgency"].as_u64().filter(|u| *u <= 2).ok_or_else(|| bad("urgency"))? as u8,
         timeout_ms: f["timeout_ms"].as_i64().and_then(|v| i32::try_from(v).ok()).ok_or_else(|| bad("timeout_ms"))?,
+        // optional (older shells omit it); present with a wrong type is a protocol error
+        suppress_sound: match f.get("suppress_sound") {
+            None => false,
+            Some(v) => v.as_bool().ok_or_else(|| bad("suppress_sound"))?,
+        },
     })
 }
 
@@ -189,6 +194,16 @@ fn parse_note(f: &serde_json::Value) -> io::Result<notify::Note> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn suppress_sound_is_optional_but_must_be_boolean_when_present() {
+        let base = |extra: &str| serde_json::from_str::<serde_json::Value>(&format!(r#"{{"op":"notify","seq":1,"id":7,"app":"A","icon":"","summary":"S","body":"B","actions":[],"urgency":1,"timeout_ms":-1{extra}}}"#)).unwrap();
+        assert!(!parse_note(&base("")).unwrap().suppress_sound, "old payloads stay accepted");
+        assert!(parse_note(&base(r#","suppress_sound":true"#)).unwrap().suppress_sound);
+        assert!(!parse_note(&base(r#","suppress_sound":false"#)).unwrap().suppress_sound);
+        assert!(parse_note(&base(r#","suppress_sound":"yes""#)).is_err());
+        assert!(parse_note(&base(r#","suppress_sound":1"#)).is_err());
+    }
 
     fn sock(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("nr-test-{}-{tag}", std::process::id()));

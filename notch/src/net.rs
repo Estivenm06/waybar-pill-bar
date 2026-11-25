@@ -2,7 +2,7 @@
 //! worker threads; results land in `state.net` and the compact `state.status.wifi/bt` through the `Poster`.
 //! Logic ported from the legacy GTK `main.rs`.
 
-use crate::state::{BtStatus, State, WifiStatus};
+use crate::state::{BtStatus, ConnectedBtDevice, State, WifiStatus};
 use crate::wayland::Poster;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -85,7 +85,7 @@ impl BtSnap {
     }
 
     pub fn status(&self) -> BtStatus {
-        BtStatus { available: self.available, on: self.on, connected: self.devs.iter().filter(|d| d.connected).map(|d| d.name.clone()).collect() }
+        BtStatus { available: self.available, on: self.on, connected: self.devs.iter().filter(|d| d.connected).map(|d| ConnectedBtDevice { mac: d.mac.clone(), name: d.name.clone(), battery: d.battery }).collect() }
     }
 
     /// Headline and secondary line of the Bluetooth status card.
@@ -339,7 +339,7 @@ fn bt_parse_info(info: &str) -> BtInfo {
             if BT_AUDIO_UUIDS.iter().any(|u| low.contains(u)) { r.audio_uuid = true; }
             if low.contains(A2DP_SINK_UUID) { r.sink_uuid = true; }
         } else if let Some(v) = l.strip_prefix("Battery Percentage:") {
-            r.battery = v.find('(').and_then(|a| v[a + 1..].split(')').next()).and_then(|n| n.trim().parse().ok());
+            r.battery = v.find('(').and_then(|a| v[a + 1..].split(')').next()).and_then(|n| n.trim().parse::<u8>().ok()).filter(|b| *b <= 100);
         }
     }
     r
@@ -403,13 +403,27 @@ pub fn bt_snapshot() -> BtSnap {
     BtSnap { on, available, audio_available, devs }
 }
 
-/// Cheap status for the pill: controller power + connected device names, no per-device queries.
+/// Status for the pill: controller power + connected devices with their live battery
+/// (one `bluetoothctl info` per connected device only; paired-but-disconnected devices are never queried).
 pub fn bt_status() -> BtStatus {
     let show = sh_out("bluetoothctl", &["show"]);
     let on = show.contains("Powered: yes");
     let available = on || show.contains("Powered: no");
-    let connected = if on { bt_list(&["devices", "Connected"]).into_iter().map(|(_, n)| n).collect() } else { Vec::new() };
+    let connected = if on {
+        bt_list(&["devices", "Connected"]).into_iter()
+            .map(|(mac, name)| { let battery = bt_parse_info(&bt_info(&mac)).battery; ConnectedBtDevice { mac, name, battery } })
+            .collect()
+    } else { Vec::new() };
     BtStatus { available, on, connected }
+}
+
+/// Apply a pill-status update: the compact status, and the battery of matching connected detail rows
+/// (rows no longer connected lose theirs so a stale percentage never survives a disconnect).
+pub fn apply_bt_status(st: &mut State, b: BtStatus) {
+    for d in st.net.bt.devs.iter_mut() {
+        d.battery = if d.connected { b.connected.iter().find(|c| c.mac.eq_ignore_ascii_case(&d.mac)).map_or(d.battery, |c| c.battery) } else { None };
+    }
+    st.status.bt = b;
 }
 
 fn post_bt(poster: &Poster, snap: BtSnap) {
@@ -679,7 +693,15 @@ mod tests {
         assert_eq!((w.on, w.ssid.as_deref(), w.signal), (true, Some("Home"), 71));
         assert_eq!(wifi(true, true, false).status().ssid, None);
         let s = BtSnap { on: true, available: true, audio_available: false, devs: vec![bt("A", "Buds", true, true), bt("B", "Mouse", false, true)] };
-        assert_eq!(s.status().connected, ["Buds"]);
+        assert_eq!(s.status().connected, [ConnectedBtDevice { mac: "A".into(), name: "Buds".into(), battery: None }]);
+        assert_eq!(bt_parse_info("Battery Percentage: 0x00 (0)").battery, Some(0));
+        assert_eq!(bt_parse_info("Battery Percentage: 0x64 (100)").battery, Some(100));
+        assert_eq!(bt_parse_info("Battery Percentage: 0x65 (101)").battery, None);
+        assert_eq!(bt_parse_info("Battery Percentage: junk").battery, None);
+        let mut st = State::new();
+        st.net.bt = BtSnap { on: true, available: true, audio_available: false, devs: vec![BtDev { mac: "A".into(), connected: true, battery: Some(10), ..Default::default() }, BtDev { mac: "B".into(), connected: false, battery: Some(5), ..Default::default() }] };
+        apply_bt_status(&mut st, BtStatus { available: true, on: true, connected: vec![ConnectedBtDevice { mac: "A".into(), name: "x".into(), battery: Some(55) }] });
+        assert_eq!((st.net.bt.devs[0].battery, st.net.bt.devs[1].battery), (Some(55), None));
     }
 
     #[test]

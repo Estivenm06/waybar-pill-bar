@@ -10,11 +10,13 @@ for a in "$@"; do
     *) echo "Unknown option: $a"; echo "Usage: ./uninstall.sh [--purge]"; exit 1 ;;
   esac
 done
-GCONF="$HOME/.config/waybar-notch"; GDATA="$HOME/.local/share/waybar-notch"
 STATE_PLUGIN="${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/plugin-install.json"
 HELPER_DIR="$(dirname "$(readlink -f "$0")")/files"
 # validate the record and recovery journal before any desktop command; a dangling or linked record must not slip past `-e`
 python3 "$HELPER_DIR/setup/plugin-state.py" validate || { echo "The install record or recovery journal failed validation; nothing was changed."; exit 1; }
+if [ "$PURGE" = 1 ]; then
+  python3 "$HELPER_DIR/scripts/waybar-pill-plugin" purge-credentials --check || { echo "The credential locations are not safe to purge; nothing was changed."; exit 1; }
+fi
 if command -v omarchy >/dev/null 2>&1; then
   # an enabled plugin owns the session; disabling closes its lease and restores the native desktop
   omarchy plugin disable waybar.pill-bar >/dev/null 2>&1 || true
@@ -28,6 +30,6 @@ done
 [ "$rc" = 0 ] || { echo "Recovery could not finish; keep the checkout and resolve the reported conflict."; exit 1; }
 echo "Plugin files restored. Preferences and credentials are kept; remove the checkout with: omarchy plugin remove waybar.pill-bar"
 if [ "$PURGE" = 1 ]; then
-  rm -rf "$GCONF/google.json" "$GCONF/project-id" "$GDATA/google-token.json" "$GDATA/browser-profile"
+  python3 "$HELPER_DIR/scripts/waybar-pill-plugin" purge-credentials || { echo "Credential removal failed; nothing outside the product footprint was touched."; exit 1; }
   echo "Deleted the Google OAuth client, token and sign-in browser profile."
 fi
