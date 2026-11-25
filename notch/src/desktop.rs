@@ -116,6 +116,8 @@ pub struct Desk {
     pub workspaces: Vec<Workspace>,
     /// A screenshot freeze/selection surface (`hyprpicker`, `selection`) is on screen.
     pub capture_active: bool,
+    /// Active layout code of the main keyboard (see `parse_keyboard`).
+    pub keyboard: Option<String>,
 }
 
 impl Desk {
@@ -141,6 +143,21 @@ fn focused_name(snap: &DesktopSnapshot) -> Option<String> {
     snap.monitors.iter().find(|m| m.focused).map(|m| m.name.clone())
 }
 
+/// Active layout code of the main keyboard (`us,es` + index 1 gives `ES`). `Some("?")` when a keyboard exists but its
+/// active layout is unknown; `None` without a keyboard inventory. Virtual keyboards are deliberately included.
+pub fn parse_keyboard(devices: &Value) -> Option<String> {
+    let kbs = devices.get("keyboards")?.as_array()?;
+    let has_layout = |k: &&Value| k.get("layout").and_then(Value::as_str).is_some_and(|l| !l.trim().is_empty());
+    let kb = kbs.iter().find(|k| k.get("main").and_then(Value::as_bool) == Some(true)).or_else(|| kbs.iter().find(has_layout))?;
+    let codes: Vec<&str> = kb.get("layout").and_then(Value::as_str).unwrap_or("").split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+    let code = match kb.get("active_layout_index").and_then(Value::as_u64) {
+        Some(i) => codes.get(i as usize).copied(),
+        None if codes.len() == 1 => codes.first().copied(),
+        None => None,
+    };
+    Some(code.map_or_else(|| "?".to_string(), str::to_uppercase))
+}
+
 /// Blocking (call off the UI thread). `clients` is returned too so the app tracker can reuse it.
 pub fn query_desk() -> Result<(Desk, Value), String> {
     let clients = hypr::json("j/clients")?;
@@ -148,7 +165,8 @@ pub fn query_desk() -> Result<(Desk, Value), String> {
     let workspaces = parse_workspaces(&hypr::json("j/workspaces")?);
     // a malformed layer dump keeps the screenshot flag off rather than failing the whole snapshot
     let capture_active = hypr::json("j/layers").ok().as_ref().and_then(capture_active).unwrap_or(false);
-    Ok((Desk { focused: focused_name(&snap), snap, workspaces, capture_active }, clients))
+    let keyboard = hypr::json("j/devices").ok().as_ref().and_then(parse_keyboard);
+    Ok((Desk { focused: focused_name(&snap), snap, workspaces, capture_active, keyboard }, clients))
 }
 
 /// Which output hosts the notch and the side pills. Precedence: a live interaction pin, a connected fixed output,
@@ -181,11 +199,11 @@ fn capture_active(layers: &Value) -> Option<bool> {
 }
 
 fn relevant_event(line: &str) -> bool {
-    const EVENTS: [&str; 22] = [
+    const EVENTS: [&str; 23] = [
         "focusedmon", "focusedmonv2", "monitoradded", "monitoraddedv2", "monitorremoved", "monitorremovedv2",
         "workspace", "workspacev2", "activespecial", "activespecialv2", "movewindow", "movewindowv2",
         "moveworkspace", "moveworkspacev2", "fullscreen", "activewindowv2", "openwindow", "closewindow",
-        "configreloaded", "changefloatingmode", "openlayer", "closelayer",
+        "configreloaded", "changefloatingmode", "openlayer", "closelayer", "activelayout",
     ];
     line.split(">>").next().is_some_and(|name| EVENTS.contains(&name))
 }
@@ -213,6 +231,9 @@ struct Publisher {
     tracker: Option<crate::app_status::Tracker>,
     last_desk: Option<Desk>,
     last_buttons: Option<Vec<crate::apps::AppButton>>,
+    last_open: Option<Vec<crate::apps::OpenApp>>,
+    /// Buttons the open-window groups were built against (empty without a tracker).
+    buttons: Vec<crate::apps::AppButton>,
 }
 
 impl Publisher {
@@ -221,13 +242,26 @@ impl Publisher {
         let buttons = t.buttons();
         if self.last_buttons.as_ref() != Some(&buttons) {
             self.last_buttons = Some(buttons.clone());
-            self.poster.post(move |st, _| st.apps.buttons = buttons);
+            self.buttons = buttons.clone();
+            self.poster.post(move |st, _| st.apps.set_buttons(buttons));
+        }
+    }
+
+    /// Open-window groups from a successful client snapshot, independent of the configured-app tracker. A failed
+    /// query (non-array reply) keeps the last good list; a successful empty array clears it.
+    fn open(&mut self, clients: &Value) {
+        let index = crate::desktop_entries::cached();
+        let Some(open) = crate::apps::group_clients(clients, &self.buttons, &index) else { return };
+        if self.last_open.as_ref() != Some(&open) {
+            self.last_open = Some(open.clone());
+            self.poster.post(move |st, _| st.apps.set_open(open));
         }
     }
 
     /// Everything: monitors, workspaces, fullscreen, screenshot layers, client-based app status.
     fn all(&mut self) {
         let Ok((desk, clients)) = query_desk() else { return };
+        self.open(&clients);
         if let Some(t) = &mut self.tracker { let _ = t.update_clients(clients); }
         if self.last_desk.as_ref() != Some(&desk) {
             self.last_desk = Some(desk.clone());
@@ -238,8 +272,9 @@ impl Publisher {
 
     /// Window titles/classes only: app status without the monitor queries.
     fn clients(&mut self) {
-        let Some(t) = &mut self.tracker else { return };
-        if let Ok(clients) = hypr::json("j/clients") { let _ = t.update_clients(clients); }
+        let Ok(clients) = hypr::json("j/clients") else { return };
+        self.open(&clients);
+        if let Some(t) = &mut self.tracker { let _ = t.update_clients(clients); }
         self.apps();
     }
 
@@ -257,7 +292,8 @@ fn watch(poster: Poster) {
         poster.post(|st, _| st.apps.wa_plugin = true);
         crate::app_status::watch_whatsapp(poster.clone());
     }
-    let mut p = Publisher { poster, tracker, last_desk: None, last_buttons: None };
+    crate::apps::install_icon_worker(&poster);
+    let mut p = Publisher { poster, tracker, last_desk: None, last_buttons: None, last_open: None, buttons: Vec::new() };
     p.apps();
     let events = hypr::subscribe(watched_event);
     loop {
@@ -414,7 +450,7 @@ mod tests {
         assert!(watched_event("windowtitlev2>>0x1,x"));
         assert!(watched_event("createworkspacev2>>3,3"));
         assert!(watched_event("destroyworkspace>>3"));
-        assert!(!watched_event("activelayout>>kb,us"));
+        assert!(watched_event("activelayout>>kb,us"), "keyboard layout changes refresh the indicator");
     }
 
     fn ws(id: i64, monitor: &str, windows: u64) -> Value {
@@ -445,5 +481,29 @@ mod tests {
         let snap = parse_snapshot(&json!([mon(0, "A", 1920, 1200, 1.0, 0, true, 2, 0)]), &json!([]));
         let desk = Desk { snap, workspaces: parse_workspaces(&json!([ws(5, "A", 1)])), ..Default::default() };
         assert_eq!(desk.workspace_buttons("A"), [WsButton { id: 2, active: true }, WsButton { id: 5, active: false }]);
+    }
+
+    #[test]
+    fn keyboard_uses_the_main_device_and_reported_layout_index() {
+        let dev = |main: bool, layout: &str, idx: Option<u64>| {
+            let mut v = json!({"name": "k", "main": main, "layout": layout, "active_keymap": "English, (US)"});
+            if let Some(i) = idx { v["active_layout_index"] = json!(i); }
+            v
+        };
+        let kbs = |v: Vec<Value>| json!({"keyboards": v});
+        assert_eq!(parse_keyboard(&kbs(vec![dev(false, "de", Some(0)), dev(true, "us,es", Some(0))])).as_deref(), Some("US"));
+        assert_eq!(parse_keyboard(&kbs(vec![dev(true, "us,es", Some(1)), dev(false, "de", Some(0))])).as_deref(), Some("ES"));
+        assert_eq!(parse_keyboard(&kbs(vec![dev(true, "us", None)])).as_deref(), Some("US"));
+        assert_eq!(parse_keyboard(&kbs(vec![dev(true, "us,es", None)])).as_deref(), Some("?"));
+        assert_eq!(parse_keyboard(&kbs(vec![dev(true, "us,es", Some(5))])).as_deref(), Some("?"));
+        assert_eq!(parse_keyboard(&kbs(vec![dev(false, "", None), dev(false, "fr", Some(0))])).as_deref(), Some("FR"));
+        assert_eq!(parse_keyboard(&json!({})), None);
+        assert_eq!(parse_keyboard(&json!({"keyboards": []})), None);
+    }
+
+    #[test]
+    fn layout_events_refresh_the_desk_without_parsing_their_payload() {
+        assert!(relevant_event("activelayout>>hl-virtual-keyboard-fcitx5,English, (US)"));
+        assert!(needs_desk("activelayout>>kb,Spanish"));
     }
 }

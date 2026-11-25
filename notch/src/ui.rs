@@ -114,6 +114,8 @@ impl Hits {
     }
     fn hit_after_is_none(&self, idx: usize, p: Point) -> bool { !self.items[idx + 1..].iter().any(|(r, ..)| r.contains(p)) }
 
+    #[cfg(test)]
+    pub fn items_rect(&self, id: u32) -> Rect { self.items.iter().find(|(_, i, _)| *i == id).map(|(r, ..)| *r).expect("registered hit") }
     pub fn at(&self, p: Point) -> Option<u32> { self.items.iter().rev().find(|(r, ..)| r.contains(p)).map(|(_, id, _)| *id) }
     pub fn hovered(&self) -> Option<u32> { self.pos.and_then(|p| self.at(p)) }
     pub fn is_hover(&self, id: u32) -> bool { self.hovered() == Some(id) }

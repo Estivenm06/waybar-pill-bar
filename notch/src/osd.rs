@@ -14,7 +14,6 @@ use smithay_client_toolkit::shell::wlr_layer::{Anchor, Layer};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const DEFAULT_SMALL: (f32, f32) = (190.0, 26.0); // matches the default collapsed notch
 const BIG: (f32, f32) = (320.0, 58.0);
 const WIN: (u32, u32) = (360, 80);
 const HIDE_MS: u64 = 1500;
@@ -187,10 +186,11 @@ pub struct OsdView {
     x: f32,
     v: f32,
     t: f32,
-}
-
-impl OsdView {
-    fn small(st: &State) -> (f32, f32) { st.osd.collapsed.unwrap_or(DEFAULT_SMALL) }
+    /// Toast being drawn, the one fading out, the cross-fade progress and the eased bar fill.
+    shown: Option<Toast>,
+    prev: Option<Toast>,
+    fade: f32,
+    frac: f32,
 }
 
 impl View for OsdView {
@@ -237,6 +237,21 @@ impl View for OsdView {
             ctx.cmds.push(Cmd::Close(ctx.id));
             return false;
         }
+        // follow the pushed toast: cross-fade when its icon changes, ease the bar towards its level
+        if let Some(cur) = o.toast.clone() {
+            match &self.shown {
+                None => self.frac = cur.frac,
+                Some(s) if s.glyph != cur.glyph && animate => { self.prev = self.shown.take(); self.fade = 0.0; }
+                _ => {}
+            }
+            let k = if animate { 1.0 - (-dt * 18.0).exp() } else { 1.0 };
+            self.frac += (cur.frac - self.frac) * k;
+            self.shown = Some(cur);
+        }
+        if self.prev.is_some() {
+            self.fade = (self.fade + dt / 0.18).min(1.0);
+            if self.fade >= 1.0 { self.prev = None; }
+        }
         true
     }
 
@@ -245,18 +260,29 @@ impl View for OsdView {
     fn event(&mut self, _ev: Event, _ctx: &mut Ctx) {}
 
     fn draw(&mut self, cv: &mut Canvas, dc: &mut DrawCtx) {
-        let Some(toast) = dc.state.osd.toast.as_ref() else { return };
+        let Some(toast) = self.shown.clone() else { return };
         let pal = &dc.state.pal;
-        let (sw, sh) = Self::small(dc.state);
-        let x = self.x.clamp(0.0, 1.2);
-        let w = (sw + (BIG.0 - sw) * x).max(sw);
-        let h = (sh + (BIG.1 - sh) * x).max(sh);
-        let card = rect((WIN.0 as f32 - w) / 2.0, WIN.1 as f32 - h, w, h);
-        glass(cv, pal, card, r_all(22.0));
-        let alpha = ((x - 0.45) / 0.5).clamp(0.0, 1.0);
-        if alpha > 0.0 {
-            cv.with_alpha(alpha, |cv| draw_content(cv, pal, toast, card, self.t));
-        }
+        // appear/disappear as one unit: the card scales up from 90% and fades with the spring, no notch-size morph
+        let x = self.x.clamp(0.0, 1.0);
+        let k = crate::layout::smooth(x);
+        let (ww, wh) = cv.size();
+        let (w, h) = (BIG.0 * (0.9 + 0.1 * k), BIG.1 * (0.9 + 0.1 * k));
+        let card = rect((ww - w) / 2.0, wh - h - (1.0 - k) * 6.0, w, h);
+        cv.with_alpha(k, |cv| {
+            // opaque glass body (the OSD has no compositor blur) with a soft top sheen, no outline
+            cv.fill_rrect(card, r_all(22.0), pal.glass);
+            cv.fill_rrect(card, r_all(22.0), crate::render::vgradient(card, with_a(pal.fg_hi, 0.09), with_a(pal.fg_hi, 0.0)));
+            // a changed icon (play <-> pause) cross-fades instead of snapping
+            if let Some(prev) = &self.prev {
+                let mut p = prev.clone();
+                p.frac = self.frac;
+                cv.with_alpha(1.0 - self.fade, |cv| draw_content(cv, pal, &p, card, self.t));
+            }
+            let mut cur = toast;
+            cur.frac = self.frac;
+            let a = if self.prev.is_some() { self.fade } else { 1.0 };
+            cv.with_alpha(a, |cv| draw_content(cv, pal, &cur, card, self.t));
+        });
     }
 }
 

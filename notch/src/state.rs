@@ -47,8 +47,15 @@ pub struct WifiStatus {
 pub struct BtStatus {
     pub available: bool,
     pub on: bool,
-    /// Names of connected devices.
-    pub connected: Vec<String>,
+    /// Connected devices, each with its own live battery when it reports one.
+    pub connected: Vec<ConnectedBtDevice>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectedBtDevice {
+    pub mac: String,
+    pub name: String,
+    pub battery: Option<u8>,
 }
 
 /// Where the notch surface sits (kept current by the notch); pages that must
@@ -58,6 +65,8 @@ pub struct NotchInfo {
     pub output: Option<String>,
     /// Top-left of the notch layer surface in the output's logical coordinates.
     pub origin: (f32, f32),
+    /// Bottom edge of the collapsed notch (top margin + height): windows must start below it.
+    pub bottom: f32,
     /// Whether the card is currently expanded (target state).
     pub expanded: bool,
     /// Pointer is over the notch.
@@ -98,6 +107,9 @@ impl State {
         let (settings, _warn) = crate::config::load_settings();
         crate::theme::configure(&settings.appearance);
         let pal = Palette::current(settings.appearance.corner_radius as f32, settings.appearance.font_size as f32);
+        let mut apps = crate::apps::Apps::default();
+        apps.set_pins(&settings.pinned_apps);
+        apps.set_order(&settings.app_order);
         State {
             outputs: Vec::new(),
             settings,
@@ -106,7 +118,7 @@ impl State {
             net: Default::default(),
             sys: Default::default(),
             desk: Default::default(),
-            apps: Default::default(),
+            apps,
             media: Default::default(),
             weather: Default::default(),
             cal: Default::default(),
@@ -123,8 +135,11 @@ impl State {
         }
     }
 
-    /// Re-derive the palette after a settings/theme change.
+    /// Re-derive the palette after a settings/theme change. Settings were replaced, so the pinned launchers
+    /// are re-synced too.
     pub fn refresh_palette(&mut self) {
+        self.apps.set_pins(&self.settings.pinned_apps);
+        self.apps.set_order(&self.settings.app_order);
         crate::theme::configure(&self.settings.appearance);
         let a = &self.settings.appearance;
         self.pal = Palette::current(a.corner_radius as f32, a.font_size as f32);

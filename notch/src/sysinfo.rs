@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const MAX_HIST: usize = 50;
@@ -79,14 +79,15 @@ pub struct Sys {
     toggle_seq: u64,
     nl_known: bool,
     dnd_known: bool,
+    /// A sound-preference save is running.
+    pub notification_sounds_pending: bool,
 }
 
 impl Sys {
-    /// Add a copied text to the history (unless a clear is running) and persist it. True when the list changed.
+    /// Add a copied text to the visible history (unless a clear is running). Memory only: the clipboard service owns
+    /// the history file. True when the list changed.
     pub fn clip_push(&mut self, s: String) -> bool {
-        if self.clip_clearing || !push_history(&mut self.clip, s) { return false; }
-        if let Err(e) = save_history_at(&hist_path(), &self.clip) { eprintln!("clipboard history: {e}"); }
-        true
+        !self.clip_clearing && push_history(&mut self.clip, s)
     }
 
     /// Home chip text for the newest copy.
@@ -152,28 +153,13 @@ pub fn set_active(on: bool) { GATE.set(on); }
 pub fn start(poster: &Poster) {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) { return; }
-    load_history(poster);
+    let _ = CLIP.set(clip_service(poster, ClipConfig::system()));
     power_worker(poster.clone());
     volume_worker(poster.clone());
     net_worker(poster.clone());
-    clipboard_worker(poster.clone());
     stats_worker(poster.clone());
     usage_worker(poster.clone());
     controls_worker(poster.clone());
-}
-
-fn load_history(poster: &Poster) {
-    let poster = poster.clone();
-    std::thread::spawn(move || {
-        let hist = load_history_at(&hist_path()).unwrap_or_else(|e| { eprintln!("clipboard history: {e}"); Vec::new() });
-        poster.post(move |st: &mut State, _| {
-            // copies that arrived before the file was read stay on top
-            let mut merged = std::mem::take(&mut st.sys.clip);
-            for h in hist { if !merged.contains(&h) { merged.push(h); } }
-            merged.truncate(MAX_HIST);
-            st.sys.clip = merged;
-        });
-    });
 }
 
 // ── battery ─────────────────────────────────────────────────────────────────
@@ -338,7 +324,7 @@ fn net_worker(poster: Poster) {
             let b = crate::net::bt_status();
             if bt.as_ref() != Some(&b) {
                 bt = Some(b.clone());
-                poster.post(move |st: &mut State, _| st.status.bt = b);
+                poster.post(move |st: &mut State, _| crate::net::apply_bt_status(st, b));
             }
             GATE.sleep(Duration::from_secs(if GATE.active() { 5 } else { 12 }));
         }
@@ -346,34 +332,225 @@ fn net_worker(poster: Poster) {
 }
 
 // ── clipboard ───────────────────────────────────────────────────────────────
+//
+// One coordinator thread owns the history mirror, every history-file read/write, and the `wl-paste --watch` child
+// (its own process group) with the reader thread that frames its output. The UI thread only mirrors what the
+// coordinator posts, tagged with a generation that Clear bumps, so nothing read before a Clear can reappear after it.
 
-fn clipboard_worker(poster: Poster) {
-    std::thread::spawn(move || loop {
-        // wl-paste runs the command on every clipboard change; NUL terminates each entry.
-        let child = Command::new("wl-paste")
-            .args(["--type", "text", "--watch", "sh", "-c", "cat; printf '\\0'"])
-            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
-        if let Ok(mut child) = child {
-            if let Some(mut out) = child.stdout.take() {
-                let mut acc: Vec<u8> = Vec::new();
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = out.read(&mut buf) {
-                    if n == 0 { break; }
-                    for &b in &buf[..n] {
-                        if b == 0 {
-                            let s = String::from_utf8_lossy(&acc).to_string();
-                            acc.clear();
-                            poster.post(move |st: &mut State, _| { st.sys.clip_push(s); });
-                        } else if acc.len() < 20000 {
-                            acc.push(b);
-                        }
-                    }
-                }
-            }
-            let _ = child.wait();
+/// Longest selection kept, in bytes. The watcher's shell applies it before NULs are removed.
+const CLIP_MAX_BYTES: usize = 20000;
+/// Run by `wl-paste --watch` for every selection: cap, drain what `head` left (wl-paste must never see a closed pipe),
+/// strip NULs so the payload cannot forge a frame delimiter, then emit the single NUL that ends the frame.
+const CLIP_FILTER: &str = "{ head -c 20000; cat >/dev/null; } | tr -d '\\000'; printf '\\0'";
+
+struct ClipConfig {
+    history: PathBuf,
+    /// Program and arguments of the watcher; each selection arrives as one NUL-terminated frame on its stdout.
+    watch: Vec<String>,
+    /// Program and arguments that clear the system selection.
+    clear: Vec<String>,
+    restart_delay: Duration,
+    /// Test hook: the coordinator waits here after capturing its startup generation and before reading the file.
+    #[cfg(test)]
+    startup_gate: Option<Arc<std::sync::Barrier>>,
+}
+
+impl ClipConfig {
+    fn system() -> ClipConfig {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect();
+        ClipConfig {
+            history: hist_path(),
+            watch: v(&["wl-paste", "--type", "text", "--watch", "sh", "-c", CLIP_FILTER]),
+            clear: v(&["wl-copy", "--clear"]),
+            restart_delay: Duration::from_secs(2),
+            #[cfg(test)]
+            startup_gate: None,
         }
-        std::thread::sleep(Duration::from_secs(2));
-    });
+    }
+}
+
+enum ClipCommand {
+    Frame { generation: u64, text: String },
+    Applied { generation: u64 },
+    Clear { generation: u64 },
+    Resume { generation: u64 },
+    Ended { generation: u64 },
+    #[cfg(test)]
+    Shutdown,
+}
+
+enum ReaderRelease { Next, Stop }
+
+#[derive(Clone)]
+struct ClipService {
+    generation: Arc<AtomicU64>,
+    tx: mpsc::Sender<ClipCommand>,
+}
+
+static CLIP: OnceLock<ClipService> = OnceLock::new();
+
+fn clip_service(poster: &Poster, cfg: ClipConfig) -> ClipService {
+    let (tx, rx) = mpsc::channel();
+    let svc = ClipService { generation: Arc::new(AtomicU64::new(0)), tx };
+    let startup = svc.generation.load(Ordering::SeqCst);
+    let (poster, inner) = (poster.clone(), svc.clone());
+    std::thread::spawn(move || clip_coordinator(cfg, poster, inner, startup, rx));
+    svc
+}
+
+struct Watcher {
+    generation: u64,
+    child: std::process::Child,
+    release: mpsc::Sender<ReaderRelease>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl Watcher {
+    fn spawn(cfg: &ClipConfig, generation: u64, tx: &mpsc::Sender<ClipCommand>) -> Option<Watcher> {
+        use std::os::unix::process::CommandExt;
+        let (prog, args) = cfg.watch.split_first()?;
+        let mut child = Command::new(prog).args(args)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0).spawn().ok()?;
+        let Some(out) = child.stdout.take() else { kill_group(&mut child); return None };
+        let (release, rx) = mpsc::channel();
+        let tx = tx.clone();
+        let reader = std::thread::spawn(move || clip_reader(out, generation, tx, rx));
+        Some(Watcher { generation, child, release, reader })
+    }
+
+    /// Stop the reader, kill the whole watcher process group (so no descendant keeps stdout open), reap, join.
+    fn stop(mut self) {
+        let _ = self.release.send(ReaderRelease::Stop);
+        kill_group(&mut self.child);
+        let _ = self.reader.join();
+    }
+}
+
+/// SIGKILL the child's process group, then reap the child. Called before the reap, so the group id cannot be reused.
+fn kill_group(child: &mut std::process::Child) {
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+    let _ = child.wait();
+}
+
+/// Owns the watcher's stdout. Sends one frame, then waits to be released, so at most one selection is outstanding.
+/// Bytes read past a frame's terminator are kept for the next frame; an oversized frame is dropped through its end.
+fn clip_reader(mut out: std::process::ChildStdout, generation: u64, tx: mpsc::Sender<ClipCommand>, release: mpsc::Receiver<ReaderRelease>) {
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut frame: Vec<u8> = Vec::new();
+        let mut oversized = false;
+        loop {
+            let end = carry.iter().position(|&b| b == 0);
+            let piece_len = end.unwrap_or(carry.len());
+            if frame.len() + piece_len > CLIP_MAX_BYTES { oversized = true; } else { frame.extend_from_slice(&carry[..piece_len]); }
+            if let Some(i) = end { carry.drain(..=i); break; }
+            carry.clear();
+            match out.read(&mut buf) {
+                Ok(n) if n > 0 => carry.extend_from_slice(&buf[..n]),
+                _ => { let _ = tx.send(ClipCommand::Ended { generation }); return; }
+            }
+        }
+        if oversized { continue; }
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        if tx.send(ClipCommand::Frame { generation, text }).is_err() { return; }
+        match release.recv() { Ok(ReaderRelease::Next) => {} _ => return }
+    }
+}
+
+fn clip_coordinator(cfg: ClipConfig, poster: Poster, svc: ClipService, startup: u64, rx: mpsc::Receiver<ClipCommand>) {
+    let ClipService { generation: shared, tx } = svc;
+    #[cfg(test)]
+    if let Some(gate) = &cfg.startup_gate { gate.wait(); }
+    let mut mirror = load_history_at(&cfg.history).unwrap_or_else(|e| { eprintln!("clipboard history: {e}"); Vec::new() });
+    mirror.truncate(MAX_HIST);
+    {
+        let (snapshot, shared, ack) = (mirror.clone(), shared.clone(), tx.clone());
+        poster.post(move |st: &mut State, _| {
+            if shared.load(Ordering::SeqCst) == startup && !st.sys.clip_clearing { st.sys.clip = snapshot; }
+            let _ = ack.send(ClipCommand::Applied { generation: startup });
+        });
+    }
+    let mut watcher: Option<Watcher> = None;
+    let mut restart_at: Option<Instant> = None;
+    let mut starting = true;
+    // (Re)start capture for `generation`, or schedule a retry.
+    let begin = |watcher: &mut Option<Watcher>, restart_at: &mut Option<Instant>, generation: u64| {
+        *watcher = Watcher::spawn(&cfg, generation, &tx);
+        *restart_at = if watcher.is_none() { Some(Instant::now() + cfg.restart_delay) } else { None };
+    };
+    loop {
+        let cmd = match restart_at {
+            Some(t) => match rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
+                Ok(c) => Some(c),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() { Ok(c) => Some(c), Err(_) => break },
+        };
+        let current = shared.load(Ordering::SeqCst);
+        let Some(cmd) = cmd else { begin(&mut watcher, &mut restart_at, current); continue };
+        match cmd {
+            ClipCommand::Applied { generation } if generation == current => match &watcher {
+                Some(w) if w.generation == generation => { let _ = w.release.send(ReaderRelease::Next); }
+                None if starting && restart_at.is_none() => { starting = false; begin(&mut watcher, &mut restart_at, current); }
+                _ => {}
+            },
+            ClipCommand::Resume { generation } if generation == current && watcher.is_none() => {
+                starting = false;
+                begin(&mut watcher, &mut restart_at, current);
+            }
+            ClipCommand::Frame { generation, text } if generation == current => {
+                let Some(w) = watcher.as_ref().filter(|w| w.generation == generation) else { continue };
+                if !push_history(&mut mirror, text.clone()) { let _ = w.release.send(ReaderRelease::Next); continue; }
+                if let Err(e) = save_history_at(&cfg.history, &mirror) { eprintln!("clipboard history: {e}"); }
+                let (shared, ack) = (shared.clone(), tx.clone());
+                poster.post(move |st: &mut State, _| {
+                    if shared.load(Ordering::SeqCst) == generation && !st.sys.clip_clearing { st.sys.clip_push(text); }
+                    let _ = ack.send(ClipCommand::Applied { generation });
+                });
+            }
+            ClipCommand::Ended { generation } if generation == current && watcher.as_ref().is_some_and(|w| w.generation == generation) => {
+                if let Some(w) = watcher.take() { w.stop(); }
+                restart_at = Some(Instant::now() + cfg.restart_delay);
+            }
+            ClipCommand::Clear { generation } => {
+                if let Some(w) = watcher.take() { w.stop(); }
+                restart_at = None;
+                starting = false;
+                mirror.clear();
+                let disk_cleared = match save_history_at(&cfg.history, &[]) {
+                    Ok(()) => true,
+                    Err(e) => { eprintln!("clipboard history: {e}"); false }
+                };
+                let (message, success) = system_clear(&cfg.clear);
+                let (mut message, success) = clear_result(disk_cleared, message, success);
+                if !success { message.push_str("; clipboard capture paused until Clear is retried"); }
+                let (shared, ack) = (shared.clone(), tx.clone());
+                poster.post(move |st: &mut State, _| {
+                    if shared.load(Ordering::SeqCst) != generation { return; }
+                    st.sys.clip_clearing = false;
+                    st.sys.clip_status = Some(ClipStatus { message, success });
+                    if success { let _ = ack.send(ClipCommand::Resume { generation }); }
+                });
+            }
+            #[cfg(test)]
+            ClipCommand::Shutdown => break,
+            _ => {} // a stale generation: Frame/Applied/Ended from before the latest Clear
+        }
+    }
+    if let Some(w) = watcher.take() { w.stop(); }
+}
+
+/// Clear the Wayland selection. A missing program is a reported unavailable system clipboard, not a success.
+fn system_clear(cmd: &[String]) -> (String, bool) {
+    let Some((prog, args)) = cmd.split_first() else { return ("History cleared; system clipboard unavailable".to_string(), false) };
+    if !on_path(prog) { return ("History cleared; system clipboard unavailable".to_string(), false); }
+    match Command::new(prog).args(args).status() {
+        Ok(s) if s.success() => ("Clipboard cleared".to_string(), true),
+        Ok(s) => (format!("History cleared; {prog} --clear failed ({s})"), false),
+        Err(e) => (format!("History cleared; {prog} failed: {e}"), false),
+    }
 }
 
 /// Insert `s` at the front: trimmed of trailing newlines, blank entries ignored, duplicates moved up, capped.
@@ -400,34 +577,23 @@ pub fn clip_copy(text: &str) {
     }
 }
 
-/// Clear the in-memory history, the history file and the Wayland selection; copies still queued from before the
-/// clear are dropped until the system clipboard has been cleared. The outcome lands in `sys.clip_status`.
+/// Clear the history (memory, file) and the Wayland selection. The UI half runs at once: it bumps the shared
+/// generation, empties the visible list and stops accepting captures; the clipboard service then stops the watcher,
+/// persists `[]` and clears the selection, and its tagged result lands in `sys.clip_status`. Capture resumes only
+/// after a fully successful clear. A clear already in progress absorbs further requests.
 pub fn clip_clear(poster: &Poster) {
-    let p = poster.clone();
+    if let Some(svc) = CLIP.get() { clip_clear_with(svc, poster); }
+}
+
+fn clip_clear_with(svc: &ClipService, poster: &Poster) {
+    let svc = svc.clone();
     poster.post(move |st: &mut State, _| {
+        if st.sys.clip_clearing { return; }
+        let generation = svc.generation.fetch_add(1, Ordering::SeqCst) + 1;
         st.sys.clip_clearing = true;
         st.sys.clip_status = None;
         st.sys.clip.clear();
-        let disk_cleared = match save_history_at(&hist_path(), &[]) {
-            Ok(()) => true,
-            Err(e) => { eprintln!("clipboard history: {e}"); false }
-        };
-        std::thread::spawn(move || {
-            let (message, success) = if !on_path("wl-copy") {
-                ("History cleared; system clipboard unavailable".to_string(), false)
-            } else {
-                match Command::new("wl-copy").arg("--clear").status() {
-                    Ok(s) if s.success() => ("Clipboard cleared".to_string(), true),
-                    Ok(s) => (format!("History cleared; wl-copy --clear failed ({s})"), false),
-                    Err(e) => (format!("History cleared; wl-copy failed: {e}"), false),
-                }
-            };
-            let (message, success) = clear_result(disk_cleared, message, success);
-            p.post(move |st: &mut State, _| {
-                st.sys.clip_clearing = false;
-                st.sys.clip_status = Some(ClipStatus { message, success });
-            });
-        });
+        let _ = svc.tx.send(ClipCommand::Clear { generation });
     });
 }
 
@@ -666,6 +832,27 @@ pub fn toggle_dnd(poster: &Poster) {
     poster.post(move |st: &mut State, _| st.sys.set_dnd(on));
 }
 
+/// Flip notification sounds (`notch.behavior.notification_sounds`, not DND). The save runs off the UI thread; the
+/// tile changes only once it succeeded, and clicks while a save is pending are ignored.
+pub fn toggle_notification_sounds(st: &mut State, poster: &Poster) {
+    if st.sys.notification_sounds_pending { return; }
+    st.sys.notification_sounds_pending = true;
+    st.sys.message = None;
+    let poster = poster.clone();
+    std::thread::spawn(move || {
+        let r = crate::config::toggle_notification_sounds();
+        poster.post(move |st: &mut State, _| apply_notification_sounds_result(st, r));
+    });
+}
+
+fn apply_notification_sounds_result(st: &mut State, r: Result<bool, String>) {
+    st.sys.notification_sounds_pending = false;
+    match r {
+        Ok(on) => st.settings.behavior.notification_sounds = on,
+        Err(e) => st.sys.message = Some(format!("Notification sounds not saved: {e}")),
+    }
+}
+
 /// Run one capture helper. The caller collapses the notch and waits for the collapsed frames first.
 /// `capture_pending` is set until the helper exits; a failure ends up in `capture_error`.
 pub fn capture(poster: &Poster, action: CaptureAction) {
@@ -703,6 +890,21 @@ pub fn lock_screen(poster: &Poster) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_toggle_result_changes_only_the_sound_setting() {
+        let mut st = State::new();
+        st.sys.notification_sounds_pending = true;
+        st.sys.dnd = true;
+        st.sys.message = Some("old".into());
+        apply_notification_sounds_result(&mut st, Ok(true));
+        assert!(st.settings.behavior.notification_sounds && !st.sys.notification_sounds_pending && st.sys.dnd);
+        st.sys.notification_sounds_pending = true;
+        apply_notification_sounds_result(&mut st, Err("disk full".into()));
+        assert!(st.settings.behavior.notification_sounds, "failure leaves the saved value");
+        assert!(!st.sys.notification_sounds_pending);
+        assert_eq!(st.sys.message.as_deref(), Some("Notification sounds not saved: disk full"));
+    }
 
     #[test]
     fn history_push_dedups_trims_and_caps() {
@@ -956,5 +1158,213 @@ mod history_tests {
         assert_eq!(msg, "Clipboard history file could not be cleared");
         assert_eq!(clear_result(true, "Clipboard cleared".into(), true), ("Clipboard cleared".to_string(), true));
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod clip_service_tests {
+    use super::*;
+    use crate::testkit::{Pump, Rig};
+
+    struct Env { dir: PathBuf, hist: PathBuf, rig: Rig, pump: Pump, svc: ClipService }
+
+    impl Drop for Env {
+        fn drop(&mut self) { let _ = self.svc.tx.send(ClipCommand::Shutdown); }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("clip-svc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn config(dir: &Path, script: &str, clear: &[&str]) -> ClipConfig {
+        ClipConfig {
+            history: dir.join("data").join("clipboard.json"),
+            watch: vec!["sh".into(), "-c".into(), script.into()],
+            clear: clear.iter().map(|s| s.to_string()).collect(),
+            restart_delay: Duration::from_secs(30),
+            startup_gate: None,
+        }
+    }
+
+    fn env_with(dir: PathBuf, cfg: ClipConfig) -> Env {
+        let (rig, pump) = Rig::pumped();
+        let hist = cfg.history.clone();
+        let svc = clip_service(&rig.poster, cfg);
+        Env { dir, hist, rig, pump, svc }
+    }
+
+    fn env(tag: &str, script: &str, clear: &[&str]) -> Env {
+        let dir = tmp(tag);
+        let cfg = config(&dir, script, clear);
+        env_with(dir, cfg)
+    }
+
+    impl Env {
+        fn saved(&self) -> Vec<String> { load_history_at(&self.hist).unwrap_or_default() }
+        fn wait_saved(&self, want: &[&str]) {
+            let end = Instant::now() + Duration::from_secs(10);
+            while self.saved() != want {
+                assert!(Instant::now() < end, "history file never became {want:?}, is {:?}", self.saved().len());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn until(&mut self, what: &str, cond: impl Fn(&State) -> bool) { self.pump.until(&mut self.rig.st, what, cond); }
+        fn drain(&mut self, ms: u64) { self.pump.dispatch(&mut self.rig.st, ms); }
+        fn clear(&mut self) { clip_clear_with(&self.svc, &self.rig.poster); }
+    }
+
+    /// First watcher run emits 1, 2, 3; every later run emits `fresh`.
+    fn staged(dir: &Path) -> String {
+        format!("if [ -e {d}/ran ]; then printf 'fresh\\000'; else touch {d}/ran; printf '1\\0002\\0003\\000'; fi; sleep 30", d = dir.display())
+    }
+
+    fn filtered(source: &str) -> String { format!("{source} | ( {CLIP_FILTER} ); sleep 30") }
+
+    #[test]
+    fn nul_flood_yields_one_bounded_selection() {
+        let mut e = env("flood", &filtered("yes x | head -n 100000 | tr '\\n' '\\000'"), &["true"]);
+        let want = "x".repeat(CLIP_MAX_BYTES / 2);
+        e.until("the capped selection", |st| st.sys.clip.len() == 1);
+        assert_eq!(e.rig.st.sys.clip, [want.clone()]);
+        e.drain(300);
+        assert_eq!(e.rig.st.sys.clip, [want.clone()]);
+        assert_eq!(e.saved(), [want]);
+    }
+
+    #[test]
+    fn payload_size_boundaries_and_embedded_nuls() {
+        for (n, tag) in [(19_999usize, "b1"), (20_000, "b2"), (20_001, "b3")] {
+            let dir = tmp(tag);
+            let src = dir.join("payload");
+            std::fs::write(&src, vec![b'a'; n]).unwrap();
+            let cfg = config(&dir, &filtered(&format!("cat {}", src.display())), &["true"]);
+            let mut e = env_with(dir, cfg);
+            e.until("the selection", |st| !st.sys.clip.is_empty());
+            assert_eq!(e.rig.st.sys.clip[0].len(), n.min(CLIP_MAX_BYTES), "payload of {n} bytes");
+            assert_eq!(e.saved()[0].len(), n.min(CLIP_MAX_BYTES));
+        }
+        // a multi-byte character cut by the cap becomes a replacement character, never invalid text
+        let dir = tmp("utf8");
+        let src = dir.join("payload");
+        let mut p = vec![b'a'; CLIP_MAX_BYTES - 1];
+        p.extend_from_slice("é".as_bytes());
+        std::fs::write(&src, p).unwrap();
+        let cfg = config(&dir, &filtered(&format!("cat {}", src.display())), &["true"]);
+        let mut e = env_with(dir, cfg);
+        e.until("the selection", |st| !st.sys.clip.is_empty());
+        assert!(e.rig.st.sys.clip[0].ends_with('\u{FFFD}'));
+        // embedded NULs are removed, not treated as delimiters
+        let dir = tmp("nul");
+        let src = dir.join("payload");
+        std::fs::write(&src, b"ab\0cd").unwrap();
+        let cfg = config(&dir, &filtered(&format!("cat {}", src.display())), &["true"]);
+        let mut e = env_with(dir, cfg);
+        e.until("the selection", |st| !st.sys.clip.is_empty());
+        e.drain(200);
+        assert_eq!(e.rig.st.sys.clip, ["abcd"]);
+    }
+
+    #[test]
+    fn frames_split_across_reads_stay_intact() {
+        let mut e = env("split", "printf 'a\\303'; sleep 0.3; printf '\\251b\\000c\\000'; sleep 30", &["true"]);
+        e.until("both frames", |st| st.sys.clip.len() == 2);
+        assert_eq!(e.rig.st.sys.clip, ["c", "a\u{e9}b"]);
+    }
+
+    #[test]
+    fn stalled_ui_leaves_one_selection_outstanding() {
+        let mut e = env("stall", "printf '1\\0002\\0003\\000'; sleep 30", &["true"]);
+        e.drain(500); // applies the startup snapshot; its acknowledgement starts the watcher
+        e.wait_saved(&["1"]);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(e.saved(), ["1"], "later selections wait for the UI to apply the first");
+        e.until("all three", |st| st.sys.clip.len() == 3);
+        assert_eq!(e.rig.st.sys.clip, ["3", "2", "1"]);
+        e.wait_saved(&["3", "2", "1"]);
+    }
+
+    #[test]
+    fn clear_with_a_pending_acknowledgement_finishes_and_only_fresh_text_follows() {
+        let dir = tmp("clear-pending");
+        let script = staged(&dir);
+        let cfg = config(&dir, &script, &["true"]);
+        let mut e = env_with(dir, cfg);
+        e.drain(500); // applies the startup snapshot; its acknowledgement starts the watcher
+        e.wait_saved(&["1"]); // the reader is now waiting for the UI, which has not run yet
+        e.clear();
+        e.until("the clear result", |st| st.sys.clip_status.is_some());
+        let status = e.rig.st.sys.clip_status.clone().unwrap();
+        assert!(status.success, "{}", status.message);
+        e.until("fresh capture after the clear", |st| st.sys.clip == ["fresh"]);
+        e.drain(300);
+        assert_eq!(e.rig.st.sys.clip, ["fresh"]);
+        e.wait_saved(&["fresh"]);
+    }
+
+    #[test]
+    fn history_read_before_a_clear_cannot_return_after_it() {
+        let dir = tmp("late-load");
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let mut cfg = config(&dir, "sleep 30", &["true"]);
+        cfg.startup_gate = Some(gate.clone());
+        save_history_at(&cfg.history, &["old secret".to_string()]).unwrap();
+        let mut e = env_with(dir, cfg);
+        e.clear();
+        e.drain(100); // the clear bumps the generation while the coordinator is still before its file read
+        assert!(e.rig.st.sys.clip_clearing);
+        gate.wait();
+        e.until("the clear result", |st| st.sys.clip_status.is_some());
+        e.drain(300);
+        assert!(e.rig.st.sys.clip.is_empty());
+        assert!(e.saved().is_empty());
+    }
+
+    fn alive(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s.rsplit(") ").next().is_some_and(|rest| !rest.starts_with('Z')),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn watcher_descendants_cannot_hold_shutdown_open() {
+        let dir = tmp("group");
+        let script = format!("sleep 30 & echo $! > {d}/pid; printf '1\\000'; sleep 30", d = dir.display());
+        let cfg = config(&dir, &script, &["true"]);
+        let mut e = env_with(dir, cfg);
+        e.until("the first selection", |st| st.sys.clip == ["1"]);
+        let pid: u32 = std::fs::read_to_string(e.dir.join("pid")).unwrap().trim().parse().unwrap();
+        assert!(alive(pid));
+        e.clear();
+        e.until("the clear result", |st| st.sys.clip_status.is_some());
+        let end = Instant::now() + Duration::from_secs(3);
+        while alive(pid) {
+            assert!(Instant::now() < end, "the watcher's background child survived the clear");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn failed_clear_pauses_capture_and_a_retry_resumes_it() {
+        let dir = tmp("retry");
+        let script = staged(&dir);
+        let ok = format!("test -e {}/ok", dir.display());
+        let cfg = config(&dir, &script, &["sh", "-c", &ok]);
+        let mut e = env_with(dir, cfg);
+        e.until("the first run", |st| st.sys.clip.len() == 3);
+        e.clear();
+        e.until("the failure", |st| st.sys.clip_status.is_some());
+        let status = e.rig.st.sys.clip_status.clone().unwrap();
+        assert!(!status.success && status.message.contains("clipboard capture paused until Clear is retried"), "{}", status.message);
+        e.drain(500);
+        assert!(e.rig.st.sys.clip.is_empty() && e.saved().is_empty(), "capture stays paused");
+        std::fs::write(e.dir.join("ok"), b"").unwrap();
+        e.clear();
+        e.until("the retry", |st| st.sys.clip_status.as_ref().is_some_and(|s| s.success));
+        e.until("capture resumed", |st| st.sys.clip == ["fresh"]);
+        e.wait_saved(&["fresh"]);
     }
 }

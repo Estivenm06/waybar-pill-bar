@@ -1,5 +1,6 @@
 mod app_status;
 mod apps;
+mod apps_page;
 mod audio;
 mod art_cache;
 mod art_http;
@@ -7,6 +8,8 @@ mod calendar;
 mod config;
 mod controls;
 mod desktop;
+mod dock;
+mod desktop_entries;
 mod gcal;
 mod glue;
 mod home;

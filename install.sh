@@ -63,6 +63,7 @@ python3 "$SRC/scripts/waybar-pill-plugin" validate-checkout "$ROOT"
 
 # Build products and staging stay outside the plugin directory, which Omarchy watches for changes.
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/waybar-notch"
+python3 "$STATEPY" cache-prepare || { echo "The build cache $CACHE is not trustworthy; nothing was built or downloaded. Fix its ownership, links or permissions and retry."; exit 1; }
 export CARGO_TARGET_DIR="$CACHE/source-target-v1"
 SRC_BIN="$CARGO_TARGET_DIR/release/waybar-notch"
 PRE_BIN="$CACHE/prebuilt/waybar-notch"
@@ -94,13 +95,11 @@ else
     fi
     BIN="$SRC_BIN"
     [ -x "$BIN" ] || { echo "The notch binary is missing: $BIN"; progress "Setup failed: no notch binary. See the provision log."; exit 1; }
-    mkdir -p -m 700 "$CACHE"
-    printf '%s\n' "$SRC_HASH" > "$STAMP"
+    python3 "$STATEPY" cache-stamp "$SRC_HASH" || { echo "Could not record the build stamp safely."; exit 1; }
   fi
 fi
 progress "Installing the bar files…"
 
-mkdir -p -m 700 "$CACHE"
 STAGE=$(mktemp -d "$CACHE/stage.XXXXXX")
 BEGUN=0; DONE=0
 cleanup() {

@@ -17,7 +17,9 @@ use crate::ui::{Hits, Palette, glass};
 use crate::wayland::{Button, Cmd, Ctx, Cursor, DrawCtx, Event as UiEvent, KbMode, PanelSpec, Poster, View};
 use smithay_client_toolkit::shell::wlr_layer::{Anchor, Layer};
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command as Proc, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +47,58 @@ pub struct Note {
     pub actions: Vec<(String, String)>, // (key, label)
     pub urgency: u8,                    // 0 low, 1 normal, 2 critical
     pub timeout_ms: i32,                // -1 default, 0 persistent
+    pub suppress_sound: bool,           // the sender's `suppress-sound` hint
+}
+
+// ------------------------------------------------------------------ notification sound
+
+const SOUND_FILE: &str = "/usr/share/sounds/freedesktop/stereo/message.oga";
+const SOUND_LIMIT: Duration = Duration::from_secs(3);
+
+/// Whether a card that passed the Do-Not-Disturb gate should beep: the switch is on, the urgency is normal or
+/// critical, the sender did not ask for silence and no live card with that id exists (updates stay silent).
+pub fn should_play(enabled: bool, n: &Note, has_live_card: bool) -> bool {
+    enabled && n.urgency >= 1 && !n.suppress_sound && !has_live_card
+}
+
+/// One bounded request slot to a single playback worker: while a sound plays, further requests are dropped
+/// rather than queued.
+pub struct SoundQueue(mpsc::SyncSender<()>);
+
+impl SoundQueue {
+    /// `play` runs on the worker thread; its error is logged once, never repeated, and never reaches the UI.
+    pub fn start(play: impl Fn() -> io::Result<()> + Send + 'static) -> SoundQueue {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        let _ = std::thread::Builder::new().name("notify-sound".into()).spawn(move || {
+            let mut logged = false;
+            while rx.recv().is_ok() {
+                if let Err(e) = play() {
+                    if !logged { logged = true; eprintln!("waybar-notch: notification sound unavailable: {e}"); }
+                }
+                // requests that arrived during playback are dropped, never replayed
+                while rx.try_recv().is_ok() {}
+            }
+        });
+        SoundQueue(tx)
+    }
+
+    /// Non-blocking; a full slot or a dead worker silently drops the request.
+    pub fn request(&self) { let _ = self.0.try_send(()); }
+}
+
+/// Play the freedesktop "message" sound with PipeWire, killing the player after 3 seconds.
+pub fn play_message_sound() -> io::Result<()> {
+    if !Path::new(SOUND_FILE).is_file() { return Err(io::Error::new(io::ErrorKind::NotFound, format!("{SOUND_FILE} is missing"))); }
+    let mut child = Proc::new("pw-play").arg(SOUND_FILE).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let end = Instant::now() + SOUND_LIMIT;
+    loop {
+        match child.try_wait()? {
+            Some(s) if s.success() => return Ok(()),
+            Some(s) => return Err(io::Error::other(format!("pw-play exited with {s}"))),
+            None if Instant::now() >= end => { let _ = child.kill(); let _ = child.wait(); return Ok(()); }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 pub fn dnd_path() -> String {
@@ -263,6 +317,7 @@ pub struct Notes {
     gens: IconGenerations,
     icons: Option<IconWorker>,
     relay: Option<mpsc::Sender<Command>>,
+    sound: Option<SoundQueue>,
     /// Fullscreen: hide the stack (timers keep running).
     pub hidden: bool,
     /// Output the stack appears on (the notch's destination); `None` = compositor's choice.
@@ -282,6 +337,9 @@ impl Notes {
 
     /// Number of cards that are not sliding out.
     fn active(&self) -> usize { self.cards.iter().filter(|c| !c.closing).count() }
+
+    /// A live (not sliding out) card with this id exists.
+    fn has_live_card(&self, id: u32) -> bool { self.cards.iter().any(|c| c.note.id == id && !c.closing) }
 
     pub fn show(&mut self, n: Note, cmds: &mut Vec<Cmd>) {
         // a replaces_id update swaps the card in place of the old one; the old card goes away synchronously
@@ -358,9 +416,17 @@ impl Notes {
 /// Handle one relay event on the UI thread (see `dispatch`).
 fn handle_event(st: &mut State, cmds: &mut Vec<Cmd>, ev: Event) {
     let Some(relay) = st.notes.relay.clone() else { return };
+    let sounds = st.settings.behavior.notification_sounds;
     let cell = std::cell::RefCell::new((&mut st.notes, cmds));
     dispatch(ev, dnd_on, &relay,
-        |n| { let mut g = cell.borrow_mut(); let (notes, cmds) = &mut *g; notes.show(n, cmds); },
+        |n| {
+            let mut g = cell.borrow_mut();
+            let (notes, cmds) = &mut *g;
+            // decided before the card replaces an older one with the same id
+            let play = should_play(sounds, &n, notes.has_live_card(n.id));
+            notes.show(n, cmds);
+            if play { if let Some(q) = &notes.sound { q.request(); } }
+        },
         |id| cell.borrow_mut().0.close(id, REASON_CLOSED, false));
 }
 
@@ -371,9 +437,11 @@ pub fn start(shell_pid: i32, poster: &Poster) -> std::io::Result<()> {
     let (ftx, frx) = mpsc::channel::<String>();
     let cmds = notification_relay::start(shell_pid, ftx, etx)?;
     let (worker, done) = IconWorker::start(load_icon);
+    let sound = SoundQueue::start(play_message_sound);
     poster.post(move |st, _| {
         st.notes.relay = Some(cmds);
         st.notes.icons = Some(worker);
+        st.notes.sound = Some(sound);
     });
     let p = poster.clone();
     std::thread::spawn(move || {
@@ -618,7 +686,7 @@ mod tests {
     }
 
     fn note(id: u32, urgency: u8) -> Note {
-        Note { id, app: "A".into(), icon: String::new(), summary: "S".into(), body: "B".into(), actions: Vec::new(), urgency, timeout_ms: -1 }
+        Note { id, app: "A".into(), icon: String::new(), summary: "S".into(), body: "B".into(), actions: Vec::new(), urgency, timeout_ms: -1, suppress_sound: false }
     }
 
     fn tiny() -> DecodedImage { DecodedImage { width: 1, height: 1, rgba: vec![0u8; 4] } }
@@ -635,6 +703,50 @@ mod tests {
             Command::Action { id, key } => format!("action {id} {key}"),
         }).collect();
         (shown.into_inner(), closed.into_inner(), cmds)
+    }
+
+    fn sounds(enabled: bool, urgency: u8, suppress: bool, live: bool) -> bool {
+        should_play(enabled, &Note { suppress_sound: suppress, ..note(1, urgency) }, live)
+    }
+
+    #[test]
+    fn sound_policy_is_switch_urgency_hint_and_freshness() {
+        assert!(sounds(true, 1, false, false) && sounds(true, 2, false, false));
+        assert!(!sounds(false, 1, false, false), "switch off");
+        assert!(!sounds(true, 0, false, false), "low urgency");
+        assert!(!sounds(true, 1, true, false), "suppress-sound");
+        assert!(!sounds(true, 1, false, true), "update of a live card");
+    }
+
+    #[test]
+    fn sound_only_follows_the_dnd_gate_and_updates_never_repeat() {
+        // dispatch already drops DND-rejected notes before `show`, so the sound decision in `show` never sees them
+        let (rtx, _rrx) = mpsc::channel();
+        let shown = std::cell::Cell::new(0);
+        dispatch(Event::Notify { seq: 1, note: note(3, 1) }, || true, &rtx, |_| shown.set(shown.get() + 1), |_| {});
+        assert_eq!(shown.get(), 0);
+        let mut notes = Notes::default();
+        let mut cmds = Vec::new();
+        notes.show(note(5, 1), &mut cmds);
+        assert!(notes.has_live_card(5) && !notes.has_live_card(6));
+    }
+
+    #[test]
+    fn bursts_never_build_a_backlog_and_failures_do_not_stop_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        let q = SoundQueue::start(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(150));
+            Err(io::Error::other("player failed"))
+        });
+        for _ in 0..200 { q.request(); }
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "requests during playback are dropped");
+        q.request();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "the worker survives a failed player");
     }
 
     #[test]
@@ -782,7 +894,7 @@ mod tests {
         let mut cmds = Vec::new();
         let mk = |id: u32, app: &str, sum: &str, body: &str, urg: u8, actions: &[(&str, &str)]| Note {
             id, app: app.into(), icon: String::new(), summary: sum.into(), body: body.into(),
-            actions: actions.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), urgency: urg, timeout_ms: 0,
+            actions: actions.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), urgency: urg, timeout_ms: 0, suppress_sound: false,
         };
         rig.st.notes.show(mk(1, "Calendar", "Standup in 5 minutes", "", 0, &[]), &mut cmds);
         rig.st.notes.show(mk(2, "Discord", "<b>Ana</b> sent a message", "hey, are you joining the call? we are waiting for you in the usual channel and everyone is already here", 1, &[("default", "Open"), ("reply", "Reply"), ("mute", "Mute")]), &mut cmds);

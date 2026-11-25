@@ -4,11 +4,31 @@ A pure-Rust pill bar and notch (no GTK, no Waybar) for **Arch Linux + Omarchy 4.
 
 ## Preview
 
-![waybar-pill-bar: one notch for media, power modes, Wi-Fi, Bluetooth, audio and more](preview.png)
+![waybar-pill-bar: the whole bar plus the media and controls pages and the app dock](preview.png)
 
-[![Demo: the notch follows what is playing, then switches the power mode](docs/demo.gif)](docs/demo.mp4)
+[![Demo: dock, notch expansion and media in a 960-pixel silent teaser](docs/demo.gif)](docs/demo.mp4)
 
-*Demo: the notch follows whatever is playing (here a local file in mpv), then switches the power mode with a sliding highlight. Click the animation for the full-quality [MP4](docs/demo.mp4). Recorded with a synthetic track on an empty workspace: no personal data.*
+*A 3-minute tour with an original lo-fi soundtrack. Click the animation for the full [MP4](docs/demo.mp4). Recorded in an isolated nested Hyprland with a private audio server, session bus and a real Quickshell notification relay, using synthetic apps, clipboard text and two real local mpv players playing the original track: no personal data. Account and hardware integrations (Google Calendar, Wi-Fi, Bluetooth, weather, WhatsApp, brightness, reminders) are shown in their genuine unavailable or setup state, never faked; screenshot, recording, lock, reading mode, display scale and text size were only hovered, and multi-output placement and the plugin lifecycle are described in captions, not demonstrated.*
+
+<details><summary>Chapters of the video</summary>
+
+| Time | Chapter |
+|---|---|
+| 0:00 | The whole bar: launcher, workspaces, keyboard layout, clock, app dock, status |
+| 0:07 | App dock: hover expansion, launch, focus, Applications page, pin and unpin |
+| 0:25 | Media: two players, source chip, play/pause, previous/next, seek, artwork (lyrics unavailable offline) |
+| 0:42 | Calendar: month and day navigation, agenda, reminder form (Google sign-in not done) |
+| 0:55 | Clipboard: recopy verified with `wl-paste`, clear with confirmation |
+| 1:09 | AI usage empty states and weather (offline) |
+| 1:19 | Volume: master, mute, per-app streams; Wi-Fi and Bluetooth offline states |
+| 1:36 | Battery details and display page (hover only) |
+| 1:47 | Notifications with actions, dismissal and the volume OSD |
+| 1:59 | Controls: Do Not Disturb, notification sounds and the tile grid |
+| 2:13 | Settings: accent, font size and clock format applied to a private config, then restored |
+| 2:35 | Settings tour: monitors, tabs, utilities, AI providers, apps (WhatsApp not connected) |
+| 2:52 | Plugin manager: enable, update, disable and restore (described, not demonstrated) |
+
+</details>
 
 ## What's new in 0.2
 
@@ -42,7 +62,7 @@ Needs Omarchy 4.x with the Lua Hyprland config and `omarchy plugin list --json` 
 - Setup never requests OAuth and never restarts the shell; the missing required packages are installed as described below. Build failures leave the native desktop usable; inspect `${XDG_STATE_HOME:-$HOME/.local/state}/waybar-notch/provision.log`.
 - Every enable recovers stale session files, then snapshots a fresh baseline. Retained WhatsApp adapter entries keep their original backups rather than treating patched files as originals. All proposed files and their hashes are prepared before publishing. Disable/removal restores originals and removes the install record and product backup tree. User preferences, credentials, build cache and durable recovery helpers remain.
 - While enabled, one `waybar-notch` process draws the selected output's pills, notch, OSD and notification cards. The backend stops the native Waybar unit and disables native notifications/OSD through `shell.json`, restoring only what it changed. Inactive helpers never restart the product.
-- Notifications: Quickshell keeps owning `org.freedesktop.Notifications` (its bus name is process-wide and cannot be released). `Service.qml` loads `NotificationRelay.qml` on the backend's request and forwards each notification to the notch over `$XDG_RUNTIME_DIR/waybar-pill-plugin/notifications.sock` (NDJSON v2 with sequence numbers, acknowledgements and bounded queues, peer-authenticated by PID); the notch renders its usual cards and sends actions/closures back so the sender gets the real D-Bus signals. Activation only reports success after that relay handshake; any failure restores the native desktop. The notch binary itself never claims a notification name and refuses to start without `--notification-relay <shell-pid>`.
+- Notifications: Quickshell keeps owning `org.freedesktop.Notifications` (its bus name is process-wide and cannot be released). `Service.qml` loads `NotificationRelay.qml` on the backend's request and forwards each notification to the notch over `$XDG_RUNTIME_DIR/waybar-pill-plugin/notifications.sock` (NDJSON v2 with sequence numbers, acknowledgements and bounded queues, peer-authenticated by PID); the notch renders its usual cards and sends actions/closures back so the sender gets the real D-Bus signals. Activation only reports success after that relay handshake; any failure restores the native desktop. The notch binary itself never claims a notification name. Started with `--notification-relay <shell-pid>` (plugin mode) it also serves notifications and WhatsApp; started bare (no arguments, for development) it draws the bar without either; a malformed relay PID is refused with a usage line.
 
 - WhatsApp uses its existing native plugin UI inside the notch. Keep the WhatsApp plugin enabled in the native layout. Quickshell caches plugin QML and does not hot-reload this adapter: a newly installed adapter may need one `omarchy-restart-shell`. While `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json` still lists `{"id":"waybar.pill-bar"}` in `plugins`, teardown retains only WhatsApp's `Panel.qml`, `BarWidget.qml` and `WaybarPillAnchor.qml`, together with their recovery record and original backups. This lets the next shell load the adapter across restart or logout. Disabling/removing Pill Bar, deleting its checkout, missing/malformed shell configuration or explicit recovery requests full restoration. Absent, disabled or unsupported WhatsApp sources leave other bar features available. Changed retained adapter bytes or a different proposed adapter version produce a visible incompatibility warning and skip embedding rather than overwrite them; resolve any reported conflicts and explicitly recover before re-enabling. Unsafe paths or malformed install records remain hard errors.
 - Qt caches plugin QML for the life of the shell: after changing `Service.qml`/`NotificationRelay.qml` run `omarchy-restart-shell` (disable/enable alone keeps serving the old code).
@@ -60,11 +80,13 @@ Local promo assets are excluded from the repository and not needed to install.
 | Feature | What it is |
 |---|---|
 | **Pills** | Native layer-shell surfaces drawn by `waybar-notch` (one left and one right pill per output). Launcher, workspaces, app launchers (Discord, Steam, Spotify, WhatsApp; only the ones installed), media pill, status pill (Bluetooth, Wi-Fi, display, volume, battery) and clock. Opaque, theme-colored, animated. |
-| **Notch** | Rust, one layer-shell surface drawn with tiny-skia/cosmic-text; the clock, weather glyph and album art morph continuously between the collapsed pill and the expanded card. Collapsed: cover art, title, live equalizer. Hover: springs open into **Home / Media / Calendar / Clipboard / AI / Controls** tabs. |
+| **Notch** | Rust, one layer-shell surface drawn with tiny-skia/cosmic-text; the clock, weather glyph and album art morph continuously between the collapsed pill and the expanded card. Collapsed (360×40 by default): clock, app tiles and cover art; hovering the clock for 350 ms opens it, tiles never do. Hover: springs open into **Home / Media / Calendar / Clipboard / AI / Controls** tabs. |
 | **Device details** | On Home, the battery, Wi-Fi and Bluetooth chips open detail pages inside the notch (Back returns Home). Battery shows charge, live power draw, estimated time, capacity, health and cycles from sysfs, plus power profiles. Wi-Fi and Bluetooth show a status card with connected/saved/paired lists. |
 | **Control pages** | Volume, Wi-Fi, Bluetooth, battery (with power modes), display and calendar open as pages inside the notch from the right pill or the `waybar-popupctl` fifo. |
 | **Media** | Follows any MPRIS player (Spotify, browsers, mpv, VLC, ...), prefers the one that is playing, lets you cycle between players, and controls the one shown. |
-| **Notifications** | Black cards below the right pill for notifications the Omarchy shell relays to the notch, click = default action, right click = dismiss, hidden in fullscreen. Do Not Disturb is shared with Omarchy (`~/.local/state/omarchy/notifications.json`); critical notifications bypass it. |
+| **App shortcuts** | The collapsed notch holds one row of open and pinned applications (configured apps first, then pins, then other open windows); the left pill shows only the launcher, workspaces and the main keyboard's active layout. The notch widens (up to its expanded width) so every app fits between the side pills, with `+N` for the rest; on a narrow output it drops below the pills instead of overlapping them. Click focuses the most recent window; a pinned app launches through `gtk-launch` when closed. Right click on a non-configured app opens **Applications** (Controls > Settings > Applications), which lists every window, pins/unpins (`notch.pinned_apps`, persisted) and offers an installed-application chooser when a window's desktop entry cannot be inferred. A **Notification sounds** utility tile (`notification-sounds`) mutes or unmutes notification sounds without touching Do Not Disturb. |
+| **Bluetooth battery** | The right pill shows the battery of connected Bluetooth devices (`87%`, or `2 · 42%` with the lowest value for several); the tooltip lists each device. Devices that do not report a battery show none. |
+| **Notifications** | Black cards below the right pill for notifications the Omarchy shell relays to the notch, click = default action, right click = dismiss, hidden in fullscreen. Do Not Disturb is shared with Omarchy (`~/.local/state/omarchy/notifications.json`); critical notifications bypass it. Optional **Notification sounds** (Settings > Behavior, off by default) plays the freedesktop `message` sound with `pw-play` for new normal/critical notifications that pass the Do Not Disturb gate; updates, low urgency and senders using the `suppress-sound` hint stay silent. |
 | **OSD** | Notch-style overlay for volume and brightness keys (and Wi-Fi/Bluetooth toggles). |
 | **Per-app volume** | Master slider plus a slider and mute button per playing application, live via `pactl subscribe`. |
 | **Display controls** | Per-monitor on/off (never the last one), per-monitor brightness (only where supported), scale 1 / 1.25 / 1.6 / 2, text size. |
@@ -236,7 +258,8 @@ Run for the plugin-only cutover (each Python file in its own process):
 - `bash -n install.sh uninstall.sh files/scripts/waybar-popupctl files/scripts/waybar-brightness-key files/hooks/pill-theme-hook`
 - `cargo test --manifest-path notch/Cargo.toml` and `cargo build --release --locked --manifest-path notch/Cargo.toml`
 - `python3 -m unittest tests/test_plugin_bridge.py`, `tests/test_omarchy_matrix.py` (temporary-HOME install and uninstall, no-record uninstall, legacy refusal, removed-flag usage error), `tests/test_notification_relay.py`, `tests/test_plugin_widgets.py`, `tests/test_widget_adapters.py` (real patched WhatsApp Panel in Quickshell on a private bus) and `files/setup/test_waybar_setup.py`
-- Headless subprocess runs of `notch/target/release/waybar-notch` with no arguments, an unknown command, a missing/zero/non-numeric/negative/extra relay PID and extra supervisor arguments: all print the usage line and exit 1 before GTK or D-Bus; `--gen-waybar-theme` still succeeds.
+- Headless subprocess runs of `notch/target/release/waybar-notch`: an unknown command and a missing/zero/non-numeric/negative/extra `--notification-relay` PID print the usage line and exit 1; with no arguments it starts a bare bar without notifications or WhatsApp (those need the relay).
+- Hardening covered by regressions: the build cache is validated (no links, foreign owners or group/other-writable directories) before anything is built, downloaded or staged there; `./uninstall.sh --purge` removes only the four Google credential entries through descriptor-relative, ownership-checked deletion that never follows links; the clipboard watcher frames selections with a byte cap and NUL stripping, applies one selection at a time, and a Clear generation guarantees no pre-Clear history returns after it.
 
 Not verified: Omarchy 3.x; `google-setup.py` against the live Cloud Console and a live Google consent/token exchange; WhatsApp with a browser other than Brave; a machine without a battery; a non-Nerd Omarchy font; a full logout/login cycle. This change did not redeploy or restart any live desktop.
 

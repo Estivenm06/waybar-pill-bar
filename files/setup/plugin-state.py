@@ -8,6 +8,8 @@
   plugin-state.py finish                    verify that every recorded file holds its prepared bytes and mode
   plugin-state.py uninstall                 restore the per-file baseline, or report conflicts and change nothing
   plugin-state.py validate                  read-only trust/schema/footprint check of the record and recovery journal
+  plugin-state.py cache-prepare             validate (creating 0700 when absent) the build cache and its product leaves
+  plugin-state.py cache-stamp HASH          atomically record the 64-hex source hash as the cache stamp
 
 Setup order: `begin` for every destination, `prepare` for every destination, then `publish` each one, then `finish`.
 Interrupted at any point, `uninstall` accepts only an absent destination, its original bytes, its prepared bytes, or
@@ -771,7 +773,76 @@ def validate():
     return 0
 
 
+def cache_dir():
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(helper.home(), ".cache"), "waybar-notch")
+
+
+def cache_root(create):
+    cache = cache_dir()
+    fd = helper.open_directory_chain(cache, own_from=helper.trust_root(cache, default=cache), create=create)
+    return cache, fd
+
+
+def cache_prepare():
+    """Fail closed on links, foreign owners and group/other-writable cache directories or leaves before the installer
+    reads, downloads, builds or stages anything there. Absent directories are created 0700."""
+    try:
+        cache = cache_dir()
+        own = helper.trust_root(cache, default=cache)
+        for sub in ("", "source-target-v1", "source-target-v1/release", "prebuilt"):
+            path = os.path.join(cache, sub) if sub else cache
+            create = sub != "source-target-v1/release"
+            fd = helper.open_directory_chain(path, own_from=own, create=create)
+            if fd is not None:
+                os.close(fd)
+        for rel in ("source-built-v1.sha256", "source-target-v1/release/waybar-notch", "prebuilt/waybar-notch"):
+            path = os.path.join(cache, rel)
+            dfd = helper.open_directory_chain(os.path.dirname(path), own_from=own)
+            if dfd is None:
+                continue
+            try:
+                try:
+                    fd = helper.open_leaf(dfd, os.path.basename(path), path, state=True)
+                except FileNotFoundError:
+                    continue
+                os.close(fd)
+            finally:
+                os.close(dfd)
+    except PluginError as e:
+        return fail("unsafe build cache: " + str(e))
+    except OSError as e:
+        return fail("cannot prepare the build cache: %s" % (e.strerror or type(e).__name__))
+    return 0
+
+
+def cache_stamp(value):
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        return fail("the cache stamp must be 64 lowercase hex characters")
+    try:
+        cache, dfd = cache_root(False)
+        if dfd is None:
+            return fail("the build cache is missing")
+        try:
+            name = "source-built-v1.sha256"
+            try:
+                os.close(helper.open_leaf(dfd, name, os.path.join(cache, name), state=True))
+            except FileNotFoundError:
+                pass
+            write_private(dfd, name, (value + "\n").encode(), 0o600)
+        finally:
+            os.close(dfd)
+    except PluginError as e:
+        return fail("unsafe build cache: " + str(e))
+    except OSError as e:
+        return fail("cannot write the cache stamp: %s" % (e.strerror or type(e).__name__))
+    return 0
+
+
 def main(argv):
+    if argv == ["cache-prepare"]:
+        return cache_prepare()
+    if argv[:1] == ["cache-stamp"] and len(argv) == 2:
+        return cache_stamp(argv[1])
     if argv[:1] == ["begin"] and len(argv) > 1:
         return begin(argv[1:])
     if argv[:1] == ["prepare"] and len(argv) == 4:

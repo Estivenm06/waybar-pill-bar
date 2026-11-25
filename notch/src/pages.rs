@@ -8,6 +8,7 @@ pub fn build() -> Vec<(&'static str, Box<dyn Page>)> {
         if let Some(p) = crate::popups::BodyPage::new(kind) { v.push((id, Box::new(p))); }
     }
     v.push(("controls", Box::new(crate::controls::Controls::new())));
+    v.push(("apps", Box::new(crate::apps_page::AppsPage::new())));
     v.push(("clipboard", Box::new(crate::controls::Clipboard::new())));
     v.push(("weather", Box::new(crate::info_pages::WeatherPage::new())));
     v.push(("ai", Box::new(crate::info_pages::AiPage::new())));

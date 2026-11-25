@@ -15,8 +15,9 @@ use std::collections::{HashMap, HashSet};
 const CATALOG: &str = include_str!("../../files/setup/apps-catalog.json");
 
 pub const TAB_LABELS: [(&str, &str); 4] = [("media", "Media"), ("calendar", "Calendar"), ("clipboard", "Clipboard"), ("ai", "AI usage")];
-pub const UTILITY_LABELS: [(&str, &str); 10] = [
+pub const UTILITY_LABELS: [(&str, &str); 11] = [
     ("screenshot", "Screenshot"), ("record", "Record"), ("nightlight", "Reading Mode"), ("dnd", "Do Not Disturb"),
+    ("notification-sounds", "Notification sounds"),
     ("wifi", "Wi-Fi"), ("bluetooth", "Bluetooth"), ("lock", "Lock"), ("clear-clipboard", "Clear clipboard"),
     ("audio", "Audio"), ("display", "Displays"),
 ];
@@ -121,6 +122,7 @@ pub enum Action {
     BgApp(String),
     MoveApp(String, i32),
     ToggleAi(String),
+    OpenApplications,
     Apply,
     Reset,
     Cancel,
@@ -244,7 +246,9 @@ impl SettingsPage {
 
     fn do_apply(&mut self, ctx: &mut Ctx) {
         if self.busy || self.dirty_notes() { return; }
-        let draft = self.draft.clone();
+        // pins are edited only on the Applications page, under the config lock; Apply never writes them
+        let mut draft = self.draft.clone();
+        draft.pinned_apps = self.active.pinned_apps.clone();
         let mut patch: Map<String, Value> = Map::new();
         let np = config::diff_patch(&self.active.to_json(), &draft.to_json());
         if !np.is_empty() { patch.insert("notch".into(), Value::Object(np)); }
@@ -273,7 +277,8 @@ impl SettingsPage {
         let Some(res) = st.pending_settings_result.take() else { return };
         self.busy = false;
         match res {
-            Ok((n, apps_err)) => {
+            Ok((mut n, apps_err)) => {
+                n.pinned_apps = st.settings.pinned_apps.clone();
                 self.active = n.clone();
                 st.settings = n;
                 st.refresh_palette();
@@ -291,6 +296,7 @@ impl SettingsPage {
     fn act(&mut self, a: Action, ctx: &mut Ctx) {
         match &a {
             Action::Apply => self.do_apply(ctx),
+            Action::OpenApplications => ctx.state.nav = Some(NavTo::Page("apps")),
             Action::Cancel => { self.draft = self.active.clone(); self.sync_fields(); ctx.state.nav = Some(NavTo::Page("controls")); }
             Action::Reset => {
                 let d = NotchSettings::default();
@@ -358,6 +364,7 @@ enum Item {
     ListRow(ListKind, &'static str, String),
     AppRow(String, String, bool, bool, bool, bool, bool),
     AiRow(String, String, bool),
+    Link(&'static str),
 }
 
 impl Page for SettingsPage {
@@ -493,6 +500,7 @@ impl SettingsPage {
             },
         }
         v.push(Item::Section("Apps"));
+        v.push(Item::Link("Applications"));
         if let Some(d) = &self.doc {
             let names: HashMap<String, String> = catalog().into_iter().map(|a| (a.0, a.1)).collect();
             let mut order: Vec<String> = self.apps_draft.iter().map(|a| a.id.clone()).collect();
@@ -588,6 +596,14 @@ impl SettingsPage {
                     self.reg(rr, list, next_id, Action::Clock(*f), &mut h);
                     seg(cv, pal, rr, t, self.draft.behavior.clock_format == *f, h);
                 }
+            }
+            Item::Link(l) => {
+                lab(cv, l);
+                let b = rect(right.right() - 70.0, r.y + 4.0, 70.0, 24.0);
+                let mut h = false;
+                self.reg(b, list, next_id, Action::OpenApplications, &mut h);
+                button(cv, pal, b, "Open", ButtonKind::Plain, h, false);
+                *next_id += 2;
             }
             Item::Mode => {
                 lab(cv, "Notch and pills");

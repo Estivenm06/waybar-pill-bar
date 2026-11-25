@@ -7,6 +7,7 @@
 //! the current page reports through `Page::morph`. Everything else (tab bar,
 //! page content) fades in once `prog` passes 0.5.
 
+use crate::dock::{Dims, collapsed_layout, icon_for};
 use crate::layout::{Point, Rect, Size, lerp, lerp_pt, lerp_rect, pt, rect, smooth, window};
 use crate::page::{Morph, Page};
 use crate::render::{Canvas, HAlign, Image, TextStyle, TextSys, VAlign, mix, r_all, with_a};
@@ -52,29 +53,83 @@ pub fn spring(x: f32, v: f32, target: f32, dt: f32) -> (f32, f32) {
 /// Collapsed/expanded geometry derived from settings and the output size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geom {
+    /// Target collapsed width (adaptive once the output is known).
     pub coll_w: f32,
+    /// Widest the collapsed notch may be right now without touching a side pill.
+    pub cap_w: f32,
     pub coll_h: f32,
     pub exp_w: f32,
     pub exp_h_max: f32,
     pub top_margin: i32,
 }
 
+/// Clearance kept between the collapsed notch and the side pills.
+const SIDE_GAP: f32 = 12.0;
+/// Below this much room between the pills the notch drops under them.
+const MIN_COLL_W: f32 = 180.0;
+/// Top margin that clears the 26px side-pill row.
+const LOWER_ROW_MARGIN: i32 = 30;
+
+/// Collapsed width and whether the notch must sit below the side-pill row.
+/// `configured` is the saved width (a preferred minimum), `preferred` what the content needs, `capacity` the
+/// room between the pills.
+pub fn fit_collapsed(output_w: f32, left: f32, right: f32, configured: f32, preferred: f32, exp_w: f32) -> (f32, f32, bool) {
+    let capacity = output_w - 2.0 * (left.max(right) + SIDE_GAP);
+    let want = configured.max(preferred).min(exp_w);
+    if capacity < MIN_COLL_W {
+        let cap = (output_w - SCREEN_MARGIN).max(1.0).min(exp_w);
+        (want.min(cap), cap, true)
+    } else {
+        let cap = capacity.min(exp_w);
+        (want.min(cap), cap, false)
+    }
+}
+/// What the collapsed notch has to fit: measured clock, playing media, app count and the room the side pills take.
+#[derive(Clone, Copy, Debug)]
+pub struct Measured {
+    pub time_w: f32,
+    pub media: bool,
+    pub n_apps: usize,
+    pub left: f32,
+    pub right: f32,
+}
+
 impl Geom {
     pub fn compute(st: &State, output: Option<&str>) -> Geom {
+        Self::compute_at(st, output, st.settings.layout.top_margin as i32)
+    }
+
+    fn compute_at(st: &State, output: Option<&str>, top_margin: i32) -> Geom {
         let l = &st.settings.layout;
         let logical = output.and_then(|n| st.outputs.iter().find(|o| o.name == n)).map(|o| (o.size.0 as f32, o.size.1 as f32));
         let (lw, lh) = logical.filter(|(w, h)| *w > 0.0 && *h > 0.0).unwrap_or((1.0e6, 1.0e6));
-        let top = l.top_margin as f32;
+        let top = top_margin as f32;
         let avail_w = (lw - SCREEN_MARGIN).max(1.0);
         let avail_h = (lh - top - SCREEN_MARGIN).max(1.0);
+        let coll_w = (l.collapsed_width as f32).min(avail_w);
         Geom {
-            coll_w: (l.collapsed_width as f32).min(avail_w),
+            coll_w,
+            cap_w: coll_w,
             coll_h: (l.collapsed_height as f32).min(avail_h),
             exp_w: (l.expanded_width as f32).min(avail_w / HEADROOM),
             exp_h_max: avail_h / HEADROOM,
-            top_margin: l.top_margin as i32,
+            top_margin,
         }
     }
+
+    /// Base geometry widened to fit the collapsed content between the side pills; `m` carries the measured
+    /// content. Before the output is known the base geometry is returned unchanged.
+    pub fn adaptive(st: &State, output: Option<&str>, m: Measured) -> Geom {
+        let base = Self::compute(st, output);
+        let Some(o) = output.and_then(|n| st.outputs.iter().find(|o| o.name == n)).filter(|o| o.size.0 > 0 && o.size.1 > 0) else { return base };
+        let pref = crate::dock::preferred_width(m.time_w, base.coll_h, m.media, m.n_apps);
+        let (width, cap, lower) = fit_collapsed(o.size.0 as f32, m.left, m.right, st.settings.layout.collapsed_width as f32, pref, base.exp_w);
+        let mut g = if lower { Self::compute_at(st, output, (st.settings.layout.top_margin as i32).max(LOWER_ROW_MARGIN)) } else { base };
+        g.coll_w = width.min(g.exp_w);
+        g.cap_w = cap.min(g.exp_w);
+        g
+    }
+
     /// Layer-surface size for an expanded card of height `th`.
     pub fn host(&self, th: f32) -> (u32, u32) {
         ((self.exp_w * HEADROOM).floor() as u32, (th.min(self.exp_h_max).max(RESERVE_H.min(self.exp_h_max)) * HEADROOM).floor() as u32)
@@ -107,7 +162,6 @@ pub struct Notch {
     hover: bool,
     collapse_at: Option<Instant>,
     reset_at: Option<Instant>,
-    charge_phase: f32,
     kb: bool,
     last_rect: Rect,
     area: Rect,
@@ -117,7 +171,62 @@ pub struct Notch {
     viz_on: bool,
     /// Fullscreen window on this output (or a capture freeze): draw nothing.
     hidden: bool,
+    /// Hover-open dwell deadline; only armed while the pointer rests on the clock/background, never on a tile.
+    dwell_at: Option<Instant>,
+    /// Shortcut key behind each app tile hit id (`ID_TILE + index`) of the last collapsed paint.
+    tile_keys: Vec<String>,
+    /// Eased hover level per tile hit id (0..1).
+    tile_hover: Vec<(u32, f32)>,
+    /// What lay under the pointer at press time (`Some(id)` for a tile, `None` for the background).
+    press_id: Option<Option<u32>>,
+    press_key: Option<String>,
+    /// Rect of the pressed tile at press time.
+    press_rect: Option<Rect>,
+    /// Hit id and rect of every tile of the last collapsed paint.
+    tile_rects: Vec<(u32, Rect)>,
+    /// Hover label: text, tile rect, eased hover level.
+    tip: Option<(String, Rect, f32)>,
+    /// Current (animated) collapsed width and its velocity; `geom.coll_w` is the target.
+    coll_w: f32,
+    coll_v: f32,
+    coll_ready: bool,
+    drag: Option<Drag>,
+    /// Drawn x of each tile by shortcut key, so tiles slide to their new slots.
+    tile_x: Vec<(String, f32)>,
+    sliding: bool,
+    /// Seconds the slide keeps easing after a drop.
+    settle: f32,
+    last_dt: f32,
 }
+
+/// Collapsed app tiles live far above the tab ids (1..=6); `+N` has its own id.
+const ID_OVERFLOW: u32 = 1_900_000;
+const ID_TILE: u32 = 2_000_000;
+/// Pointer travel before a press on a tile turns into a drag.
+const DRAG_START: f32 = 6.0;
+
+/// A tile press that may become a drag: shortcut index and key, press point, grab offset inside the tile, the
+/// drop slot computed by the last paint.
+#[derive(Clone, Debug)]
+struct Drag {
+    key: String,
+    idx: usize,
+    start: Point,
+    pos: Point,
+    grab: f32,
+    active: bool,
+    drop: usize,
+}
+/// Pointer must rest this long on the clock/background before hover opens the notch.
+const DWELL: Duration = Duration::from_millis(350);
+/// Hover highlight / icon scale easing time.
+const TILE_FADE: f32 = 0.14;
+/// Longest frame step fed to the springs (a resume after suspend must not integrate a long catch-up).
+const MAX_DT: f32 = 0.05;
+/// Clock size in the collapsed notch.
+const CLOCK_PX: f32 = 14.0;
+/// Room the charging bolt takes before the clock.
+const BOLT_W: f32 = 12.0;
 
 impl Notch {
     pub fn new(pages: Vec<(&'static str, Box<dyn Page>)>) -> Notch {
@@ -134,12 +243,11 @@ impl Notch {
             size: (0.0, 0.0),
             size_v: (0.0, 0.0),
             size_t: (0.0, 0.0),
-            geom: Geom { coll_w: 210.0, coll_h: 24.0, exp_w: 520.0, exp_h_max: 800.0, top_margin: 2 },
+            geom: Geom { coll_w: 360.0, cap_w: 360.0, coll_h: 40.0, exp_w: 560.0, exp_h_max: 800.0, top_margin: 4 },
             host: (582, 627),
             hover: false,
             collapse_at: None,
             reset_at: None,
-            charge_phase: 0.0,
             kb: false,
             last_rect: Rect::default(),
             area: Rect::default(),
@@ -148,6 +256,22 @@ impl Notch {
             output_seen: None,
             viz_on: false,
             hidden: false,
+            dwell_at: None,
+            tile_keys: Vec::new(),
+            tile_hover: Vec::new(),
+            press_id: None,
+            press_key: None,
+            press_rect: None,
+            tile_rects: Vec::new(),
+            tip: None,
+            coll_w: 360.0,
+            coll_v: 0.0,
+            coll_ready: false,
+            drag: None,
+            tile_x: Vec::new(),
+            sliding: false,
+            settle: 0.0,
+            last_dt: 0.016,
         }
     }
 
@@ -158,7 +282,7 @@ impl Notch {
     fn tab_for(&self, page: &'static str) -> &'static str {
         match page {
             "weather" => "home",
-            "settings" | "wifi" | "bt" | "audio" | "battery" | "display" => "controls",
+            "settings" | "apps" | "wifi" | "bt" | "audio" | "battery" | "display" => "controls",
             p => TABS.iter().map(|t| t.0).find(|t| *t == p).unwrap_or("home"),
         }
     }
@@ -174,11 +298,12 @@ impl Notch {
         // Secondary pages keep the tab they were entered from; tab pages highlight themselves.
         self.origin = match id {
             "weather" => "home",
-            "settings" | "wifi" | "bt" | "audio" | "battery" | "display" => "controls",
+            "settings" | "apps" | "wifi" | "bt" | "audio" | "battery" | "display" => "controls",
             _ => self.tab_for(id),
         };
         self.page_fade = 0.0;
-        if let Some(i) = self.page_idx(id) { self.pages[i].1.shown(ctx); }
+        // from a collapsed notch `set_expanded(true)` activates the page, so it is activated exactly once
+        if self.target > 0.5 { if let Some(i) = self.page_idx(id) { self.pages[i].1.shown(ctx); } }
     }
 
     fn set_expanded(&mut self, expand: bool, ctx: &mut Ctx) {
@@ -234,14 +359,37 @@ impl Notch {
 
     fn collapsed_media(st: &State) -> Option<CollapsedMedia> { crate::glue::collapsed_media(st) }
 
+    /// Base geometry widened to the collapsed content, measured with the exact styles the notch paints with.
+    fn measure_geom(&self, ctx: &mut Ctx) -> Geom {
+        let st = &*ctx.state;
+        let Some(out) = ctx.output.filter(|n| st.outputs.iter().any(|o| o.name == *n)) else { return Geom::compute(st, ctx.output) };
+        let (time, _) = Self::clock_strings(st);
+        let bolt = if st.status.power.as_ref().is_some_and(crate::glue::actively_charging) { BOLT_W } else { 0.0 };
+        let time_w = bolt + ctx.text.measure(&time, &TextStyle::new(st.pal.fs(CLOCK_PX), st.pal.fg_hi).bold(), None).0;
+        let m = Measured {
+            time_w,
+            media: Self::collapsed_media(st).is_some_and(|m| m.playing),
+            n_apps: st.apps.shortcuts.len(),
+            left: crate::pills::occupied_width(st, ctx.text, out),
+            right: crate::rightpill::occupied_width(st, ctx.text),
+        };
+        Geom::adaptive(st, Some(out), m)
+    }
+
     fn tick_inner(&mut self, dt: f32, ctx: &mut Ctx) -> bool {
-        let new_geom = Geom::compute(ctx.state, ctx.output);
+        let dt = dt.min(MAX_DT);
+        self.last_dt = dt;
+        if self.settle > 0.0 { self.settle = (self.settle - dt).max(0.0); }
+        let new_geom = self.measure_geom(ctx);
         if new_geom != self.geom { self.geom = new_geom; }
-        if self.size_t == (0.0, 0.0) { self.size = (self.geom.coll_w, self.geom.coll_h); }
+        if !self.coll_ready { self.coll_w = self.geom.coll_w; self.coll_v = 0.0; self.coll_ready = true; }
+        // a smaller safety capacity applies at once; growth and voluntary shrinking animate
+        self.coll_w = self.coll_w.min(self.geom.cap_w);
+        if self.size_t == (0.0, 0.0) { self.size = (self.coll_w, self.geom.coll_h); }
         {
             let out = ctx.output.and_then(|n| ctx.state.outputs.iter().find(|o| o.name == n));
             let origin = out.map_or((0.0, 0.0), |o| (((o.size.0 as f32 - self.host.0 as f32) / 2.0).floor(), self.geom.top_margin as f32));
-            let info = crate::state::NotchInfo { output: ctx.output.map(str::to_string), origin, expanded: self.target > 0.5, hover: self.hover };
+            let info = crate::state::NotchInfo { output: ctx.output.map(str::to_string), origin, bottom: self.geom.top_margin as f32 + self.geom.coll_h, expanded: self.target > 0.5, hover: self.hover };
             if ctx.state.notch != info {
                 // the pills follow `State.notch.output`: repaint every panel as soon as it changes
                 let moved = ctx.state.notch.output != info.output;
@@ -253,7 +401,7 @@ impl Notch {
         if let Some(nav) = ctx.state.nav.take() {
             match nav {
                 NavTo::Page(id) => {
-                    if let Some(id) = TABS.iter().map(|t| t.0).chain(["weather", "settings", "wifi", "bt", "audio", "battery", "display", "whatsapp"]).find(|p| *p == id) {
+                    if let Some(id) = TABS.iter().map(|t| t.0).chain(["weather", "settings", "apps", "wifi", "bt", "audio", "battery", "display", "whatsapp"]).find(|p| *p == id) {
                         self.show(id, ctx);
                         self.set_expanded(true, ctx);
                         // opened from outside (pill click, fifo): fold away again unless the pointer arrives
@@ -314,6 +462,12 @@ impl Notch {
                 else if !self.hover && !crate::whatsapp::close(ctx.state, crate::whatsapp::CloseTo::Collapse) { self.set_expanded(false, ctx); }
             }
         }
+        if let Some(at) = self.dwell_at {
+            if now >= at {
+                self.dwell_at = None;
+                if self.hover && !self.expanded() { self.set_expanded(true, ctx); }
+            }
+        }
         if let Some(at) = self.reset_at {
             if now >= at {
                 self.reset_at = None;
@@ -327,14 +481,27 @@ impl Notch {
         let done = (np - self.target).abs() < 0.0015 && nv.abs() < 0.02;
         if anim && !done { self.prog = np; self.vel = nv; active = true; } else { self.prog = self.target; self.vel = 0.0; }
         // size springs towards the page's own size while expanded, else towards the collapsed size
-        let (tw, th) = if self.target > 0.5 { self.size_t } else { (self.geom.coll_w, self.geom.coll_h) };
+        let (cw, cv) = spring(self.coll_w, self.coll_v, self.geom.coll_w, dt);
+        if anim && ((cw - self.geom.coll_w).abs() >= 0.5 || cv.abs() >= 1.0) { self.coll_w = cw.min(self.geom.cap_w); self.coll_v = cv; active = true; } else { self.coll_w = self.geom.coll_w; self.coll_v = 0.0; }
+        let (tw, th) = if self.target > 0.5 { self.size_t } else { (self.coll_w, self.geom.coll_h) };
         let (w, vw) = spring(self.size.0, self.size_v.0, tw, dt);
         let (h, vh) = spring(self.size.1, self.size_v.1, th, dt);
         let sdone = (w - tw).abs() < 0.5 && vw.abs() < 1.0 && (h - th).abs() < 0.5 && vh.abs() < 1.0;
         if anim && !sdone { self.size = (w, h); self.size_v = (vw, vh); active = true; } else { self.size = (tw, th); self.size_v = (0.0, 0.0); }
         if self.page_fade < 1.0 { self.page_fade = (self.page_fade + dt / 0.16).min(1.0); active = true; }
-        let charging = ctx.state.status.power.as_ref().is_some_and(crate::glue::actively_charging);
-        if charging { self.charge_phase = (self.charge_phase + dt / 3.0) % 1.0; active = true; }
+        // eased tile hover (snaps when animations are off)
+        {
+            let hovered = self.hits.hovered();
+            if let Some(h) = hovered { if h >= ID_TILE || h == ID_OVERFLOW { if !self.tile_hover.iter().any(|(i, _)| *i == h) { self.tile_hover.push((h, 0.0)); } } }
+            let step = if anim { dt / TILE_FADE } else { 1.0 };
+            for (id, l) in &mut self.tile_hover {
+                let target = if Some(*id) == hovered { 1.0 } else { 0.0 };
+                *l = if *l < target { (*l + step).min(target) } else { (*l - step).max(target) };
+                active |= *l != target;
+            }
+            self.tile_hover.retain(|(_, l)| *l > 0.0);
+        }
+        active |= self.dwell_at.is_some() || self.sliding || self.settle > 0.0 || self.drag.as_ref().is_some_and(|d| d.active);
         // equaliser feed only while something plays and the pill is what is visible
         let want_viz = ctx.state.media.playing && !self.expanded() && self.prog < 0.05;
         if want_viz != self.viz_on { self.viz_on = want_viz; crate::media::set_visualizer(ctx.poster, want_viz); }
@@ -348,7 +515,8 @@ impl View for Notch {
     fn attached(&mut self, id: PanelId) { self.id = id; }
 
     fn spec(&self, st: &State) -> PanelSpec {
-        let g = Geom::compute(st, self.output_seen.as_deref());
+        // the adaptive geometry (lower-row margin) applies once the output is known
+        let g = if self.output_seen.is_some() { self.geom } else { Geom::compute(st, None) };
         let host = if self.host.0 > 0 { self.host } else { g.host(0.0) };
         PanelSpec {
             namespace: "waybar-notch",
@@ -363,7 +531,7 @@ impl View for Notch {
 
     fn tick(&mut self, dt: f32, ctx: &mut Ctx) -> bool {
         self.output_seen = ctx.output.map(str::to_string);
-        ctx.state.osd.collapsed = Some((self.geom.coll_w, self.geom.coll_h));
+        ctx.state.osd.collapsed = Some((self.coll_w, self.geom.coll_h));
         ctx.state.osd.output = ctx.output.map(str::to_string);
         let b = &ctx.state.settings.behavior;
         let hide = ctx.state.bar_hidden || (b.hide_on_fullscreen && ctx.output.is_some_and(|o| ctx.state.desk.is_fullscreen(o))) || ctx.state.desk.capture_active;
@@ -389,20 +557,23 @@ impl View for Notch {
     fn event(&mut self, ev: Event, ctx: &mut Ctx) {
         let open_on_hover = ctx.state.settings.behavior.open_on_hover;
         match &ev {
-            Event::PointerEnter(_) => {
+            Event::PointerEnter(p) => {
                 self.hover = true;
                 self.collapse_at = None;
-                if open_on_hover { self.set_expanded(true, ctx); }
+                if !self.expanded() { self.update_dwell(*p, open_on_hover); }
             }
+            Event::PointerMove(p) if !self.expanded() && self.drag.is_none() => self.update_dwell(*p, open_on_hover),
             Event::PointerLeave => {
                 self.hover = false;
+                self.dwell_at = None;
+                self.press_id = None;
+                self.drag = None;
                 if self.expanded() { self.schedule_collapse(ctx); }
             }
             _ => {}
         }
         if !self.expanded() {
-            if let Event::Release(Button::Left, _) = ev { self.set_expanded(true, ctx); }
-            self.hits.event(&ev);
+            self.collapsed_event(ev, ctx);
             return;
         }
         // tab bar
@@ -447,24 +618,21 @@ impl View for Notch {
         let co = (1.0 - tc / 0.22).clamp(0.0, 1.0); // collapsed content
         let eo = ((tc - 0.5) / 0.4).clamp(0.0, 1.0); // expanded content
 
-        let w = lerp(g.coll_w, self.size.0, tc).max(g.coll_w);
+        let cw = self.coll_w;
+        let w = lerp(cw, self.size.0, tc).max(cw);
         let h = lerp(g.coll_h, self.size.1, tc).max(g.coll_h);
-        let w = if self.target > 0.5 || self.prog > 0.01 { self.size.0.max(g.coll_w).min(w.max(self.size.0 * tc)) } else { w };
+        let w = if self.target > 0.5 || self.prog > 0.01 { self.size.0.max(cw).min(w.max(self.size.0 * tc)) } else { w };
         let nrect = rect((host_w - w) / 2.0, 0.0, w, h.max(self.size.1 * tc).max(g.coll_h));
         self.last_rect = nrect;
         let radius = pal.radius.min(nrect.h / 2.0);
         let radii = r_all(radius);
 
-        // surface + charging edge
-        let charging = st.status.power.as_ref().is_some_and(crate::glue::actively_charging);
-        glass(cv, &pal, nrect, radii);
-        if charging {
-            let pulse = 0.5 + 0.5 * (self.charge_phase * std::f32::consts::TAU).sin();
-            cv.stroke_rrect(nrect, radii, 1.0, with_a(mix(pal.accent, pal.accent_hi, pulse), 0.65 + 0.35 * pulse));
-        }
+        // glassmorphic surface: translucent body with a soft top sheen, no outline
+        cv.fill_rrect(nrect, radii, with_a(pal.glass, 0.58 + 0.24 * tc));
+        cv.fill_rrect(nrect, radii, crate::render::vgradient(nrect, with_a(pal.fg_hi, 0.10), with_a(pal.fg_hi, 0.0)));
 
         // layout reference: the notch at its target size, centred on the surface
-        let (tw, th) = if self.expanded() || self.prog > 0.01 { self.size_t } else { (g.coll_w, g.coll_h) };
+        let (tw, th) = if self.expanded() || self.prog > 0.01 { self.size_t } else { (self.coll_w, g.coll_h) };
         let card = rect((host_w - tw) / 2.0, 0.0, tw, th);
         let tabs = self.visible_tabs(st);
         let tabs_w = tabs.len() as f32 * 36.0 + (tabs.len().saturating_sub(1)) as f32 * 4.0 + 6.0;
@@ -489,10 +657,121 @@ impl View for Notch {
             }
             self.draw_collapsed_and_morph(cv, dc, &pal, nrect, tc, co, eo);
         });
+        // tile label: drawn outside the notch clip, fading and sliding in with the hover level
+        if let Some((name, r, l)) = self.tip.take() {
+            if tc < 0.05 {
+                let style = TextStyle::new(pal.fs(11.0), pal.fg_hi).weight(600);
+                let w = cv.measure(&name, &style).0 + 18.0;
+                let (host_w, _) = cv.size();
+                let x = (r.center().x - w / 2.0).clamp(4.0, (host_w - w - 4.0).max(4.0));
+                let k = crate::layout::smooth(l);
+                let tip = rect(x, nrect.bottom() + 6.0 + (1.0 - k) * -4.0, w, 22.0);
+                cv.with_alpha(k, |cv| {
+                    cv.fill_rrect(tip, r_all(11.0), pal.glass);
+                    cv.fill_rrect(tip, r_all(11.0), crate::render::vgradient(tip, with_a(pal.fg_hi, 0.09), with_a(pal.fg_hi, 0.0)));
+                    cv.text(&name, &style, tip.center(), HAlign::Center, VAlign::Middle);
+                });
+            }
+        }
     }
 }
 
 impl Notch {
+    /// Arm or cancel the hover dwell: armed only over the clock/background (never over a tile).
+    fn update_dwell(&mut self, p: Point, open_on_hover: bool) {
+        // hit rectangles exist only while the collapsed content is interactive
+        let over_tile = self.hits.at(p).is_some();
+        if over_tile || !open_on_hover { self.dwell_at = None; }
+        else if self.dwell_at.is_none() { self.dwell_at = Some(Instant::now() + DWELL); }
+    }
+
+    /// Pointer input while collapsed: tile clicks never expand the notch; a click on the background opens Home.
+    fn collapsed_event(&mut self, ev: Event, ctx: &mut Ctx) {
+        match &ev {
+            Event::Press(b, p) => {
+                self.dwell_at = None;
+                let hit = self.hits.at(*p);
+                self.press_id = Some(hit);
+                self.press_key = hit.and_then(|id| self.tile_key(id)).map(str::to_string);
+                self.press_rect = hit.and_then(|id| self.tile_rects.iter().find(|(i, _)| *i == id).map(|(_, r)| *r));
+                self.drag = None;
+                if *b == Button::Left {
+                    if let (Some(id), Some(key), Some(r)) = (hit, self.press_key.clone(), self.press_rect) {
+                        let idx = (id - ID_TILE) as usize;
+                        self.drag = Some(Drag { key, idx, start: *p, pos: *p, grab: p.x - r.x, active: false, drop: idx });
+                    }
+                }
+            }
+            Event::Release(b, p) => {
+                self.dwell_at = None;
+                if let Some(d) = self.drag.take() {
+                    if d.active {
+                        self.press_id = None;
+                        self.press_key = None;
+                        self.press_rect = None;
+                        self.hits.event(&ev);
+                        if *b == Button::Left { self.commit_drag(d, ctx); }
+                        return;
+                    }
+                }
+                let down = self.press_id.take();
+                let click = self.hits.event(&ev);
+                let pressed_key = self.press_key.take();
+                match down {
+                    // pressed on a tile: only a release on the same tile counts
+                    Some(Some(_)) => {
+                        let Some(c) = click else { return };
+                        if c.id == ID_OVERFLOW {
+                            if *b == Button::Left { ctx.state.nav = Some(NavTo::Page("apps")); }
+                            return;
+                        }
+                        let Some(key) = self.tile_key(c.id).map(str::to_string).filter(|k| pressed_key.as_ref() == Some(k)) else { return };
+                        let st = &mut *ctx.state;
+                        let Some(sc) = st.apps.shortcut(&key) else { return };
+                        match *b {
+                            Button::Left => st.apps.activate_shortcut(&key, false, st.notch.output.as_deref()),
+                            Button::Right if sc.configured_id.is_some() => st.apps.activate_shortcut(&key, true, st.notch.output.as_deref()),
+                            Button::Right => { st.apps.page_focus = Some(key); st.nav = Some(NavTo::Page("apps")); }
+                            _ => {}
+                        }
+                    }
+                    _ => {
+                        if *b == Button::Left && self.hits.at(*p).is_none() {
+                            self.show("home", ctx);
+                            self.set_expanded(true, ctx);
+                        }
+                    }
+                }
+                return;
+            }
+            Event::PointerMove(p) => {
+                if let Some(d) = self.drag.as_mut() {
+                    d.pos = *p;
+                    if !d.active && (p.x - d.start.x).abs() > DRAG_START { d.active = true; self.dwell_at = None; self.tip = None; }
+                    if d.active { ctx.cmds.push(Cmd::Redraw(ctx.id)); }
+                }
+            }
+            _ => {}
+        }
+        self.hits.event(&ev);
+    }
+
+    /// Drop of a dragged tile: reorder the shortcut row, apply it now and save it in the background.
+    fn commit_drag(&mut self, d: Drag, ctx: &mut Ctx) {
+        let st = &mut *ctx.state;
+        let mut keys: Vec<String> = st.apps.shortcuts.iter().map(|s| s.key.clone()).collect();
+        if d.idx >= keys.len() || keys[d.idx] != d.key || d.drop == d.idx { return; }
+        let k = keys.remove(d.idx);
+        keys.insert(d.drop.min(keys.len()), k);
+        st.settings.app_order = keys.clone();
+        st.apps.set_order(&keys);
+        self.settle = 0.35;
+        #[cfg(not(test))]
+        std::thread::spawn(move || { if let Err(e) = crate::config::save_app_order(&keys) { eprintln!("waybar-notch: app order not saved: {e}"); } });
+    }
+
+    fn tile_key(&self, id: u32) -> Option<&str> { id.checked_sub(ID_TILE).and_then(|i| self.tile_keys.get(i as usize)).map(String::as_str) }
+
     fn draw_tabs(&mut self, cv: &mut Canvas, pal: &Palette, tabs: &[(&'static str, &'static str)]) {
         let bar = self.tabs_rect;
         cv.fill_rrect(bar, r_all(15.0), pal.surface);
@@ -534,7 +813,7 @@ impl Notch {
         let st = dc.state;
         let g = self.geom;
         let (host_w, _) = cv.size();
-        let coll = rect((host_w - g.coll_w) / 2.0, 0.0, g.coll_w, g.coll_h);
+        let coll = rect((host_w - self.coll_w) / 2.0, 0.0, self.coll_w, g.coll_h);
         let cy = coll.y + coll.h / 2.0;
         let media = Self::collapsed_media(st);
         let (time, period) = Self::clock_strings(st);
@@ -543,65 +822,119 @@ impl Notch {
         let m = self.morph;
 
         let day_st = TextStyle::new(pal.fs(10.0), with_a(pal.fg, 0.65)).weight(600);
-        let time_st = TextStyle::new(pal.fs(13.0), pal.fg_hi).bold();
+        let time_st = TextStyle::new(pal.fs(CLOCK_PX), pal.fg_hi).bold();
         let temp_st = TextStyle::new(pal.fs(11.0), pal.fg_hi).weight(600);
         let icon_sz = pal.fs(12.0);
 
-        // --- collapsed layout positions
-        let (clock_c0, icon_c0, temp_x0, day_x0, art0, eq0);
+        // --- collapsed layout: clock block, media slot, app tiles, then whatever room is left
         let day = chrono::Local::now().format("%a").to_string();
-        let day_w = cv.measure(&day, &day_st).0;
-        let time_w = cv.measure(&time, &time_st).0;
-        let temp_w = cv.measure(&w_temp, &temp_st).0;
-        let icon_w = icon_sz;
-        if media.is_none() {
-            let total = day_w + 8.0 + time_w + 8.0 + icon_w + 3.0 + temp_w;
-            let x0 = coll.x + (coll.w - total) / 2.0;
-            day_x0 = x0;
-            clock_c0 = pt(x0 + day_w + 8.0 + time_w / 2.0, cy);
-            icon_c0 = pt(x0 + day_w + 8.0 + time_w + 8.0 + icon_w / 2.0, cy);
-            temp_x0 = x0 + day_w + 8.0 + time_w + 8.0 + icon_w + 3.0;
-            art0 = Rect::default();
-            eq0 = Rect::default();
-        } else {
-            day_x0 = 0.0;
-            clock_c0 = pt(coll.center().x, cy);
-            let total = icon_w + 3.0 + temp_w;
-            let x0 = coll.x + (coll.w - total) / 2.0;
-            icon_c0 = pt(x0 + icon_w / 2.0, cy);
-            temp_x0 = x0 + icon_w + 3.0;
-            let side = (g.coll_h - 4.0).clamp(1.0, 20.0);
-            art0 = rect(coll.x + 12.0, cy - side / 2.0, side, side);
-            eq0 = rect(coll.right() - 12.0 - 36.0, cy - 8.0, 36.0, 16.0);
+        let bolt_w = if st.status.power.as_ref().is_some_and(crate::glue::actively_charging) { BOLT_W } else { 0.0 };
+        let dims = Dims { day_w: cv.measure(&day, &day_st).0, time_w: cv.measure(&time, &time_st).0, temp_w: cv.measure(&w_temp, &temp_st).0, icon_w: icon_sz, bolt_w };
+        let lay = collapsed_layout(coll, dims, media.as_ref().is_some_and(|m| m.playing), st.apps.shortcuts.len());
+        let (clock_c0, icon_c0) = (lay.clock_c, lay.weather_anchor);
+        let art0 = lay.art.unwrap_or_default();
+
+        // tile hits exist only while the collapsed content is the visible, settled state
+        self.tile_keys.clear();
+        self.tile_rects.clear();
+        let interactive = self.target < 0.5 && co > 0.5;
+        let mut tiles: Vec<(u32, Rect, usize)> = Vec::new();
+        for (r, i) in &lay.tiles {
+            let id = ID_TILE + tiles.len() as u32;
+            self.tile_keys.push(st.apps.shortcuts[*i].key.clone());
+            self.tile_rects.push((id, *r));
+            if interactive { self.hits.add(*r, id); }
+            tiles.push((id, *r, *i));
+        }
+        if let Some((r, _)) = lay.overflow {
+            self.tile_rects.push((ID_OVERFLOW, r));
+            if interactive { self.hits.add(r, ID_OVERFLOW); }
+        }
+        // hover label under the notch for the tile the pointer eases into
+        self.tip = None;
+        if interactive {
+            let mut best = 0.02;
+            for (id, r, i) in &tiles {
+                let l = self.tile_level(*id);
+                if l > best { best = l; self.tip = Some((st.apps.shortcuts[*i].name.clone(), *r, l)); }
+            }
+            if let Some((r, n)) = lay.overflow {
+                let l = self.tile_level(ID_OVERFLOW);
+                if l > best { self.tip = Some((format!("{n} more apps"), r, l)); }
+            }
+        }
+        // drag preview: the other tiles slide aside to open the slot the dragged tile would drop into
+        let dragging = self.drag.as_ref().filter(|d| d.active && d.idx < tiles.len()).cloned();
+        if dragging.is_some() { self.tip = None; }
+        let mut shown_tiles: Vec<(u32, Rect, usize)> = Vec::new();
+        let mut lifted: Option<(u32, Rect, usize)> = None;
+        let slide_k = 1.0 - (-self.last_dt * 24.0).exp();
+        let animating = dragging.is_some() || self.settle > 0.0;
+        let mut moving = false;
+        let drop = dragging.as_ref().map_or(0, |d| tiles.iter().enumerate().filter(|(n, (_, r, _))| *n != d.idx && r.center().x < d.pos.x).count());
+        if let Some(d) = self.drag.as_mut() { d.drop = if dragging.is_some() { drop } else { d.idx }; }
+        for (n, (id, r, i)) in tiles.iter().enumerate() {
+            let mut target = *r;
+            if let Some(d) = &dragging {
+                if n == d.idx {
+                    let (lo, hi) = (tiles[0].1.x, tiles[tiles.len() - 1].1.x);
+                    lifted = Some((*id, rect((d.pos.x - d.grab).clamp(lo, hi), r.y, r.w, r.h), *i));
+                    continue;
+                }
+                let o = n - (n > d.idx) as usize;
+                target = tiles[o + (o >= drop) as usize].1;
+            }
+            let key = &st.apps.shortcuts[*i].key;
+            let pos = match self.tile_x.iter().position(|(k, _)| k == key) {
+                Some(p) => p,
+                None => { self.tile_x.push((key.clone(), target.x)); self.tile_x.len() - 1 }
+            };
+            let cur = &mut self.tile_x[pos].1;
+            if animating {
+                *cur += (target.x - *cur) * slide_k;
+                if (target.x - *cur).abs() > 0.3 { moving = true; } else { *cur = target.x; }
+            } else {
+                *cur = target.x;
+            }
+            shown_tiles.push((*id, rect(*cur, target.y, target.w, target.h), *i));
+        }
+        self.tile_x.retain(|(k, _)| st.apps.shortcuts.iter().any(|s| s.key == *k));
+        self.sliding = moving;
+        // a press whose tile moved, resized or changed identity meanwhile must not fire on release
+        if let (Some(Some(id)), Some(r)) = (self.press_id, self.press_rect) {
+            let same = self.tile_rects.iter().any(|(i, tr)| *i == id && *tr == r)
+                && (id == ID_OVERFLOW || self.tile_key(id).map(str::to_string) == self.press_key);
+            if !same { self.press_id = None; self.press_key = None; self.press_rect = None; }
         }
 
-        // --- plain collapsed bits (fade out first)
+        // --- plain collapsed bits and tiles (fade out first)
         if co > 0.0 {
             cv.with_alpha(co, |cv| {
-                if media.is_none() { cv.text(&day, &day_st, pt(day_x0, cy), HAlign::Left, VAlign::Middle); }
-                cv.text(&w_temp, &temp_st, pt(temp_x0, cy), HAlign::Left, VAlign::Middle);
-                if let Some(mm) = &media {
-                    draw_eq(cv, pal, eq0, &mm.bars, mm.playing);
+                if let Some(x) = lay.day_x { cv.text(&day, &day_st, pt(x, cy), HAlign::Left, VAlign::Middle); }
+                if let Some((_, tx)) = lay.weather { cv.text(&w_temp, &temp_st, pt(tx, cy), HAlign::Left, VAlign::Middle); }
+                if let (Some(mm), Some(eq)) = (&media, lay.eq) { draw_eq(cv, pal, eq, &mm.bars, mm.playing); }
+                for (id, r, i) in &shown_tiles { self.paint_tile(cv, pal, st, &st.apps.shortcuts[*i], *r, *id); }
+                if let Some((id, r, i)) = &lifted {
+                    // the dragged tile floats above the row with a soft shadow
+                    let (rr, sh) = (r.pad_xy(-2.0, -2.0), r.pad_xy(-2.0, -2.0));
+                    cv.fill_rrect(rect(sh.x, sh.y + 3.0, sh.w, sh.h), r_all(10.0), with_a(crate::render::rgb(0, 0, 0), 0.35));
+                    self.paint_tile(cv, pal, st, &st.apps.shortcuts[*i], rr, *id);
                 }
-                if st.status.power.as_ref().is_some_and(crate::glue::actively_charging) {
-                    cv.text("\u{f0e7}", &TextStyle::icon(10.0, pal.accent_hi), pt(coll.right() - 4.0, coll.y + 6.0), HAlign::Right, VAlign::Middle);
-                }
+                if let Some((r, n)) = lay.overflow { self.paint_overflow(cv, pal, r, n); }
+                if let Some(b) = lay.bolt { cv.text("\u{f0e7}", &TextStyle::icon(11.0, pal.accent_hi), b, HAlign::Center, VAlign::Middle); }
             });
         }
 
         // --- morphing elements
         // clock
         {
-            let (c, size, a) = match (m.clock, media.is_none()) {
-                (Some((tp, ts)), true) => (lerp_pt(clock_c0, tp, p), lerp(pal.fs(13.0), ts, p), 1.0),
-                (Some((tp, ts)), false) => (tp, ts, eo),
-                (None, true) => (clock_c0, pal.fs(13.0), co),
-                (None, false) => (clock_c0, pal.fs(13.0), 0.0),
+            let (c, size) = match m.clock {
+                Some((tp, ts)) => (lerp_pt(clock_c0, tp, p), lerp(pal.fs(CLOCK_PX), ts, p)),
+                None => (clock_c0, pal.fs(CLOCK_PX)),
             };
+            let a = match (m.clock.is_some(), lay.clock) { (true, true) => 1.0, (true, false) => tc, (false, true) => co, (false, false) => 0.0 };
             if a > 0.0 {
-                let big = ((size - pal.fs(13.0)) / (36.0 - pal.fs(13.0))).clamp(0.0, 1.0);
-                let colr = mix(pal.fg_hi, pal.fg_hi, big);
-                let sty = TextStyle::new(size, colr).bold();
+                let sty = TextStyle::new(size, pal.fg_hi).bold();
                 cv.with_alpha(a, |cv| {
                     let w = cv.text(&time, &sty, c, HAlign::Center, VAlign::Middle);
                     if !period.is_empty() && eo > 0.0 {
@@ -611,22 +944,25 @@ impl Notch {
                 });
             }
         }
-        // weather glyph
+        // weather glyph (collapsed only when the layout had room for it)
         {
+            let shown = lay.weather.is_some();
             let (c, size, a) = match m.weather_icon {
-                Some((tp, ts)) => (lerp_pt(icon_c0, tp, p), lerp(icon_sz, ts, p), 1.0),
-                None => (icon_c0, icon_sz, co),
+                Some((tp, ts)) => (lerp_pt(icon_c0, tp, p), lerp(icon_sz, ts, p), if shown { 1.0 } else { tc }),
+                None => (icon_c0, icon_sz, if shown { co } else { 0.0 }),
             };
             if a > 0.0 { cv.with_alpha(a, |cv| { cv.text(&w_icon, &TextStyle::icon(size, pal.fg_hi), c, HAlign::Center, VAlign::Middle); }); }
         }
-        // album art
+        // album art: the media status slot
         if let Some(mm) = &media {
-            let (r, a) = match m.art {
-                Some(tr) => (lerp_rect(art0, tr, p), 1.0),
-                None => (art0, co),
+            let (r, a) = match (m.art, lay.art.is_some()) {
+                (Some(tr), true) => (lerp_rect(art0, tr, p), 1.0),
+                (Some(tr), false) => (tr, tc),
+                (None, true) => (art0, co),
+                (None, false) => (art0, 0.0),
             };
             if a > 0.0 {
-                let rad = lerp(5.0, 10.0, p.clamp(0.0, 1.0));
+                let rad = lerp(8.0, 10.0, p.clamp(0.0, 1.0));
                 cv.with_alpha(a, |cv| match &mm.art {
                     Some(img) => cv.image_cover(img, r, r_all(rad)),
                     None => {
@@ -635,11 +971,57 @@ impl Notch {
                     }
                 });
             }
-        } else if let Some(tr) = m.art {
-            let _ = tr; // no player: Home draws its own placeholder
         }
-        let _ = (nrect, tc);
+        let _ = nrect;
     }
+
+    fn tile_level(&self, id: u32) -> f32 { self.tile_hover.iter().find(|(i, _)| *i == id).map_or(0.0, |(_, l)| *l) }
+
+    /// One app tile: fixed hit cell, icon scaling 1.0 -> 1.10 on hover (0.94 pressed), active underline, running dot.
+    fn paint_tile(&self, cv: &mut Canvas, pal: &Palette, st: &State, s: &crate::apps::Shortcut, cell: Rect, id: u32) {
+        let lvl = self.tile_level(id);
+        let scale = if self.hits.is_pressed(id) { 0.94 } else { 1.0 + 0.10 * lvl };
+        let base = if s.active { with_a(pal.accent, 0.16 + 0.10 * lvl) } else { with_a(pal.fg, 0.05 + 0.10 * lvl) };
+        cv.fill_rrect(cell, r_all(8.0), base);
+        cv.stroke_rrect(cell, r_all(8.0), 1.0, with_a(if s.active { pal.accent } else { pal.fg }, 0.07 + 0.10 * lvl));
+        let edge = icon_for(cell.w) * scale;
+        let icon = Rect::around(cell.center(), edge, edge);
+        let running = st.apps.running(s);
+        cv.with_alpha(if running || s.pin.is_none() { 1.0 } else { 0.62 }, |cv| crate::apps_page::paint_icon(cv, pal, st, s, icon));
+        let (cx, bottom) = (cell.center().x, cell.bottom());
+        // one dot per open window (up to three) under the icon; a single focused window keeps the accent underline
+        if s.active && s.windows <= 1 {
+            cv.fill_rrect(rect(cx - 6.0, bottom - 3.5, 12.0, 2.0), r_all(1.0), pal.accent);
+        } else if running {
+            let n = s.windows.clamp(1, 3);
+            let col = if s.active { pal.accent } else { with_a(pal.fg_hi, 0.85) };
+            for k in 0..n {
+                let x = cx + (k as f32 - (n as f32 - 1.0) / 2.0) * 5.0;
+                cv.fill_circle(pt(x, bottom - 2.5), if s.active { 1.7 } else { 1.4 }, col);
+            }
+        }
+        // an unread badge of the configured app takes precedence over the window count
+        let badge = s.configured_id.as_deref().and_then(|id| st.apps.button(id)).and_then(|b| st.apps.shown(b).1).map(badge_text);
+        if let Some(t) = badge {
+            let style = TextStyle::new(8.5, crate::render::rgb(255, 255, 255)).weight(700);
+            let w = (cv.measure(&t, &style).0 + 6.0).max(12.0).min(cell.w - 2.0);
+            let r = rect(cell.right() - w - 1.0, cell.y + 1.0, w, 12.0);
+            cv.fill_rrect(r, r_all(6.0), crate::render::rgb(0xe5, 0x3e, 0x3e));
+            cv.text(&t, &style, r.center(), HAlign::Center, VAlign::Middle);
+        }
+    }
+
+    fn paint_overflow(&self, cv: &mut Canvas, pal: &Palette, cell: Rect, n: usize) {
+        let lvl = self.tile_level(ID_OVERFLOW);
+        cv.fill_rrect(cell, r_all(8.0), with_a(pal.fg, 0.05 + 0.10 * lvl));
+        cv.stroke_rrect(cell, r_all(8.0), 1.0, with_a(pal.fg, 0.07 + 0.10 * lvl));
+        cv.text(&format!("+{n}"), &TextStyle::new(pal.fs(11.0), pal.fg_hi).weight(700), cell.center(), HAlign::Center, VAlign::Middle);
+    }
+}
+
+/// Compact badge text: numbers above 99 read `99+`; anything else is shown as given.
+fn badge_text(t: &str) -> String {
+    match t.parse::<u32>() { Ok(n) if n > 99 => "99+".to_string(), _ => t.to_string() }
 }
 
 /// Equaliser: six rounded bars, accent while playing, dim when paused.
@@ -723,6 +1105,139 @@ mod tests {
         assert!(g.exp_h_max < 300.0);
     }
 
+    // ---- collapsed dock: dwell, tile clicks, animation switch
+
+    fn dock_state(n_apps: usize) -> State {
+        let mut st = State::new();
+        st.settings.behavior.open_on_hover = true;
+        let open = (0..n_apps).map(|i| crate::apps::OpenApp { key: format!("app:zz-none-{i}"), name: format!("Zz{i}"), configured_id: None, desktop_id: None,
+            windows: vec![crate::apps::OpenWindow { address: format!("0x{:x}", 0xfff0 + i), class: format!("zz-none-{i}"), initial_class: format!("zz-none-{i}"), title: String::new(), workspace: 1, workspace_name: "1".into(), focus_order: i as i64 }],
+            active: i == 0 }).collect();
+        st.apps.set_open(open);
+        st
+    }
+
+    fn step(n: &mut Notch, st: &mut State, secs: f32) -> bool {
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        let mut active = false;
+        let mut t = 0.0;
+        while t < secs {
+            let mut ctx = Ctx { state: st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None };
+            active = n.tick(0.016, &mut ctx);
+            t += 0.016;
+        }
+        active
+    }
+
+    fn send(n: &mut Notch, st: &mut State, ev: Event) {
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        let mut ctx = Ctx { state: st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None };
+        n.event(ev, &mut ctx);
+    }
+
+    fn paint(n: &mut Notch, st: &State, scale: f32) -> tiny_skia::Pixmap {
+        let mut rig = crate::testkit::Rig::new();
+        rig.scale = scale;
+        let spec = n.spec(st);
+        let (w, h) = ((spec.size.0 as f32 * scale).ceil() as u32, (spec.size.1 as f32 * scale).ceil() as u32);
+        let mut pm = tiny_skia::Pixmap::new(w, h).unwrap();
+        let mut cmds = Vec::new();
+        {
+            let mut cv = Canvas::new(&mut pm, &mut rig.text, scale);
+            let mut dc = DrawCtx { state: st, cmds: &mut cmds, poster: &rig.poster, id: 1, output: None };
+            n.draw(&mut cv, &mut dc);
+        }
+        pm
+    }
+
+    #[test]
+    fn hover_over_a_tile_never_expands_and_a_tile_click_does_not_expand_either() {
+        let mut st = dock_state(4);
+        let mut n = Notch::new(crate::pages::build());
+        step(&mut n, &mut st, 0.05);
+        let pm = paint(&mut n, &st, 1.6);
+        crate::testkit::save_over_backdrop(&pm, 10, "/tmp/notch-dock-4apps.png");
+        let tile = n.hits.items_rect(ID_TILE).center();
+        send(&mut n, &mut st, Event::PointerEnter(tile));
+        assert!(n.dwell_at.is_none() && !n.expanded(), "entering moves nothing");
+        std::thread::sleep(Duration::from_millis(500));
+        step(&mut n, &mut st, 0.05);
+        assert!(!n.expanded(), "no dwell over a tile");
+        send(&mut n, &mut st, Event::Press(Button::Left, tile));
+        send(&mut n, &mut st, Event::Release(Button::Left, tile));
+        step(&mut n, &mut st, 0.05);
+        assert!(!n.expanded(), "app click focuses/launches without expanding");
+        assert!(st.nav.is_none());
+        // right click on a general app opens Applications focused on that group
+        send(&mut n, &mut st, Event::Press(Button::Right, tile));
+        send(&mut n, &mut st, Event::Release(Button::Right, tile));
+        assert_eq!((st.nav.clone(), st.apps.page_focus.as_deref()), (Some(NavTo::Page("apps")), Some("app:zz-none-0")));
+    }
+
+    #[test]
+    fn dwell_on_the_clock_opens_after_350ms_and_leaving_cancels() {
+        let mut st = dock_state(4);
+        let mut n = Notch::new(crate::pages::build());
+        step(&mut n, &mut st, 0.05);
+        paint(&mut n, &st, 1.6);
+        let bg = pt(n.geom.coll_w / 2.0 + (n.host.0 as f32 - n.geom.coll_w) / 2.0, 1.0);
+        assert!(n.hits.at(bg).is_none());
+        send(&mut n, &mut st, Event::PointerEnter(bg));
+        assert!(n.dwell_at.is_some() && !n.expanded());
+        send(&mut n, &mut st, Event::PointerLeave);
+        assert!(n.dwell_at.is_none());
+        send(&mut n, &mut st, Event::PointerEnter(bg));
+        std::thread::sleep(Duration::from_millis(400));
+        step(&mut n, &mut st, 0.05);
+        assert!(n.expanded());
+        // reverse mid-spring: bounded geometry, velocity kept
+        step(&mut n, &mut st, 0.1);
+        let mid = n.prog;
+        assert!(mid > 0.0 && mid < 1.0);
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        n.set_expanded(false, &mut Ctx { state: &mut st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None });
+        for _ in 0..40 { step(&mut n, &mut st, 0.016); assert!(n.prog > -0.2 && n.prog < 1.2); }
+    }
+
+    #[test]
+    fn disabled_animations_snap_and_request_no_frames() {
+        let mut st = dock_state(2);
+        st.settings.behavior.animations = false;
+        st.status.power = Some(crate::power::PowerSnapshot { available: true, ac_online: Some(true), percentage: Some(50.0), batteries: vec![crate::power::BatterySnapshot {
+            name: "BAT0".into(), state: crate::power::BatteryState::Charging, percentage: Some(50.0), power_w: None, energy_now_wh: None, energy_full_wh: None, energy_design_wh: None,
+            health_pct: None, voltage_v: None, cycles: None, technology: None, manufacturer: None, model: None, time_to_empty_secs: None, time_to_full_secs: None }] });
+        let mut n = Notch::new(crate::pages::build());
+        step(&mut n, &mut st, 0.05);
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        n.set_expanded(true, &mut Ctx { state: &mut st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None });
+        assert_eq!(n.prog, 1.0, "snaps to the final state");
+        let active = step(&mut n, &mut st, 0.1);
+        assert_eq!(n.vel, 0.0);
+        assert!(!active || n.page_fade < 1.0, "no continuous frames once settled");
+    }
+
+    #[test]
+    fn huge_frame_steps_are_clamped() {
+        let mut st = dock_state(0);
+        let mut n = Notch::new(crate::pages::build());
+        step(&mut n, &mut st, 0.05);
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        n.set_expanded(true, &mut Ctx { state: &mut st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None });
+        let mut ctx = Ctx { state: &mut st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None };
+        n.tick(30.0, &mut ctx);
+        assert!(n.prog < 0.5, "a 30s resume step integrates at most 50ms: {}", n.prog);
+    }
+
     // ---- output selection: the pills follow `State.notch.output`
 
     fn two_outputs(focused: &str) -> State {
@@ -796,3 +1311,186 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+    use crate::wayland::OutputInfo;
+
+    #[test]
+    fn saved_width_is_a_minimum_and_expanded_width_the_cap() {
+        let fit = |ow, l, r, pref| fit_collapsed(ow, l, r, 360.0, pref, 560.0);
+        // 1200px output, left 150, right 200: four apps keep 360, ten widen to 444, twenty stop at 560
+        let pref = |n: usize| crate::dock::preferred_width(40.0, 40.0, false, n);
+        assert_eq!(fit(1200.0, 150.0, 200.0, pref(4)), (360.0, 560.0, false));
+        assert_eq!(fit(1200.0, 150.0, 200.0, pref(10)), (444.0, 560.0, false));
+        assert_eq!(fit(1200.0, 150.0, 200.0, pref(20)), (560.0, 560.0, false));
+        // a side pill that leaves less room shrinks the width and the safety cap with it
+        let (w, cap, lower) = fit(700.0, 150.0, 200.0, pref(10));
+        assert!(!lower && w == cap && cap == 700.0 - 2.0 * 212.0, "{w} {cap}");
+    }
+
+    #[test]
+    fn too_little_room_between_the_pills_drops_the_notch_below_them() {
+        let (w, cap, lower) = fit_collapsed(640.0, 150.0, 250.0, 360.0, 216.0, 560.0);
+        assert!(lower && w <= 640.0 - SCREEN_MARGIN && cap <= 640.0 - SCREEN_MARGIN);
+        let mut st = State::new();
+        st.outputs = vec![OutputInfo { name: "X".into(), pos: (0, 0), size: (640, 500) }];
+        let g = Geom::adaptive(&st, Some("X"), Measured { time_w: 40.0, media: false, n_apps: 4, left: 150.0, right: 250.0 });
+        assert_eq!(g.top_margin, (st.settings.layout.top_margin as i32).max(30));
+        let roomy = Geom::adaptive(&st, Some("X"), Measured { time_w: 40.0, media: false, n_apps: 4, left: 100.0, right: 100.0 });
+        assert_eq!(roomy.top_margin, st.settings.layout.top_margin as i32);
+        // before the output is known nothing is widened
+        assert_eq!(Geom::adaptive(&st, None, Measured { time_w: 40.0, media: false, n_apps: 40, left: 0.0, right: 0.0 }), Geom::compute(&st, None));
+    }
+
+    fn dock(n_apps: usize) -> State {
+        let mut st = State::new();
+        st.outputs = vec![OutputInfo { name: "X".into(), pos: (0, 0), size: (1400, 800) }];
+        let open = (0..n_apps).map(|i| crate::apps::OpenApp { key: format!("app:zz-none-{i}"), name: format!("Zz{i}"), configured_id: None, desktop_id: None,
+            windows: vec![crate::apps::OpenWindow { address: format!("0x{:x}", 0xfff0 + i), class: format!("zz-none-{i}"), initial_class: format!("zz-none-{i}"), title: String::new(), workspace: 1, workspace_name: "1".into(), focus_order: i as i64 }],
+            active: i == 0 }).collect();
+        st.apps.set_open(open);
+        st
+    }
+
+    fn run(n: &mut Notch, st: &mut State, secs: f32) {
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        let mut t = 0.0;
+        while t < secs {
+            let mut ctx = Ctx { state: st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: Some("X") };
+            n.tick(0.016, &mut ctx);
+            t += 0.016;
+        }
+    }
+
+    #[test]
+    fn more_apps_widen_the_notch_by_animation_and_snap_without_it() {
+        let mut st = dock(4);
+        let mut n = Notch::new(crate::pages::build());
+        run(&mut n, &mut st, 0.1);
+        assert_eq!(n.coll_w, 360.0);
+        st = dock(12);
+        run(&mut n, &mut st, 0.032);
+        assert!(n.geom.coll_w > 360.0 && n.coll_w > 360.0 && n.coll_w < n.geom.coll_w, "growing: {} -> {}", n.coll_w, n.geom.coll_w);
+        run(&mut n, &mut st, 2.0);
+        assert_eq!(n.coll_w, n.geom.coll_w);
+        assert!(n.coll_w >= crate::dock::preferred_width(20.0, 40.0, false, 12), "every app fits: {}", n.coll_w);
+        // animations off: snaps immediately and clears the velocity
+        st = dock(4);
+        st.settings.behavior.animations = false;
+        run(&mut n, &mut st, 0.016);
+        assert_eq!((n.coll_w, n.coll_v), (n.geom.coll_w, 0.0));
+    }
+
+    #[test]
+    fn dragging_a_tile_reorders_and_a_plain_click_does_not() {
+        let mut st = dock(4);
+        st.settings.app_order.clear(); // State::new reads the real config
+        st.apps.set_order(&[]);
+        let mut n = Notch::new(crate::pages::build());
+        run(&mut n, &mut st, 0.1);
+        let mut rig = crate::testkit::Rig::new();
+        let paint = |n: &mut Notch, st: &State, rig: &mut crate::testkit::Rig| {
+            let spec = n.spec(st);
+            let mut pm = tiny_skia::Pixmap::new(spec.size.0, spec.size.1).unwrap();
+            let mut cmds = Vec::new();
+            let mut cv = Canvas::new(&mut pm, &mut rig.text, 1.0);
+            let mut dc = DrawCtx { state: st, cmds: &mut cmds, poster: &rig.poster, id: 1, output: Some("X") };
+            n.draw(&mut cv, &mut dc);
+        };
+        let send = |n: &mut Notch, st: &mut State, ev: Event| {
+            let mut cmds = Vec::new();
+            let poster = crate::wayland::Poster::detached();
+            let mut text = TextSys::new();
+            n.event(ev, &mut Ctx { state: st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: Some("X") });
+        };
+        paint(&mut n, &st, &mut rig);
+        let first = st.apps.shortcuts[0].key.clone();
+        let (a, b, c) = (n.hits.items_rect(ID_TILE).center(), n.hits.items_rect(ID_TILE + 1).center(), n.hits.items_rect(ID_TILE + 2).center());
+        send(&mut n, &mut st, Event::PointerEnter(a));
+        // a press-release without travel is a click: nothing is reordered
+        send(&mut n, &mut st, Event::Press(Button::Left, a));
+        send(&mut n, &mut st, Event::PointerMove(pt(a.x + 2.0, a.y)));
+        assert!(!n.drag.as_ref().unwrap().active);
+        send(&mut n, &mut st, Event::Release(Button::Left, a));
+        assert!(st.settings.app_order.is_empty());
+        // dragging tile 0 past tile 2 drops it into slot 2
+        send(&mut n, &mut st, Event::Press(Button::Left, a));
+        send(&mut n, &mut st, Event::PointerMove(pt(c.x + 4.0, a.y)));
+        assert!(n.drag.as_ref().unwrap().active);
+        paint(&mut n, &st, &mut rig);
+        assert_eq!(n.drag.as_ref().unwrap().drop, 2);
+        send(&mut n, &mut st, Event::Release(Button::Left, pt(c.x + 4.0, a.y)));
+        assert_eq!(st.apps.shortcuts[2].key, first, "dropped into the third slot");
+        assert_eq!(st.settings.app_order, st.apps.shortcuts.iter().map(|s| s.key.clone()).collect::<Vec<_>>());
+        let _ = b;
+    }
+
+    #[test]
+    fn a_press_does_not_survive_the_tile_moving_underneath_it() {
+        let mut st = dock(4);
+        let mut n = Notch::new(crate::pages::build());
+        run(&mut n, &mut st, 0.1);
+        let mut rig = crate::testkit::Rig::new();
+        let paint = |n: &mut Notch, st: &State, rig: &mut crate::testkit::Rig| {
+            let spec = n.spec(st);
+            let mut pm = tiny_skia::Pixmap::new(spec.size.0, spec.size.1).unwrap();
+            let mut cmds = Vec::new();
+            let mut cv = Canvas::new(&mut pm, &mut rig.text, 1.0);
+            let mut dc = DrawCtx { state: st, cmds: &mut cmds, poster: &rig.poster, id: 1, output: Some("X") };
+            n.draw(&mut cv, &mut dc);
+        };
+        paint(&mut n, &st, &mut rig);
+        let p = n.hits.items_rect(ID_TILE).center();
+        n.hits.event(&Event::PointerEnter(p));
+        n.hits.event(&Event::PointerMove(p));
+        let mut cmds = Vec::new();
+        let poster = crate::wayland::Poster::detached();
+        let mut text = TextSys::new();
+        let mut ctx = Ctx { state: &mut st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: Some("X") };
+        n.event(Event::Press(Button::Left, p), &mut ctx);
+        assert!(n.press_key.is_some());
+        // the row is reordered/resized: another app now sits where the pressed tile was
+        st = dock(12);
+        run(&mut n, &mut st, 0.05);
+        paint(&mut n, &st, &mut rig);
+        assert!(n.press_id.is_none() && n.press_key.is_none(), "stale press cancelled");
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Counting(Rc<Cell<u32>>);
+    impl Page for Counting {
+        fn natural(&mut self, avail: Size, _: &State, _: &mut TextSys) -> Size { Size { w: avail.w, h: 100.0 } }
+        fn draw(&mut self, _: &mut Canvas, _: &mut DrawCtx, _: Rect) {}
+        fn event(&mut self, _: &Event, _: Rect, _: &mut Ctx) {}
+        fn shown(&mut self, _: &mut Ctx) { self.0.set(self.0.get() + 1); }
+    }
+
+    #[test]
+    fn navigating_from_the_collapsed_notch_activates_the_page_once() {
+        let n_shown = Rc::new(Cell::new(0));
+        let mut n = Notch::new(vec![("home", Box::new(Counting(Rc::new(Cell::new(0))))), ("apps", Box::new(Counting(n_shown.clone())))]);
+        let mut st = State::new();
+        let mut cmds = Vec::new();
+        let mut text = TextSys::new();
+        let poster = crate::wayland::Poster::detached();
+        st.nav = Some(NavTo::Page("apps"));
+        let mut ctx = Ctx { state: &mut st, cmds: &mut cmds, text: &mut text, poster: &poster, id: 1, output: None };
+        n.tick(0.016, &mut ctx);
+        assert!(n.expanded() && n.cur == "apps");
+        assert_eq!(n_shown.get(), 1, "page_focus must be consumed once");
+        // already expanded: switching away and back activates once per visit
+        n.show("home", &mut ctx);
+        n.show("apps", &mut ctx);
+        assert_eq!(n_shown.get(), 2);
+    }
+}
